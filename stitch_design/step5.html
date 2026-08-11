@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="ru"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Студия Написания</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "surface-variant": "#333539",
+                        "error-container": "#93000a",
+                        "surface-tint": "#adc6ff",
+                        "primary": "#adc6ff",
+                        "tertiary": "#4edea3",
+                        "on-primary": "#002e6a",
+                        "on-error-container": "#ffdad6",
+                        "ai-gradient-start": "#8B5CF6",
+                        "secondary-fixed": "#e9ddff",
+                        "inverse-primary": "#005ac2",
+                        "on-tertiary-fixed-variant": "#005236",
+                        "surface-bright": "#37393e",
+                        "success-emerald": "#10B981",
+                        "tertiary-container": "#00a572",
+                        "surface-card": "#161920",
+                        "outline": "#8c909f",
+                        "inverse-surface": "#e2e2e8",
+                        "surface-dim": "#111317",
+                        "primary-fixed": "#d8e2ff",
+                        "secondary": "#d0bcff",
+                        "tertiary-fixed": "#6ffbbe",
+                        "surface-container-low": "#1a1c20",
+                        "secondary-fixed-dim": "#d0bcff",
+                        "on-secondary-container": "#c4abff",
+                        "on-secondary": "#3c0091",
+                        "on-primary-container": "#00285d",
+                        "on-surface-variant": "#c2c6d6",
+                        "secondary-container": "#571bc1",
+                        "on-surface": "#e2e2e8",
+                        "on-tertiary-fixed": "#002113",
+                        "on-tertiary-container": "#00311f",
+                        "border-subtle": "#262B36",
+                        "on-primary-fixed-variant": "#004395",
+                        "surface-container-high": "#282a2e",
+                        "on-error": "#690005",
+                        "background": "#111317",
+                        "surface-container-highest": "#333539",
+                        "primary-container": "#4d8eff",
+                        "surface": "#111317",
+                        "outline-variant": "#424754",
+                        "primary-fixed-dim": "#adc6ff",
+                        "tertiary-fixed-dim": "#4edea3",
+                        "inverse-on-surface": "#2f3035",
+                        "on-background": "#e2e2e8",
+                        "on-secondary-fixed": "#23005c",
+                        "surface-container": "#1e2024",
+                        "on-primary-fixed": "#001a42",
+                        "on-secondary-fixed-variant": "#5516be",
+                        "error": "#ffb4ab",
+                        "surface-container-lowest": "#0c0e12",
+                        "ai-gradient-end": "#EC4899",
+                        "on-tertiary": "#003824"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "spacing": {
+                        "gutter": "16px",
+                        "sidebar-width": "260px",
+                        "margin-page": "24px",
+                        "inspector-width": "300px",
+                        "unit": "4px"
+                    },
+                    "fontFamily": {
+                        "body-md": ["Inter"],
+                        "headline-lg": ["Plus Jakarta Sans"],
+                        "body-lg": ["Inter"],
+                        "label-code": ["JetBrains Mono"],
+                        "preview-doc": ["Times New Roman"],
+                        "label-caps": ["JetBrains Mono"],
+                        "headline-md": ["Plus Jakarta Sans"]
+                    },
+                    "fontSize": {
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "headline-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "body-lg": ["16px", { "lineHeight": "24px", "fontWeight": "400" }],
+                        "label-code": ["13px", { "lineHeight": "18px", "fontWeight": "500" }],
+                        "preview-doc": ["14pt", { "lineHeight": "1.5", "fontWeight": "400" }],
+                        "label-caps": ["11px", { "lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700" }],
+                        "headline-md": ["24px", { "lineHeight": "32px", "fontWeight": "600" }]
+                    }
+                }
+            }
+        }
+    </script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;700&amp;family=Plus+Jakarta+Sans:wght@600;700&amp;family=Times+New+Roman&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<style>
+        .ai-glow {
+            box-shadow: 0 0 12px rgba(139, 92, 246, 0.4);
+        }
+        .ai-pulse {
+            animation: pulse-border 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse-border {
+            0%, 100% { border-color: rgba(139, 92, 246, 0.5); }
+            50% { border-color: rgba(236, 72, 153, 0.5); }
+        }
+        .glass-panel {
+            background: rgba(22, 25, 32, 0.85);
+            backdrop-filter: blur(12px);
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface font-body-md h-screen flex flex-col overflow-hidden">
+<!-- TopNavBar -->
+<header class="bg-surface-container-lowest dark:bg-surface-container-lowest flex justify-between items-center h-12 px-gutter w-full sticky top-0 z-50 border-b border-border-subtle">
+<div class="flex items-center gap-4">
+<span class="font-headline-md text-headline-md font-bold text-primary dark:text-primary-fixed-dim cursor-default">Платежный терминал</span>
+<div class="hidden md:flex items-center gap-2 px-3 py-1 bg-surface-container rounded border border-border-subtle text-on-surface-variant font-label-code text-label-code">
+<span class="material-symbols-outlined text-[16px]">folder</span>
+<span>/projects/thesis_2024/chapter_2.md</span>
+</div>
+</div>
+<div class="flex items-center gap-2 text-on-surface-variant">
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">bolt</span></button>
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">memory</span></button>
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">image</span></button>
+<div class="w-px h-4 bg-border-subtle mx-1"></div>
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">minimize</span></button>
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">fullscreen</span></button>
+<button class="p-1.5 hover:bg-surface-container-high transition-colors rounded cursor-pointer active:opacity-80"><span class="material-symbols-outlined text-[20px]">close</span></button>
+</div>
+</header>
+<div class="flex flex-1 overflow-hidden">
+<!-- SideNavBar (Left) -->
+<aside class="bg-surface-container dark:bg-surface-container border-r border-border-subtle flex flex-col h-full w-[260px] z-40 overflow-y-auto shrink-0">
+<div class="p-4 border-b border-border-subtle">
+<div class="flex items-center gap-3 mb-1">
+<div class="w-6 h-6 rounded bg-primary-container flex items-center justify-center shrink-0">
+<span class="material-symbols-outlined text-[14px] text-on-primary-container">school</span>
+</div>
+<div class="font-label-caps text-label-caps text-on-surface truncate">Project Passport</div>
+</div>
+<div class="font-label-code text-label-code text-on-surface-variant text-[11px]">Wizard Progress: 65%</div>
+<div class="w-full h-1 bg-surface-variant rounded-full mt-2 overflow-hidden">
+<div class="h-full bg-primary ai-glow" style="width: 65%"></div>
+</div>
+</div>
+<nav class="flex-1 py-4 px-2 space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">gavel</span>
+                    Rules
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">library_books</span>
+                    Sources
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">title</span>
+                    Title
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">format_list_bulleted</span>
+                    Plan
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 bg-primary-container dark:bg-primary-container text-on-primary-container dark:text-on-primary-container rounded-lg font-label-caps text-label-caps transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]">edit_note</span>
+                    Studio
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">auto_awesome</span>
+                    Build
+                </a>
+</nav>
+<div class="p-2 border-t border-border-subtle mt-auto space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">settings</span>
+                    Settings
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">help</span>
+                    Support
+                </a>
+</div>
+</aside>
+<!-- Main Editor Area (Center) -->
+<main class="flex-1 flex flex-col min-w-0 bg-surface-dim relative">
+<!-- Editor Toolbar -->
+<div class="h-14 border-b border-border-subtle bg-surface-card flex items-center justify-between px-6 shrink-0">
+<div class="flex items-center gap-4">
+<h1 class="font-body-lg text-body-lg text-on-surface font-semibold">Глава 2. Методология исследования</h1>
+</div>
+<button class="flex items-center gap-2 px-4 py-1.5 rounded bg-gradient-to-r from-ai-gradient-start to-ai-gradient-end text-white font-label-code text-label-code hover:opacity-90 transition-opacity ai-glow">
+<span class="material-symbols-outlined text-[16px]">bolt</span>
+                    Сгенерировать раздел (Gemini 3.5 Flash Lite)
+                </button>
+</div>
+<!-- Editor Canvas -->
+<div class="flex-1 overflow-y-auto p-8 lg:p-12 relative flex justify-center">
+<div class="w-full max-w-3xl bg-surface-card border border-border-subtle rounded-lg shadow-sm p-10 font-preview-doc text-preview-doc text-on-surface min-h-full">
+<p class="mb-4">В данной главе рассматривается методологический аппарат исследования, включающий в себя как общенаучные, так и специфические методы анализа данных. Основное внимание уделяется количественным подходам к оценке эффективности платежных систем.</p>
+<p class="mb-4 text-on-surface relative inline-block cursor-text group" id="selected-text">
+<span class="bg-primary/20 selection:bg-primary/30 rounded px-1">Применение нейросетевых алгоритмов позволяет существенно повысить точность прогнозирования транзакционных рисков. В частности, использование рекуррентных нейронных сетей (RNN) демонстрирует высокую эффективность при анализе временных рядов финансовых операций, выявляя скрытые паттерны мошеннической активности с вероятностью до 94%.</span>
+<!-- Floating Context Menu -->
+</p><div class="absolute -top-12 left-1/2 -translate-x-1/2 glass-panel border border-border-subtle rounded-lg p-1.5 flex items-center gap-1 shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none group-hover:pointer-events-auto z-10 whitespace-nowrap">
+<button class="flex items-center gap-1.5 px-3 py-1.5 rounded hover:bg-surface-variant text-on-surface font-label-code text-label-code transition-colors">
+<span class="material-symbols-outlined text-[14px] text-ai-gradient-start">magic_button</span>
+                                Переписать для Антиплагиата
+                            </button>
+<div class="w-px h-4 bg-border-subtle mx-1"></div>
+<button class="flex items-center gap-1.5 px-3 py-1.5 rounded hover:bg-surface-variant text-on-surface font-label-code text-label-code transition-colors">
+<span class="material-symbols-outlined text-[14px] text-primary">edit_document</span>
+                                Сделать научным
+                            </button>
+<div class="w-px h-4 bg-border-subtle mx-1"></div>
+<button class="flex items-center gap-1.5 px-3 py-1.5 rounded hover:bg-surface-variant text-on-surface font-label-code text-label-code transition-colors">
+<span class="material-symbols-outlined text-[14px] text-tertiary">search</span>
+                                Расписать подробнее
+                            </button>
+</div>
+<p></p>
+<p class="mb-4">Дальнейшее исследование направлено на интеграцию данных методов в существующую архитектуру процессингового центра. <span class="w-[2px] h-5 bg-primary animate-pulse inline-block align-middle ml-1"></span></p>
+</div>
+</div>
+<!-- Bottom Tool Panel -->
+<div class="h-12 border-t border-border-subtle bg-surface-card flex items-center px-4 gap-4 shrink-0 overflow-x-auto">
+<span class="font-label-caps text-label-caps text-on-surface-variant mr-2">ВСТАВКА:</span>
+<button class="flex items-center gap-2 px-3 py-1.5 rounded border border-border-subtle hover:border-primary/50 bg-surface text-on-surface font-label-code text-label-code transition-colors group">
+<span class="material-symbols-outlined text-[16px] text-ai-gradient-end group-hover:animate-pulse">switch_account</span>
+                    ИИ-рисунок Imagen 4
+                </button>
+<button class="flex items-center gap-2 px-3 py-1.5 rounded border border-border-subtle hover:border-primary/50 bg-surface text-on-surface font-label-code text-label-code transition-colors">
+<span class="material-symbols-outlined text-[16px] text-primary">bar_chart</span>
+                    График
+                </button>
+<button class="flex items-center gap-2 px-3 py-1.5 rounded border border-border-subtle hover:border-primary/50 bg-surface text-on-surface font-label-code text-label-code transition-colors">
+<span class="material-symbols-outlined text-[16px] text-tertiary">account_tree</span>
+                    UML диаграмма
+                </button>
+</div>
+</main>
+<!-- Inspector Sidebar (Right) -->
+<aside class="w-[300px] border-l border-border-subtle bg-surface-container shrink-0 flex flex-col h-full overflow-y-auto z-30 hidden xl:flex">
+<div class="h-14 border-b border-border-subtle flex items-center px-4 shrink-0">
+<span class="font-label-caps text-label-caps text-on-surface">ИНСПЕКТОР ПАСПОРТА</span>
+</div>
+<div class="p-4 space-y-6">
+<!-- Metrics -->
+<div>
+<h3 class="font-label-code text-label-code text-on-surface-variant mb-3 flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px]">analytics</span>
+                        Метрики текста
+                    </h3>
+<div class="grid grid-cols-2 gap-2">
+<div class="bg-surface-card border border-border-subtle p-3 rounded">
+<div class="font-label-caps text-label-caps text-on-surface-variant mb-1">СЛОВА</div>
+<div class="font-body-lg text-body-lg text-on-surface font-semibold">4,250</div>
+</div>
+<div class="bg-surface-card border border-border-subtle p-3 rounded relative overflow-hidden group">
+<div class="absolute inset-0 bg-success-emerald/10 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+<div class="font-label-caps text-label-caps text-on-surface-variant mb-1">% УНИКАЛЬНОСТИ</div>
+<div class="font-body-lg text-body-lg text-success-emerald font-semibold">87.4%</div>
+</div>
+</div>
+</div>
+<hr class="border-border-subtle"/>
+<!-- Registry -->
+<div>
+<h3 class="font-label-code text-label-code text-on-surface-variant mb-3 flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px]">toc</span>
+                        Реестр объектов
+                    </h3>
+<div class="space-y-2">
+<div class="flex items-center justify-between p-2 rounded bg-surface-card border border-border-subtle hover:border-primary/50 cursor-pointer transition-colors">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px] text-tertiary">table_chart</span>
+<span class="font-label-code text-label-code text-on-surface truncate max-w-[150px]">Таблица 2.1</span>
+</div>
+<span class="material-symbols-outlined text-[16px] text-success-emerald" title="Passport Indexed">check_circle</span>
+</div>
+<div class="flex items-center justify-between p-2 rounded bg-surface-card border border-border-subtle hover:border-primary/50 cursor-pointer transition-colors ai-pulse">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px] text-ai-gradient-start">image</span>
+<span class="font-label-code text-label-code text-on-surface truncate max-w-[150px]">Рисунок 2.2 (Генерация...)</span>
+</div>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant animate-spin">sync</span>
+</div>
+</div>
+</div>
+</div>
+</aside>
+</div>
+<!-- Footer -->
+<footer class="bg-surface-container-lowest dark:bg-surface-container-lowest fixed bottom-0 w-full z-50 flex justify-between items-center px-4 h-7 border-t border-border-subtle">
+<div class="font-label-code text-label-code text-success-emerald font-bold cursor-default">
+            Autosaved • 4,250 words • GOST: Compliant
+        </div>
+<div class="flex items-center gap-4">
+<a class="font-label-code text-label-code text-tertiary dark:text-tertiary-fixed-dim hover:text-primary dark:hover:text-primary-fixed-dim cursor-default" href="#">System Telemetry</a>
+<a class="font-label-code text-label-code text-tertiary dark:text-tertiary-fixed-dim hover:text-primary dark:hover:text-primary-fixed-dim cursor-default" href="#">Process Monitor</a>
+</div>
+</footer>
+</body></html>

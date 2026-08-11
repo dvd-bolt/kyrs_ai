@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Step 1 - Smart Configurator (Rules &amp; Methodology)</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;700&amp;family=Plus+Jakarta+Sans:wght@500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              "colors": {
+                      "on-surface-variant": "#c2c6d6",
+                      "surface-container-high": "#282a2e",
+                      "primary-fixed-dim": "#adc6ff",
+                      "surface-container-lowest": "#0c0e12",
+                      "on-tertiary": "#003824",
+                      "ai-gradient-start": "#8B5CF6",
+                      "on-error-container": "#ffdad6",
+                      "tertiary-fixed": "#6ffbbe",
+                      "surface-tint": "#adc6ff",
+                      "surface-container": "#1e2024",
+                      "surface-bright": "#37393e",
+                      "tertiary-fixed-dim": "#4edea3",
+                      "inverse-primary": "#005ac2",
+                      "error": "#ffb4ab",
+                      "on-secondary-fixed": "#23005c",
+                      "error-container": "#93000a",
+                      "on-surface": "#e2e2e8",
+                      "on-tertiary-fixed-variant": "#005236",
+                      "primary-fixed": "#d8e2ff",
+                      "inverse-on-surface": "#2f3035",
+                      "success-emerald": "#10B981",
+                      "secondary": "#d0bcff",
+                      "on-primary-container": "#00285d",
+                      "secondary-fixed-dim": "#d0bcff",
+                      "tertiary-container": "#00a572",
+                      "on-primary-fixed": "#001a42",
+                      "primary": "#adc6ff",
+                      "secondary-container": "#571bc1",
+                      "on-tertiary-container": "#00311f",
+                      "on-secondary-fixed-variant": "#5516be",
+                      "on-primary-fixed-variant": "#004395",
+                      "on-background": "#e2e2e8",
+                      "surface": "#111317",
+                      "border-subtle": "#262B36",
+                      "ai-gradient-end": "#EC4899",
+                      "outline-variant": "#424754",
+                      "outline": "#8c909f",
+                      "surface-card": "#161920",
+                      "tertiary": "#4edea3",
+                      "inverse-surface": "#e2e2e8",
+                      "on-error": "#690005",
+                      "surface-container-highest": "#333539",
+                      "primary-container": "#4d8eff",
+                      "on-primary": "#002e6a",
+                      "background": "#111317",
+                      "surface-dim": "#111317",
+                      "on-tertiary-fixed": "#002113",
+                      "surface-container-low": "#1a1c20",
+                      "secondary-fixed": "#e9ddff",
+                      "on-secondary": "#3c0091",
+                      "surface-variant": "#333539",
+                      "on-secondary-container": "#c4abff"
+              },
+              "borderRadius": {
+                      "DEFAULT": "0.125rem",
+                      "lg": "0.25rem",
+                      "xl": "0.5rem",
+                      "full": "0.75rem"
+              },
+              "spacing": {
+                      "unit": "4px",
+                      "inspector-width": "300px",
+                      "gutter": "16px",
+                      "margin-page": "24px",
+                      "sidebar-width": "260px"
+              },
+              "fontFamily": {
+                      "label-caps": ["JetBrains Mono"],
+                      "headline-lg": ["Plus Jakarta Sans"],
+                      "label-code": ["JetBrains Mono"],
+                      "body-md": ["Inter"],
+                      "headline-md": ["Plus Jakarta Sans"],
+                      "preview-doc": ["Times New Roman"],
+                      "body-lg": ["Inter"]
+              },
+              "fontSize": {
+                      "label-caps": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700"}],
+                      "headline-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                      "label-code": ["13px", {"lineHeight": "18px", "fontWeight": "500"}],
+                      "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                      "headline-md": ["24px", {"lineHeight": "32px", "fontWeight": "600"}],
+                      "preview-doc": ["14pt", {"lineHeight": "1.5", "fontWeight": "400"}],
+                      "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}]
+              }
+            },
+          },
+        }
+    </script>
+<style>
+        .ai-glow {
+            box-shadow: 0 0 12px 0 rgba(173, 198, 255, 0.3);
+        }
+        .ai-glow-active {
+            box-shadow: 0 0 16px 2px rgba(139, 92, 246, 0.4);
+            animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 0 12px 0 rgba(139, 92, 246, 0.3); }
+            50% { box-shadow: 0 0 20px 4px rgba(139, 92, 246, 0.6); }
+        }
+        .glass-panel {
+            background-color: rgba(22, 25, 32, 0.85);
+            backdrop-filter: blur(12px);
+        }
+        .dashed-border-neon {
+            border: 2px dashed #3B82F6;
+            transition: all 0.3s ease;
+        }
+        .dashed-border-neon:hover {
+            border-color: #8B5CF6;
+            background-color: rgba(139, 92, 246, 0.05);
+        }
+        .scan-line {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, #8B5CF6, transparent);
+            animation: scan 3s linear infinite;
+        }
+        @keyframes scan {
+            0% { top: 0; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { top: 100%; opacity: 0; }
+        }
+        
+        /* A4 Preview Scaling */
+        .a4-preview-container {
+            aspect-ratio: 1 / 1.414; /* A4 aspect ratio */
+            background-color: #f8f9fa; /* Off-white for paper */
+            position: relative;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        .a4-margin-overlay {
+            position: absolute;
+            top: 2cm; /* Scaled visually */
+            right: 1.5cm;
+            bottom: 2cm;
+            left: 3cm;
+            border: 1px dashed rgba(59, 130, 246, 0.5);
+            pointer-events: none;
+        }
+        .text-times {
+            font-family: 'Times New Roman', Times, serif;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface min-h-screen flex flex-col font-body-md overflow-hidden">
+<!-- TopNavBar -->
+<header class="bg-surface-container-lowest dark:bg-surface-container-lowest text-primary dark:text-primary-fixed-dim font-body-md text-body-md flex justify-between items-center h-12 px-gutter w-full sticky top-0 z-50 border-b border-border-subtle">
+<div class="flex items-center gap-4">
+<span class="font-headline-md text-headline-md font-bold text-primary dark:text-primary-fixed-dim">Платежный терминал</span>
+</div>
+<!-- API Limits Status -->
+<div class="flex items-center gap-4 hidden md:flex font-label-code text-label-code">
+<div class="flex items-center gap-1.5 px-3 py-1 rounded bg-surface-container border border-border-subtle" title="3.6 Flash">
+<span class="material-symbols-outlined text-[16px] text-tertiary">bolt</span>
+<span class="text-on-surface-variant">16/20</span>
+</div>
+<div class="flex items-center gap-1.5 px-3 py-1 rounded bg-surface-container border border-border-subtle" title="3.5 Lite">
+<span class="material-symbols-outlined text-[16px] text-primary">memory</span>
+<span class="text-on-surface-variant">132/500</span>
+</div>
+<div class="flex items-center gap-1.5 px-3 py-1 rounded bg-surface-container border border-border-subtle" title="Imagen 4">
+<span class="material-symbols-outlined text-[16px] text-secondary">image</span>
+<span class="text-on-surface-variant">15/25</span>
+</div>
+</div>
+<div class="flex items-center gap-2">
+<button class="p-2 rounded text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined" data-icon="minimize">minimize</span>
+</button>
+<button class="p-2 rounded text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined" data-icon="fullscreen">fullscreen</span>
+</button>
+<button class="p-2 rounded text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 hover:text-error">
+<span class="material-symbols-outlined" data-icon="close">close</span>
+</button>
+</div>
+</header>
+<div class="flex flex-1 overflow-hidden">
+<!-- SideNavBar -->
+<nav class="bg-surface-container dark:bg-surface-container font-label-caps text-label-caps h-full w-sidebar-width flex flex-col fixed left-0 top-12 z-40 overflow-y-auto border-r border-border-subtle transition-all duration-200 ease-in-out hidden md:flex shrink-0 relative top-0 h-[calc(100vh-3rem-1.75rem)]">
+<!-- Header -->
+<div class="p-4 border-b border-border-subtle flex flex-col gap-2">
+<div class="flex items-center gap-3">
+<div class="w-8 h-8 rounded bg-primary-container flex items-center justify-center text-on-primary-container font-bold ai-glow">
+                        PI
+                    </div>
+<div>
+<h2 class="font-headline-md text-[14px] font-bold text-on-surface">Project Passport</h2>
+<div class="text-tertiary-fixed-dim text-[10px] flex items-center gap-1 mt-1">
+<span class="material-symbols-outlined text-[12px]">check_circle</span> Wizard Progress: 65%
+                        </div>
+</div>
+</div>
+<!-- Progress Bar -->
+<div class="w-full h-1 bg-surface-container-highest rounded-full mt-2 overflow-hidden">
+<div class="h-full bg-ai-gradient-start to-ai-gradient-end w-[65%] shadow-[0_0_8px_#8B5CF6]"></div>
+</div>
+</div>
+<!-- Tabs -->
+<div class="flex-1 py-4 px-2 space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg bg-primary-container dark:bg-primary-container text-on-primary-container dark:text-on-primary-container transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="gavel">gavel</span>
+<span>1. Rules</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="library_books">library_books</span>
+<span>2. Sources</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="title">title</span>
+<span>3. Title</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="format_list_bulleted">format_list_bulleted</span>
+<span>4. Plan</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="edit_note">edit_note</span>
+<span>5. Studio</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="auto_awesome">auto_awesome</span>
+<span>6. Build</span>
+</a>
+</div>
+<!-- Footer Tabs -->
+<div class="p-2 border-t border-border-subtle space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="settings">settings</span>
+<span>Settings</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined text-[18px]" data-icon="help">help</span>
+<span>Support</span>
+</a>
+</div>
+</nav>
+<!-- Main Content Area -->
+<main class="flex-1 flex flex-col md:flex-row bg-background overflow-y-auto">
+<!-- Center Stage: Drag & Drop Configurator -->
+<div class="flex-1 p-margin-page flex flex-col gap-6 max-w-4xl mx-auto w-full">
+<div class="flex justify-between items-end">
+<div>
+<h1 class="font-headline-lg text-headline-lg text-on-surface">Rules &amp; Methodology</h1>
+<p class="text-on-surface-variant mt-2 max-w-lg">Upload your university guidelines or methodology documents. The system will automatically extract formatting rules.</p>
+</div>
+</div>
+<!-- D&D Zone -->
+<div class="relative flex-1 min-h-[400px] bg-surface-card rounded-xl dashed-border-neon flex flex-col items-center justify-center p-8 overflow-hidden group cursor-pointer">
+<div class="scan-line hidden group-hover:block"></div>
+<div class="w-20 h-20 rounded-full bg-surface-container-highest flex items-center justify-center mb-6 ai-glow-active">
+<span class="material-symbols-outlined text-[40px] text-primary" data-icon="upload_file">upload_file</span>
+</div>
+<h3 class="font-headline-md text-headline-md text-on-surface mb-2">Drop Methodology Here</h3>
+<p class="text-on-surface-variant text-center max-w-sm mb-6">Drag and drop PDF, DOCX, or paste URL to extract GOST/University formatting requirements.</p>
+<button class="bg-[#3B82F6] hover:bg-primary-container text-white px-6 py-2.5 rounded-lg font-medium transition-colors flex items-center gap-2">
+<span class="material-symbols-outlined text-[18px]">folder_open</span>
+                        Browse Files
+                    </button>
+<!-- Example recognized card (Floating Glassmorphism) -->
+<div class="absolute bottom-6 left-6 right-6 glass-panel border border-border-subtle rounded-lg p-4 flex items-start gap-4">
+<div class="w-10 h-10 rounded bg-success-emerald/20 flex items-center justify-center shrink-0 border border-success-emerald/30">
+<span class="material-symbols-outlined text-success-emerald" data-icon="check_circle">check_circle</span>
+</div>
+<div class="flex-1">
+<div class="flex justify-between items-center mb-1">
+<h4 class="font-bold text-on-surface text-[14px]">Extracted Rules: Methodological Guidelines v2.pdf</h4>
+<span class="text-success-emerald font-label-code text-[11px] px-2 py-0.5 rounded bg-success-emerald/10">100% Confidence</span>
+</div>
+<div class="font-label-code text-[12px] text-on-surface-variant grid grid-cols-2 gap-x-4 gap-y-2 mt-2">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[14px]">margin</span>
+                                    Fields: L:3cm, R:1.5cm, T:2cm, B:2cm
+                                </div>
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[14px]">font_download</span>
+                                    Times New Roman, 14pt
+                                </div>
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[14px]">format_line_spacing</span>
+                                    1.5 Line Spacing
+                                </div>
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-[14px]">format_indent_increase</span>
+                                    Paragraph Indent: 1.25cm
+                                </div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Right Sidebar: Interactive Preview -->
+<div class="w-full md:w-[360px] bg-surface-card border-l border-border-subtle p-6 flex flex-col shrink-0">
+<h3 class="font-headline-md text-[16px] text-on-surface mb-6 flex items-center gap-2">
+<span class="material-symbols-outlined text-primary text-[20px]">visibility</span>
+                    Format Preview
+                </h3>
+<div class="flex-1 flex flex-col items-center justify-center p-4 bg-surface-container rounded-xl border border-border-subtle overflow-hidden relative">
+<!-- A4 Representation -->
+<div class="a4-preview-container w-[200px] shadow-lg rounded-sm p-4 relative overflow-hidden transition-transform hover:scale-105 duration-300">
+<div class="a4-margin-overlay"></div>
+<div class="text-times text-[#333] text-[6px] leading-[1.5] text-justify opacity-80 mt-2">
+<p class="indent-[8px] mb-2 font-bold text-center">CHAPTER 1. THEORETICAL FRAMEWORK</p>
+<p class="indent-[8px] mb-2">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+<p class="indent-[8px] mb-2">Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+<p class="indent-[8px]">Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam.</p>
+</div>
+<!-- Margin Indicators (Visual Aids) -->
+<div class="absolute left-0 top-1/2 -translate-y-1/2 w-[3cm] border-b border-primary border-dashed flex items-center justify-center h-4 bg-primary/10" style="width: 15%; margin-left: 2px;">
+<span class="font-label-code text-[5px] text-primary">3cm</span>
+</div>
+<div class="absolute right-0 top-[20%] w-[1.5cm] border-b border-primary border-dashed flex items-center justify-center h-4 bg-primary/10" style="width: 7%; margin-right: 2px;">
+<span class="font-label-code text-[5px] text-primary">1.5cm</span>
+</div>
+</div>
+</div>
+<div class="mt-6 flex gap-3">
+<button class="flex-1 bg-surface-container hover:bg-surface-container-highest border border-border-subtle text-on-surface py-2 rounded-lg font-medium transition-colors text-[13px]">
+                        Manual Override
+                    </button>
+<button class="flex-1 bg-gradient-to-r from-ai-gradient-start to-ai-gradient-end hover:opacity-90 text-white py-2 rounded-lg font-medium transition-colors text-[13px] shadow-[0_0_10px_rgba(139,92,246,0.3)]">
+                        Confirm Rules
+                    </button>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer -->
+<footer class="bg-surface-container-lowest dark:bg-surface-container-lowest text-tertiary dark:text-tertiary-fixed-dim font-label-code text-label-code fixed bottom-0 w-full z-50 flex justify-between items-center px-4 h-7 border-t border-border-subtle">
+<div class="flex items-center gap-2">
+<span class="w-2 h-2 rounded-full bg-success-emerald ai-glow"></span>
+<span class="text-on-surface-variant dark:text-on-surface-variant">Autosaved at 11:20 | Progress: 0 / 8,000 words (0%) | GOST: 100% Match</span>
+</div>
+<div class="flex items-center gap-4 text-on-surface-variant dark:text-on-surface-variant">
+<a class="hover:text-primary dark:hover:text-primary-fixed-dim cursor-default" href="#">System Telemetry</a>
+<a class="hover:text-primary dark:hover:text-primary-fixed-dim cursor-default" href="#">Process Monitor</a>
+</div>
+</footer>
+</body></html>

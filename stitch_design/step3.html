@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="ru"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Title Builder - Project Passport</title>
+<!-- Material Symbols -->
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<!-- Tailwind CSS -->
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<!-- Tailwind Config based on Design System -->
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "surface-variant": "#333539",
+                        "error-container": "#93000a",
+                        "surface-tint": "#adc6ff",
+                        "primary": "#adc6ff",
+                        "tertiary": "#4edea3",
+                        "on-primary": "#002e6a",
+                        "on-error-container": "#ffdad6",
+                        "ai-gradient-start": "#8B5CF6",
+                        "secondary-fixed": "#e9ddff",
+                        "inverse-primary": "#005ac2",
+                        "on-tertiary-fixed-variant": "#005236",
+                        "surface-bright": "#37393e",
+                        "success-emerald": "#10B981",
+                        "tertiary-container": "#00a572",
+                        "surface-card": "#161920",
+                        "outline": "#8c909f",
+                        "inverse-surface": "#e2e2e8",
+                        "surface-dim": "#111317",
+                        "primary-fixed": "#d8e2ff",
+                        "secondary": "#d0bcff",
+                        "tertiary-fixed": "#6ffbbe",
+                        "surface-container-low": "#1a1c20",
+                        "secondary-fixed-dim": "#d0bcff",
+                        "on-secondary-container": "#c4abff",
+                        "on-secondary": "#3c0091",
+                        "on-primary-container": "#00285d",
+                        "on-surface-variant": "#c2c6d6",
+                        "secondary-container": "#571bc1",
+                        "on-surface": "#e2e2e8",
+                        "on-tertiary-fixed": "#002113",
+                        "on-tertiary-container": "#00311f",
+                        "border-subtle": "#262B36",
+                        "on-primary-fixed-variant": "#004395",
+                        "surface-container-high": "#282a2e",
+                        "on-error": "#690005",
+                        "background": "#111317",
+                        "surface-container-highest": "#333539",
+                        "primary-container": "#4d8eff",
+                        "surface": "#111317",
+                        "outline-variant": "#424754",
+                        "primary-fixed-dim": "#adc6ff",
+                        "tertiary-fixed-dim": "#4edea3",
+                        "inverse-on-surface": "#2f3035",
+                        "on-background": "#e2e2e8",
+                        "on-secondary-fixed": "#23005c",
+                        "surface-container": "#1e2024",
+                        "on-primary-fixed": "#001a42",
+                        "on-secondary-fixed-variant": "#5516be",
+                        "error": "#ffb4ab",
+                        "surface-container-lowest": "#0c0e12",
+                        "ai-gradient-end": "#EC4899",
+                        "on-tertiary": "#003824"
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    spacing: {
+                        "gutter": "16px",
+                        "sidebar-width": "260px",
+                        "margin-page": "24px",
+                        "inspector-width": "300px",
+                        "unit": "4px"
+                    },
+                    fontFamily: {
+                        "body-md": ["Inter", "sans-serif"],
+                        "headline-lg": ["Plus Jakarta Sans", "sans-serif"],
+                        "body-lg": ["Inter", "sans-serif"],
+                        "label-code": ["JetBrains Mono", "monospace"],
+                        "preview-doc": ["Times New Roman", "serif"],
+                        "label-caps": ["JetBrains Mono", "monospace"],
+                        "headline-md": ["Plus Jakarta Sans", "sans-serif"]
+                    },
+                    fontSize: {
+                        "body-md": ["14px", { lineHeight: "20px", fontWeight: "400" }],
+                        "headline-lg": ["32px", { lineHeight: "40px", letterSpacing: "-0.02em", fontWeight: "700" }],
+                        "body-lg": ["16px", { lineHeight: "24px", fontWeight: "400" }],
+                        "label-code": ["13px", { lineHeight: "18px", fontWeight: "500" }],
+                        "preview-doc": ["14pt", { lineHeight: "1.5", fontWeight: "400" }],
+                        "label-caps": ["11px", { lineHeight: "16px", letterSpacing: "0.05em", fontWeight: "700" }],
+                        "headline-md": ["24px", { lineHeight: "32px", fontWeight: "600" }]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        /* Custom scrollbar for IDE feel */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #333539; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #424754; }
+        
+        /* Utility for Material Symbols specific weights */
+        .material-symbols-outlined[data-weight="fill"] { font-variation-settings: 'FILL' 1; }
+        
+        /* Form inputs styling reset & overrides */
+        .ide-input {
+            @apply w-full bg-surface-dim border border-border-subtle rounded text-on-surface font-body-md px-3 py-2 transition-colors;
+        }
+        .ide-input:focus {
+            @apply border-primary outline-none ring-1 ring-primary/20;
+        }
+        .ide-label {
+            @apply block text-on-surface-variant font-label-code text-label-code mb-1;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface h-screen flex flex-col overflow-hidden font-body-md">
+<!-- TopNavBar (Shared Component) -->
+<header class="bg-surface-container-lowest dark:bg-surface-container-lowest border-b border-border-subtle flex justify-between items-center h-12 px-gutter w-full sticky top-0 z-50">
+<div class="flex items-center gap-4">
+<span class="font-headline-md text-headline-md font-bold text-primary dark:text-primary-fixed-dim">
+                Платежный терминал
+            </span>
+</div>
+<div class="flex items-center gap-2">
+<!-- trailing_icon_actions: ["bolt", "memory", "image", "minimize", "fullscreen", "close"] -->
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">bolt</span>
+</button>
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">memory</span>
+</button>
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">image</span>
+</button>
+<div class="w-px h-4 bg-border-subtle mx-1"></div>
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">minimize</span>
+</button>
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">fullscreen</span>
+</button>
+<button class="p-1 rounded hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 text-on-surface-variant dark:text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">close</span>
+</button>
+</div>
+</header>
+<div class="flex flex-1 overflow-hidden">
+<!-- SideNavBar (Shared Component) -->
+<aside class="bg-surface-container dark:bg-surface-container border-r border-border-subtle flex flex-col h-screen fixed left-0 top-12 z-40 overflow-y-auto w-[260px]">
+<div class="p-4 border-b border-border-subtle flex items-center gap-3">
+<div class="w-8 h-8 rounded bg-primary-container flex items-center justify-center shrink-0">
+<span class="material-symbols-outlined text-on-primary-container" data-weight="fill">inventory_2</span>
+</div>
+<div>
+<h2 class="font-label-caps text-label-caps text-primary truncate">Project Passport</h2>
+<p class="font-label-code text-[10px] text-success-emerald mt-0.5">Wizard Progress: 65%</p>
+</div>
+</div>
+<nav class="flex-1 py-4 px-2 space-y-1">
+<!-- tab_labels: ["Rules", "Sources", "Title", "Plan", "Studio", "Build"] -->
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">gavel</span>
+                    Rules
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">library_books</span>
+                    Sources
+                </a>
+<!-- ACTIVE TAB LOGIC: Matching "Title Builder" to "Title" tab -->
+<a class="flex items-center gap-3 px-3 py-2 bg-primary-container dark:bg-primary-container text-on-primary-container dark:text-on-primary-container rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">title</span>
+                    Title
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">format_list_bulleted</span>
+                    Plan
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">edit_note</span>
+                    Studio
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">auto_awesome</span>
+                    Build
+                </a>
+</nav>
+<div class="p-2 border-t border-border-subtle space-y-1">
+<!-- footer_tab_labels: ["Settings", "Support"] -->
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">settings</span>
+                    Settings
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest rounded-lg transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">help</span>
+                    Support
+                </a>
+</div>
+</aside>
+<!-- Main Workspace (Stage) -->
+<main class="flex-1 ml-[260px] flex flex-col h-full bg-background pb-7"> <!-- pb-7 to clear footer -->
+<!-- Workspace Header -->
+<div class="px-margin-page py-6 flex items-center justify-between shrink-0">
+<div>
+<div class="flex items-center gap-2 text-on-surface-variant mb-1">
+<span class="font-label-code text-[11px] uppercase tracking-wider">Шаг 3 из 6</span>
+<span class="w-1 h-1 rounded-full bg-border-subtle"></span>
+<span class="font-label-code text-[11px] text-tertiary">Форматирование</span>
+</div>
+<h1 class="font-headline-lg text-headline-lg text-on-surface">Сборка Титульного Листа</h1>
+</div>
+<div class="flex items-center gap-3">
+<button class="px-4 py-2 bg-surface-card border border-border-subtle rounded-lg text-on-surface hover:bg-surface-container-highest transition-colors font-label-code text-[12px] flex items-center gap-2">
+<span class="material-symbols-outlined text-[16px]">history</span>
+                        Сбросить
+                    </button>
+<button class="px-4 py-2 bg-[#3B82F6] hover:bg-inverse-primary rounded-lg text-white transition-colors font-label-code text-[12px] flex items-center gap-2 shadow-[0_0_12px_rgba(59,130,246,0.3)]">
+                        Сохранить и продолжить
+                        <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
+</button>
+</div>
+</div>
+<!-- 2-Column Layout -->
+<div class="flex-1 overflow-hidden px-margin-page pb-margin-page flex gap-6">
+<!-- LEFT COLUMN: Form 'Constructor' -->
+<div class="flex-1 bg-surface-card border border-border-subtle rounded-xl flex flex-col overflow-hidden">
+<div class="px-5 py-3 border-b border-border-subtle bg-surface-container-lowest flex items-center gap-2 shrink-0">
+<span class="material-symbols-outlined text-[18px] text-primary">data_object</span>
+<h3 class="font-label-code text-on-surface">Конструктор (Метаданные)</h3>
+</div>
+<div class="flex-1 overflow-y-auto p-5 space-y-5">
+<!-- Block 1: Organization -->
+<div class="space-y-4">
+<h4 class="font-label-caps text-on-surface-variant flex items-center gap-2 border-b border-border-subtle pb-2">
+<span class="material-symbols-outlined text-[14px]">account_balance</span>
+                                Учебное Заведение
+                            </h4>
+<div>
+<label class="ide-label">Министерство</label>
+<input class="ide-input" placeholder="Введите ведомство" type="text" value="Министерство науки и высшего образования Российской Федерации"/>
+</div>
+<div>
+<label class="ide-label">ВУЗ</label>
+<input class="ide-input" placeholder="Полное название ВУЗа" type="text" value="ФГБОУ ВО «Государственный Университет»"/>
+</div>
+<div>
+<label class="ide-label">Кафедра</label>
+<input class="ide-input" placeholder="Название кафедры" type="text" value="Кафедра информационных систем"/>
+</div>
+</div>
+<!-- Block 2: Work Details -->
+<div class="space-y-4 pt-2">
+<h4 class="font-label-caps text-on-surface-variant flex items-center gap-2 border-b border-border-subtle pb-2">
+<span class="material-symbols-outlined text-[14px]">description</span>
+                                Сведения о работе
+                            </h4>
+<div>
+<label class="ide-label">Дисциплина</label>
+<input class="ide-input" placeholder="Название предмета" type="text" value="Проектирование интерфейсов"/>
+</div>
+<div>
+<label class="ide-label">Тема работы</label>
+<textarea class="ide-input min-h-[80px] resize-y" placeholder="Полная тема курсовой/диплома">Разработка дизайн-системы для образовательной платформы</textarea>
+</div>
+</div>
+<!-- Block 3: People -->
+<div class="space-y-4 pt-2">
+<h4 class="font-label-caps text-on-surface-variant flex items-center gap-2 border-b border-border-subtle pb-2">
+<span class="material-symbols-outlined text-[14px]">group</span>
+                                Лица
+                            </h4>
+<div class="grid grid-cols-2 gap-4">
+<div>
+<label class="ide-label">Исполнитель (Студент)</label>
+<input class="ide-input" placeholder="ФИО" type="text" value="Иванов И. И."/>
+<input class="ide-input mt-2" placeholder="Группа/Курс" type="text" value="Группа ИТ-41"/>
+</div>
+<div>
+<label class="ide-label">Проверил (Преподаватель)</label>
+<input class="ide-input" placeholder="Должность, ФИО" type="text" value="к.т.н., доцент Петров П. П."/>
+</div>
+</div>
+</div>
+<!-- Block 4: Footer info -->
+<div class="space-y-4 pt-2 pb-4">
+<div class="grid grid-cols-2 gap-4">
+<div>
+<label class="ide-label">Город</label>
+<input class="ide-input" placeholder="Город" type="text" value="Москва"/>
+</div>
+<div>
+<label class="ide-label">Год</label>
+<input class="ide-input" placeholder="Год" type="text" value="2024"/>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- RIGHT COLUMN: Preview / Drag & Drop -->
+<div class="flex-1 flex flex-col overflow-hidden">
+<!-- Mode Switcher -->
+<div class="bg-surface-card p-1 rounded-lg border border-border-subtle flex mb-4 shrink-0 shadow-sm w-fit">
+<button class="px-4 py-1.5 rounded-md text-[13px] font-label-code transition-all bg-primary-container text-on-primary-container shadow-sm" id="btn-preview">
+                            Миниатюра DOCX
+                        </button>
+<button class="px-4 py-1.5 rounded-md text-[13px] font-label-code transition-all text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high" id="btn-upload">
+                            Загрузить Готовый
+                        </button>
+</div>
+<!-- Container for views -->
+<div class="flex-1 relative border border-border-subtle rounded-xl bg-surface-dim overflow-hidden shadow-inner flex justify-center p-6">
+<!-- VIEW 1: Document Preview (Active) -->
+<div class="w-full h-full flex items-center justify-center" id="view-preview">
+<!-- Paper representation -->
+<div class="bg-white aspect-[1/1.414] h-full max-h-[800px] shadow-2xl p-[8%] flex flex-col justify-between font-preview-doc text-black relative select-none">
+<!-- Header -->
+<div class="text-center text-[11pt] leading-tight mb-8">
+<p class="uppercase">Министерство науки и высшего образования Российской Федерации</p>
+<p class="mt-2">ФГБОУ ВО «Государственный Университет»</p>
+<p class="mt-2">Кафедра информационных систем</p>
+</div>
+<!-- Middle -->
+<div class="text-center flex-1 flex flex-col justify-center mb-8">
+<h2 class="font-bold text-[18pt] mb-4">КУРСОВАЯ РАБОТА</h2>
+<p class="text-[12pt] mb-2">по дисциплине: Проектирование интерфейсов</p>
+<p class="text-[14pt] font-bold italic mt-4">«Разработка дизайн-системы для образовательной платформы»</p>
+</div>
+<!-- Signatures block -->
+<div class="flex justify-end mb-16 text-[12pt]">
+<div class="w-1/2">
+<p class="mb-4">Исполнитель:<br/>Студент группы ИТ-41<br/>__________ Иванов И. И.</p>
+<p>Проверил:<br/>к.т.н., доцент<br/>__________ Петров П. П.</p>
+</div>
+</div>
+<!-- Footer -->
+<div class="text-center text-[12pt]">
+<p>Москва 2024</p>
+</div>
+<!-- Overlay IDE decoration -->
+<div class="absolute top-2 right-2 flex items-center gap-1 bg-[#10B981]/10 px-2 py-1 rounded">
+<span class="material-symbols-outlined text-[14px] text-[#10B981]">check_circle</span>
+<span class="text-[10px] font-label-caps text-[#10B981]">GOST 2.105-95</span>
+</div>
+</div>
+</div>
+<!-- VIEW 2: Drag and Drop Upload (Hidden by default) -->
+<div class="hidden w-full h-full flex flex-col items-center justify-center" id="view-upload">
+<div class="w-full max-w-md aspect-video border-2 border-dashed border-border-subtle rounded-xl flex flex-col items-center justify-center bg-surface-card hover:border-primary hover:bg-surface-container transition-all cursor-pointer group">
+<div class="w-16 h-16 rounded-full bg-surface-container-high flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+<span class="material-symbols-outlined text-[32px] text-on-surface-variant group-hover:text-primary transition-colors">upload_file</span>
+</div>
+<h3 class="font-headline-md text-on-surface mb-2">Загрузить DOCX</h3>
+<p class="font-body-md text-on-surface-variant text-center px-8">
+                                    Перетащите готовый титульный лист сюда или <span class="text-primary underline decoration-primary/50 underline-offset-4">выберите файл</span>
+</p>
+</div>
+<div class="mt-6 flex items-center gap-2 text-on-surface-variant">
+<span class="material-symbols-outlined text-[16px]">info</span>
+<span class="font-label-code text-[12px]">Поддерживается формат Microsoft Word (.docx). Макс размер: 5MB</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer (Shared Component) -->
+<footer class="bg-surface-container-lowest dark:bg-surface-container-lowest border-t border-border-subtle fixed bottom-0 w-full z-50 flex justify-between items-center px-4 h-7 cursor-default">
+<div class="font-label-code text-label-code text-tertiary dark:text-tertiary-fixed-dim flex items-center gap-4">
+<span>Autosaved • 4,250 words • GOST: Compliant</span>
+</div>
+<div class="flex items-center gap-6">
+<!-- links: ["System Telemetry", "Process Monitor"] -->
+<a class="font-label-code text-label-code text-on-surface-variant dark:text-on-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors" href="#">System Telemetry</a>
+<a class="font-label-code text-label-code text-on-surface-variant dark:text-on-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors" href="#">Process Monitor</a>
+</div>
+</footer>
+<script>
+        // Simple logic to switch between Preview and Upload modes
+        document.addEventListener('DOMContentLoaded', () => {
+            const btnPreview = document.getElementById('btn-preview');
+            const btnUpload = document.getElementById('btn-upload');
+            const viewPreview = document.getElementById('view-preview');
+            const viewUpload = document.getElementById('view-upload');
+
+            const activeClass = ['bg-primary-container', 'text-on-primary-container', 'shadow-sm'];
+            const inactiveClass = ['text-on-surface-variant', 'hover:text-on-surface', 'hover:bg-surface-container-high'];
+
+            function setMode(mode) {
+                if (mode === 'preview') {
+                    // Update buttons
+                    btnPreview.classList.add(...activeClass);
+                    btnPreview.classList.remove(...inactiveClass);
+                    btnUpload.classList.add(...inactiveClass);
+                    btnUpload.classList.remove(...activeClass);
+                    
+                    // Update views
+                    viewPreview.classList.remove('hidden');
+                    viewUpload.classList.add('hidden');
+                } else {
+                    // Update buttons
+                    btnUpload.classList.add(...activeClass);
+                    btnUpload.classList.remove(...inactiveClass);
+                    btnPreview.classList.add(...inactiveClass);
+                    btnPreview.classList.remove(...activeClass);
+                    
+                    // Update views
+                    viewUpload.classList.remove('hidden');
+                    viewPreview.classList.add('hidden');
+                }
+            }
+
+            btnPreview.addEventListener('click', () => setMode('preview'));
+            btnUpload.addEventListener('click', () => setMode('upload'));
+        });
+    </script>
+</body></html>

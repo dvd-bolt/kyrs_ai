@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="ru"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Шаг 6: Литература &amp; Финал - Project Passport</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "surface-variant": "#333539",
+                        "error-container": "#93000a",
+                        "surface-tint": "#adc6ff",
+                        "primary": "#adc6ff",
+                        "tertiary": "#4edea3",
+                        "on-primary": "#002e6a",
+                        "on-error-container": "#ffdad6",
+                        "ai-gradient-start": "#8B5CF6",
+                        "secondary-fixed": "#e9ddff",
+                        "inverse-primary": "#005ac2",
+                        "on-tertiary-fixed-variant": "#005236",
+                        "surface-bright": "#37393e",
+                        "success-emerald": "#10B981",
+                        "tertiary-container": "#00a572",
+                        "surface-card": "#161920",
+                        "outline": "#8c909f",
+                        "inverse-surface": "#e2e2e8",
+                        "surface-dim": "#111317",
+                        "primary-fixed": "#d8e2ff",
+                        "secondary": "#d0bcff",
+                        "tertiary-fixed": "#6ffbbe",
+                        "surface-container-low": "#1a1c20",
+                        "secondary-fixed-dim": "#d0bcff",
+                        "on-secondary-container": "#c4abff",
+                        "on-secondary": "#3c0091",
+                        "on-primary-container": "#00285d",
+                        "on-surface-variant": "#c2c6d6",
+                        "secondary-container": "#571bc1",
+                        "on-surface": "#e2e2e8",
+                        "on-tertiary-fixed": "#002113",
+                        "on-tertiary-container": "#00311f",
+                        "border-subtle": "#262B36",
+                        "on-primary-fixed-variant": "#004395",
+                        "surface-container-high": "#282a2e",
+                        "on-error": "#690005",
+                        "background": "#111317",
+                        "surface-container-highest": "#333539",
+                        "primary-container": "#4d8eff",
+                        "surface": "#111317",
+                        "outline-variant": "#424754",
+                        "primary-fixed-dim": "#adc6ff",
+                        "tertiary-fixed-dim": "#4edea3",
+                        "inverse-on-surface": "#2f3035",
+                        "on-background": "#e2e2e8",
+                        "on-secondary-fixed": "#23005c",
+                        "surface-container": "#1e2024",
+                        "on-primary-fixed": "#001a42",
+                        "on-secondary-fixed-variant": "#5516be",
+                        "error": "#ffb4ab",
+                        "surface-container-lowest": "#0c0e12",
+                        "ai-gradient-end": "#EC4899",
+                        "on-tertiary": "#003824"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "spacing": {
+                        "gutter": "16px",
+                        "sidebar-width": "260px",
+                        "margin-page": "24px",
+                        "inspector-width": "300px",
+                        "unit": "4px"
+                    },
+                    "fontFamily": {
+                        "body-md": ["Inter"],
+                        "headline-lg": ["Plus Jakarta Sans"],
+                        "body-lg": ["Inter"],
+                        "label-code": ["JetBrains Mono"],
+                        "preview-doc": ["Times New Roman"],
+                        "label-caps": ["JetBrains Mono"],
+                        "headline-md": ["Plus Jakarta Sans"]
+                    },
+                    "fontSize": {
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "headline-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "body-lg": ["16px", { "lineHeight": "24px", "fontWeight": "400" }],
+                        "label-code": ["13px", { "lineHeight": "18px", "fontWeight": "500" }],
+                        "preview-doc": ["14pt", { "lineHeight": "1.5", "fontWeight": "400" }],
+                        "label-caps": ["11px", { "lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700" }],
+                        "headline-md": ["24px", { "lineHeight": "32px", "fontWeight": "600" }]
+                    }
+                }
+            }
+        }
+    </script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@500;700&amp;family=Plus+Jakarta+Sans:wght@600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .ai-glow {
+            box-shadow: 0 0 12px rgba(139, 92, 246, 0.4);
+        }
+        .emerald-glow {
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.6);
+            animation: pulse-emerald 2s infinite;
+        }
+        @keyframes pulse-emerald {
+            0% { box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); }
+            50% { box-shadow: 0 0 25px rgba(16, 185, 129, 0.7); }
+            100% { box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); }
+        }
+        .glass-panel {
+            background: rgba(22, 25, 32, 0.85);
+            backdrop-filter: blur(12px);
+        }
+        /* Background animation simulating document assembly */
+        .doc-particle {
+            position: absolute;
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 2px;
+            animation: floatUp 15s linear infinite;
+        }
+        @keyframes floatUp {
+            0% { transform: translateY(100vh) rotate(0deg); opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { transform: translateY(-100px) rotate(360deg); opacity: 0; }
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface h-screen flex flex-col overflow-hidden relative selection:bg-primary-container selection:text-on-primary-container">
+<!-- Background Animation Container -->
+<div class="absolute inset-0 pointer-events-none z-0 overflow-hidden opacity-30" id="particles-container"></div>
+<!-- TopNavBar -->
+<header class="bg-surface-container-lowest dark:bg-surface-container-lowest border-b border-border-subtle flex justify-between items-center h-12 px-gutter w-full sticky top-0 z-50">
+<div class="font-headline-md text-headline-md font-bold text-primary dark:text-primary-fixed-dim">
+            Платежный терминал
+        </div>
+<div class="flex items-center space-x-4">
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="bolt">bolt</span>
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="memory">memory</span>
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="image">image</span>
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="minimize">minimize</span>
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="fullscreen">fullscreen</span>
+<span class="material-symbols-outlined text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high transition-colors cursor-pointer active:opacity-80 p-1 rounded-DEFAULT" data-icon="close">close</span>
+</div>
+</header>
+<div class="flex flex-1 overflow-hidden z-10 relative">
+<!-- SideNavBar -->
+<nav class="bg-surface-container dark:bg-surface-container border-r border-border-subtle flex flex-col h-full w-sidebar-width fixed left-0 top-12 z-40 overflow-y-auto">
+<div class="p-gutter border-b border-border-subtle">
+<div class="flex items-center space-x-3 mb-2">
+<div class="w-8 h-8 rounded-lg bg-surface-variant flex items-center justify-center border border-border-subtle">
+<span class="material-symbols-outlined text-primary text-sm" data-icon="rocket">rocket</span>
+</div>
+<div>
+<h2 class="font-label-caps text-label-caps text-primary">Project Passport</h2>
+<div class="text-xs text-on-surface-variant mt-0.5">Wizard Progress: 65%</div>
+</div>
+</div>
+<div class="w-full h-1 bg-surface-variant rounded-full mt-2 overflow-hidden">
+<div class="h-full bg-primary ai-glow" style="width: 65%;"></div>
+</div>
+</div>
+<div class="flex-1 py-4 px-2 space-y-1">
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="gavel">gavel</span>
+<span class="font-label-caps text-label-caps">Rules</span>
+</a>
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="library_books">library_books</span>
+<span class="font-label-caps text-label-caps">Sources</span>
+</a>
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="title">title</span>
+<span class="font-label-caps text-label-caps">Title</span>
+</a>
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="format_list_bulleted">format_list_bulleted</span>
+<span class="font-label-caps text-label-caps">Plan</span>
+</a>
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="edit_note">edit_note</span>
+<span class="font-label-caps text-label-caps">Studio</span>
+</a>
+<a class="flex items-center px-3 py-2 bg-primary-container dark:bg-primary-container text-on-primary-container dark:text-on-primary-container rounded-lg transition-all duration-200 ease-in-out group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="auto_awesome">auto_awesome</span>
+<span class="font-label-caps text-label-caps font-bold">Build</span>
+</a>
+</div>
+<div class="p-2 border-t border-border-subtle space-y-1">
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="settings">settings</span>
+<span class="font-label-caps text-label-caps">Settings</span>
+</a>
+<a class="flex items-center px-3 py-2 text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-highest dark:hover:bg-surface-container-highest transition-all duration-200 ease-in-out rounded-lg group" href="#">
+<span class="material-symbols-outlined mr-3 text-lg" data-icon="help">help</span>
+<span class="font-label-caps text-label-caps">Support</span>
+</a>
+</div>
+</nav>
+<!-- Main Workspace (Center Pane) -->
+<main class="flex-1 ml-[260px] p-margin-page flex flex-col h-[calc(100vh-48px-28px)] overflow-y-auto relative">
+<div class="max-w-4xl mx-auto w-full space-y-8 flex flex-col h-full">
+<!-- Top Section: Bibliography -->
+<div class="glass-panel border border-border-subtle rounded-xl p-6 shadow-lg flex-shrink-0 relative overflow-hidden">
+<!-- Subtle AI Glow accent top border -->
+<div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-ai-gradient-start to-ai-gradient-end opacity-50"></div>
+<div class="flex justify-between items-center mb-6">
+<div>
+<h1 class="font-headline-lg text-headline-lg text-on-surface flex items-center gap-3">
+<span class="material-symbols-outlined text-primary" data-icon="library_books">library_books</span>
+                                Литература &amp; Финал
+                            </h1>
+<p class="font-body-md text-body-md text-on-surface-variant mt-1">Шаг 6: Проверка источников и сборка финального документа.</p>
+</div>
+<button class="bg-surface-variant hover:bg-surface-container-highest border border-border-subtle text-on-surface font-label-code text-label-code px-4 py-2 rounded-lg flex items-center gap-2 transition-colors focus:outline-none focus:ring-1 focus:ring-primary">
+<span class="material-symbols-outlined text-sm" data-icon="search">search</span>
+                            Поиск в Google Scholar
+                        </button>
+</div>
+<div class="space-y-3">
+<div class="flex items-center justify-between border-b border-border-subtle pb-2 mb-2">
+<span class="font-label-caps text-label-caps text-on-surface-variant">СГЕНЕРИРОВАННЫЕ ИСТОЧНИКИ (ГОСТ Р 7.0.100-2018)</span>
+<span class="bg-tertiary-container/20 text-tertiary px-2 py-0.5 rounded text-xs font-label-code flex items-center gap-1 border border-tertiary/30">
+<span class="material-symbols-outlined text-[12px]" data-icon="check_circle">check_circle</span>
+                                ГОСТ: Compliant
+                            </span>
+</div>
+<!-- Source Items -->
+<div class="bg-surface-container-low border border-border-subtle rounded-lg p-3 hover:border-primary/50 transition-colors cursor-default group flex gap-3">
+<div class="mt-0.5"><span class="material-symbols-outlined text-on-surface-variant group-hover:text-primary transition-colors text-lg" data-icon="menu_book">menu_book</span></div>
+<div>
+<p class="font-body-md text-body-md text-on-surface leading-snug">Иванов, А. А. Методология разработки сложных программных систем в условиях неопределенности / А. А. Иванов, Б. Б. Петров // Вестник программной инженерии. – 2023. – Т. 15, № 4. – С. 45-56. – DOI 10.1234/vpi.2023.4.45.</p>
+<div class="flex gap-2 mt-2">
+<span class="text-xs font-label-code text-primary bg-primary/10 px-1.5 py-0.5 rounded border border-primary/20">Журнал</span>
+</div>
+</div>
+</div>
+<div class="bg-surface-container-low border border-border-subtle rounded-lg p-3 hover:border-primary/50 transition-colors cursor-default group flex gap-3">
+<div class="mt-0.5"><span class="material-symbols-outlined text-on-surface-variant group-hover:text-primary transition-colors text-lg" data-icon="menu_book">menu_book</span></div>
+<div>
+<p class="font-body-md text-body-md text-on-surface leading-snug">Сидоров, В. В. Архитектура корпоративных информационных систем : учебное пособие / В. В. Сидоров. – Москва : Инфра-М, 2022. – 320 с. – ISBN 978-5-16-123456-7.</p>
+<div class="flex gap-2 mt-2">
+<span class="text-xs font-label-code text-primary bg-primary/10 px-1.5 py-0.5 rounded border border-primary/20">Монография</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Center Section: The Big Button -->
+<div class="flex-1 flex items-center justify-center relative">
+<button class="emerald-glow bg-success-emerald hover:bg-tertiary-container text-white font-headline-md text-headline-md px-10 py-6 rounded-xl flex items-center gap-4 transition-all transform hover:scale-105 hover:shadow-2xl active:scale-95 group relative overflow-hidden">
+<!-- Shimmer effect -->
+<div class="absolute top-0 -inset-full h-full w-1/2 z-5 block transform -skew-x-12 bg-gradient-to-r from-transparent via-white to-transparent opacity-20 group-hover:animate-[shimmer_1.5s_infinite]"></div>
+<span class="material-symbols-outlined text-4xl" data-icon="rocket_launch">rocket_launch</span>
+<div class="text-left flex flex-col">
+<span>Сформировать .docx</span>
+<span class="font-body-md text-body-md opacity-90 text-sm font-medium">и Открыть в MS Word</span>
+</div>
+</button>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer -->
+<footer class="bg-surface-container-lowest dark:bg-surface-container-lowest border-t border-border-subtle fixed bottom-0 w-full z-50 flex justify-between items-center px-4 h-7">
+<div class="font-label-code text-label-code text-tertiary dark:text-tertiary-fixed-dim flex items-center gap-2">
+<span class="w-2 h-2 rounded-full bg-success-emerald inline-block"></span>
+             Autosaved • 4,250 words • GOST: Compliant
+        </div>
+<div class="flex gap-4">
+<a class="font-label-code text-label-code text-on-surface-variant dark:text-on-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors cursor-default" href="#">System Telemetry</a>
+<a class="font-label-code text-label-code text-on-surface-variant dark:text-on-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors cursor-default" href="#">Process Monitor</a>
+</div>
+</footer>
+<script>
+        // Simple particle generator for background
+        document.addEventListener('DOMContentLoaded', () => {
+            const container = document.getElementById('particles-container');
+            const particleCount = 20;
+
+            for (let i = 0; i < particleCount; i++) {
+                const particle = document.createElement('div');
+                particle.classList.add('doc-particle');
+                
+                // Randomize properties
+                const size = Math.random() * 40 + 20; // 20px to 60px
+                const left = Math.random() * 100; // 0% to 100%
+                const delay = Math.random() * 15; // 0s to 15s delay
+                const duration = Math.random() * 10 + 10; // 10s to 20s duration
+                
+                // Set styles
+                particle.style.width = `${size}px`;
+                particle.style.height = `${size * 1.4}px`; // Aspect ratio of a document
+                particle.style.left = `${left}%`;
+                particle.style.animationDelay = `${delay}s`;
+                particle.style.animationDuration = `${duration}s`;
+                
+                // Add some subtle inner lines to look like text blocks
+                particle.innerHTML = `
+                    <div style="width: 80%; height: 2px; background: rgba(59, 130, 246, 0.2); margin: 10% auto 5%;"></div>
+                    <div style="width: 60%; height: 2px; background: rgba(59, 130, 246, 0.2); margin: 0 auto 5%; margin-left: 10%;"></div>
+                    <div style="width: 70%; height: 2px; background: rgba(59, 130, 246, 0.2); margin: 0 auto; margin-left: 10%;"></div>
+                `;
+
+                container.appendChild(particle);
+            }
+        });
+    </script>
+</body></html>

@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="ru"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Шаг 4: Структура и План</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&amp;family=JetBrains+Mono:wght@500;700&amp;family=Plus+Jakarta+Sans:wght@600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              "colors": {
+                      "surface-variant": "#333539",
+                      "error-container": "#93000a",
+                      "surface-tint": "#adc6ff",
+                      "primary": "#adc6ff",
+                      "tertiary": "#4edea3",
+                      "on-primary": "#002e6a",
+                      "on-error-container": "#ffdad6",
+                      "ai-gradient-start": "#8B5CF6",
+                      "secondary-fixed": "#e9ddff",
+                      "inverse-primary": "#005ac2",
+                      "on-tertiary-fixed-variant": "#005236",
+                      "surface-bright": "#37393e",
+                      "success-emerald": "#10B981",
+                      "tertiary-container": "#00a572",
+                      "surface-card": "#161920",
+                      "outline": "#8c909f",
+                      "inverse-surface": "#e2e2e8",
+                      "surface-dim": "#111317",
+                      "primary-fixed": "#d8e2ff",
+                      "secondary": "#d0bcff",
+                      "tertiary-fixed": "#6ffbbe",
+                      "surface-container-low": "#1a1c20",
+                      "secondary-fixed-dim": "#d0bcff",
+                      "on-secondary-container": "#c4abff",
+                      "on-secondary": "#3c0091",
+                      "on-primary-container": "#00285d",
+                      "on-surface-variant": "#c2c6d6",
+                      "secondary-container": "#571bc1",
+                      "on-surface": "#e2e2e8",
+                      "on-tertiary-fixed": "#002113",
+                      "on-tertiary-container": "#00311f",
+                      "border-subtle": "#262B36",
+                      "on-primary-fixed-variant": "#004395",
+                      "surface-container-high": "#282a2e",
+                      "on-error": "#690005",
+                      "background": "#111317",
+                      "surface-container-highest": "#333539",
+                      "primary-container": "#4d8eff",
+                      "surface": "#111317",
+                      "outline-variant": "#424754",
+                      "primary-fixed-dim": "#adc6ff",
+                      "tertiary-fixed-dim": "#4edea3",
+                      "inverse-on-surface": "#2f3035",
+                      "on-background": "#e2e2e8",
+                      "on-secondary-fixed": "#23005c",
+                      "surface-container": "#1e2024",
+                      "on-primary-fixed": "#001a42",
+                      "on-secondary-fixed-variant": "#5516be",
+                      "error": "#ffb4ab",
+                      "surface-container-lowest": "#0c0e12",
+                      "ai-gradient-end": "#EC4899",
+                      "on-tertiary": "#003824"
+              },
+              "borderRadius": {
+                      "DEFAULT": "0.125rem",
+                      "lg": "0.25rem",
+                      "xl": "0.5rem",
+                      "full": "0.75rem"
+              },
+              "spacing": {
+                      "gutter": "16px",
+                      "sidebar-width": "260px",
+                      "margin-page": "24px",
+                      "inspector-width": "300px",
+                      "unit": "4px"
+              },
+              "fontFamily": {
+                      "body-md": ["Inter"],
+                      "headline-lg": ["Plus Jakarta Sans"],
+                      "body-lg": ["Inter"],
+                      "label-code": ["JetBrains Mono"],
+                      "preview-doc": ["Times New Roman"],
+                      "label-caps": ["JetBrains Mono"],
+                      "headline-md": ["Plus Jakarta Sans"]
+              },
+              "fontSize": {
+                      "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                      "headline-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                      "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}],
+                      "label-code": ["13px", {"lineHeight": "18px", "fontWeight": "500"}],
+                      "preview-doc": ["14pt", {"lineHeight": "1.5", "fontWeight": "400"}],
+                      "label-caps": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700"}],
+                      "headline-md": ["24px", {"lineHeight": "32px", "fontWeight": "600"}]
+              }
+            }
+          }
+        }
+    </script>
+<style>
+        .ai-pulse {
+            animation: aiPulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes aiPulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 12px 2px rgba(139, 92, 246, 0.5); }
+            50% { opacity: .8; box-shadow: 0 0 4px 1px rgba(139, 92, 246, 0.3); }
+        }
+        .tree-line {
+            position: relative;
+        }
+        .tree-line::before {
+            content: '';
+            position: absolute;
+            left: -12px;
+            top: 20px;
+            bottom: 0;
+            width: 1px;
+            background-color: theme('colors.border-subtle');
+        }
+        .tree-line-last::before {
+            bottom: auto;
+            height: 12px;
+        }
+        .tree-node::after {
+            content: '';
+            position: absolute;
+            left: -12px;
+            top: 20px;
+            width: 12px;
+            height: 1px;
+            background-color: theme('colors.border-subtle');
+        }
+    </style>
+</head>
+<body class="bg-background text-on-background font-body-md min-h-screen flex flex-col overflow-hidden">
+<!-- TopNavBar -->
+<nav class="bg-surface-container-lowest flex justify-between items-center h-12 px-gutter w-full sticky top-0 z-50 border-b border-border-subtle">
+<div class="flex items-center gap-4">
+<span class="font-headline-md text-headline-md font-bold text-primary">Платежный терминал</span>
+</div>
+<div class="flex items-center gap-2">
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">bolt</span>
+</button>
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">memory</span>
+</button>
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">image</span>
+</button>
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">minimize</span>
+</button>
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">fullscreen</span>
+</button>
+<button class="text-on-surface-variant hover:bg-surface-container-high transition-colors p-1.5 rounded cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-[20px]">close</span>
+</button>
+</div>
+</nav>
+<div class="flex flex-1 overflow-hidden">
+<!-- SideNavBar -->
+<aside class="bg-surface-container flex flex-col h-full fixed left-0 top-12 z-40 overflow-y-auto w-sidebar-width border-r border-border-subtle">
+<div class="p-4 border-b border-border-subtle flex items-center gap-3">
+<div class="w-8 h-8 rounded bg-surface-variant flex items-center justify-center shrink-0">
+<span class="material-symbols-outlined text-primary text-[18px]">folder_special</span>
+</div>
+<div>
+<h2 class="font-label-caps text-label-caps text-primary">Project Passport</h2>
+<p class="font-label-code text-label-code text-on-surface-variant text-[10px]">Wizard Progress: 65%</p>
+</div>
+</div>
+<nav class="flex-1 p-2 space-y-1 mt-2">
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">gavel</span>
+                    Rules
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">library_books</span>
+                    Sources
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">title</span>
+                    Title
+                </a>
+<!-- ACTIVE NAV ITEM -->
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg bg-primary-container text-on-primary-container transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">format_list_bulleted</span>
+                    Plan
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">edit_note</span>
+                    Studio
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">auto_awesome</span>
+                    Build
+                </a>
+</nav>
+<div class="p-2 border-t border-border-subtle space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">settings</span>
+                    Settings
+                </a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:bg-surface-container-highest transition-all duration-200 ease-in-out font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined text-[18px]">help</span>
+                    Support
+                </a>
+</div>
+</aside>
+<!-- Main Content Area (Fluid) -->
+<main class="flex-1 ml-[260px] mb-7 overflow-y-auto bg-background p-margin-page relative">
+<header class="mb-6 pb-4 border-b border-border-subtle flex justify-between items-end">
+<div>
+<h1 class="font-headline-lg text-headline-lg text-on-background mb-1">Структура и План</h1>
+<p class="font-body-md text-body-md text-on-surface-variant">Шаг 4: Интерактивная настройка дерева оглавления</p>
+</div>
+<button class="ai-pulse bg-gradient-to-r from-ai-gradient-start to-ai-gradient-end text-white px-6 py-2.5 rounded flex items-center gap-2 font-label-caps text-label-caps hover:opacity-90 transition-opacity">
+<span class="material-symbols-outlined text-[18px]">auto_awesome</span>
+                    ✨ Сгенерировать план ИИ (Gemini 3.6 Flash)
+                </button>
+</header>
+<div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+<!-- Center Pane: Tree Editor -->
+<div class="xl:col-span-2 space-y-4">
+<div class="bg-surface-card border border-border-subtle rounded-lg flex flex-col h-[500px]">
+<div class="p-3 border-b border-border-subtle bg-surface-container flex items-center justify-between">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-on-surface-variant text-[16px]">account_tree</span>
+<span class="font-label-code text-label-code text-on-surface">Дерево оглавления (QTreeWidget)</span>
+</div>
+<div class="flex gap-2">
+<button class="p-1 hover:bg-surface-variant rounded text-on-surface-variant transition-colors" title="Добавить раздел">
+<span class="material-symbols-outlined text-[16px]">add</span>
+</button>
+<button class="p-1 hover:bg-surface-variant rounded text-on-surface-variant transition-colors" title="Свернуть все">
+<span class="material-symbols-outlined text-[16px]">unfold_less</span>
+</button>
+</div>
+</div>
+<div class="flex-1 p-4 overflow-y-auto font-label-code text-label-code text-on-background space-y-2">
+<!-- Node 1 -->
+<div class="flex items-center justify-between group hover:bg-surface-container-low p-1.5 rounded transition-colors cursor-default">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-on-surface-variant text-[16px] cursor-pointer">arrow_drop_down</span>
+<span class="material-symbols-outlined text-primary text-[16px]">description</span>
+<span>Введение</span>
+</div>
+<div class="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+<div class="flex items-center gap-2">
+<div class="w-24 h-1 bg-surface-variant rounded-full overflow-hidden">
+<div class="h-full bg-success-emerald w-full"></div>
+</div>
+<span class="text-[10px] text-on-surface-variant">300/300 слов</span>
+</div>
+<div class="flex gap-1">
+<button class="text-on-surface-variant hover:text-primary"><span class="material-symbols-outlined text-[14px]">edit</span></button>
+</div>
+</div>
+</div>
+<!-- Node 2 -->
+<div class="tree-line ml-3">
+<div class="flex items-center justify-between group hover:bg-surface-container-low p-1.5 rounded transition-colors cursor-default tree-node">
+<div class="flex items-center gap-2 pl-4">
+<span class="material-symbols-outlined text-on-surface-variant text-[16px] cursor-pointer">arrow_drop_down</span>
+<span class="material-symbols-outlined text-primary text-[16px]">folder</span>
+<span class="font-bold">1. Теоретическая часть</span>
+</div>
+<div class="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+<div class="flex items-center gap-2">
+<div class="w-24 h-1 bg-surface-variant rounded-full overflow-hidden">
+<div class="h-full bg-primary w-[80%] shadow-[0_0_8px_rgba(173,198,255,0.6)]"></div>
+</div>
+<span class="text-[10px] text-on-surface-variant">800/1000 слов</span>
+</div>
+</div>
+</div>
+<!-- Node 2.1 -->
+<div class="tree-line ml-7 tree-line-last">
+<div class="flex items-center justify-between group hover:bg-surface-container-low p-1.5 rounded transition-colors cursor-default tree-node">
+<div class="flex items-center gap-2 pl-4">
+<span class="material-symbols-outlined text-surface-variant text-[16px]">remove</span>
+<span class="material-symbols-outlined text-primary text-[16px]">article</span>
+<span>1.1 Анализ предметной области</span>
+</div>
+<div class="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+<div class="flex items-center gap-2">
+<div class="w-24 h-1 bg-surface-variant rounded-full overflow-hidden">
+<div class="h-full bg-primary w-[45%]"></div>
+</div>
+<span class="text-[10px] text-on-surface-variant">450/1000 слов</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Node 3 -->
+<div class="flex items-center justify-between group hover:bg-surface-container-low p-1.5 rounded transition-colors cursor-default">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-on-surface-variant text-[16px] cursor-pointer">arrow_right</span>
+<span class="material-symbols-outlined text-primary text-[16px]">folder</span>
+<span class="font-bold text-on-surface-variant">2. Практическая разработка</span>
+</div>
+<div class="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+<div class="flex items-center gap-2">
+<div class="w-24 h-1 bg-surface-variant rounded-full overflow-hidden">
+<div class="h-full bg-surface-variant w-0"></div>
+</div>
+<span class="text-[10px] text-on-surface-variant">0/2000 слов</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Right Sidebar: Inspector -->
+<div class="xl:col-span-1 space-y-4">
+<div class="bg-surface-card border border-border-subtle rounded-lg p-4">
+<div class="flex items-center justify-between mb-4">
+<h3 class="font-label-caps text-label-caps text-on-surface">Инспектор раздела</h3>
+<span class="material-symbols-outlined text-success-emerald text-[16px]" title="Passport Indexed">check_circle</span>
+</div>
+<div class="space-y-4 font-label-code text-label-code text-on-surface-variant">
+<div>
+<label class="text-[10px] text-outline uppercase tracking-wider mb-1 block">Текущий раздел</label>
+<div class="bg-surface-container-low border border-border-subtle rounded px-2 py-1.5 text-on-surface">
+                                    1. Теоретическая часть
+                                </div>
+</div>
+<div>
+<label class="text-[10px] text-outline uppercase tracking-wider mb-1 block">Статус генерации</label>
+<div class="flex items-center gap-2">
+<div class="w-2 h-2 rounded-full bg-primary ai-pulse"></div>
+<span class="text-primary text-[11px]">В процессе (80%)</span>
+</div>
+</div>
+<div class="pt-2 border-t border-border-subtle">
+<label class="text-[10px] text-outline uppercase tracking-wider mb-1 block">Требования ГОСТ</label>
+<ul class="space-y-1.5 text-[11px]">
+<li class="flex items-center gap-2">
+<span class="material-symbols-outlined text-success-emerald text-[14px]">done</span>
+                                        Нумерация заголовков
+                                    </li>
+<li class="flex items-center gap-2">
+<span class="material-symbols-outlined text-success-emerald text-[14px]">done</span>
+                                        Вложенность до 3 уровня
+                                    </li>
+<li class="flex items-center gap-2 text-error">
+<span class="material-symbols-outlined text-[14px]">warning</span>
+                                        Объем раздела мал
+                                    </li>
+</ul>
+</div>
+</div>
+</div>
+<div class="bg-surface-card border border-border-subtle rounded-lg p-4">
+<h3 class="font-label-caps text-label-caps text-on-surface mb-3">AI Промпт Контекст</h3>
+<div class="bg-surface-container-low border border-border-subtle rounded p-2 h-24 overflow-y-auto text-[10px] font-label-code text-outline-variant leading-relaxed">
+                            {"role": "system", "content": "You are a specialized academic structurer. Analyze the subject domain and generate a highly detailed, ГОСТ-compliant table of contents. Focus on deep theoretical background before practical implementation."}
+                        </div>
+</div>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer -->
+<footer class="bg-surface-container-lowest fixed bottom-0 w-full z-50 flex justify-between items-center px-4 h-7 border-t border-border-subtle">
+<span class="font-label-code text-label-code text-tertiary font-bold text-[10px]">Autosaved • 4,250 words • GOST: Compliant</span>
+<div class="flex gap-4">
+<a class="font-label-code text-label-code text-on-surface-variant hover:text-primary transition-colors cursor-default text-[10px]" href="#">System Telemetry</a>
+<a class="font-label-code text-label-code text-on-surface-variant hover:text-primary transition-colors cursor-default text-[10px]" href="#">Process Monitor</a>
+</div>
+</footer>
+</body></html>
