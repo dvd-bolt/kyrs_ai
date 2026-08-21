@@ -22,6 +22,7 @@ from .ledger import (
     FactLedgerError,
     FactProvenanceError,
 )
+from .statistics import StatisticsSummary, correlation, percentage, summarize
 from .synthetic import (
     Distribution,
     SyntheticColumnSpec,
@@ -44,12 +45,16 @@ __all__ = [
     "FinanceIssue",
     "FinanceValidationResult",
     "JournalEntry",
+    "StatisticsSummary",
     "SyntheticColumnSpec",
     "SyntheticDataError",
     "SyntheticDatasetFactory",
     "SyntheticDatasetSpec",
     "TabularDatasetImporter",
     "TabularImportError",
+    "correlation",
+    "percentage",
+    "summarize",
     "validate_double_entry",
     "validate_finance_dataset",
 ]

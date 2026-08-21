@@ -34,6 +34,7 @@ from papercraft.domain import (
     PageBreakBlock,
     ParagraphBlock,
     TableBlock,
+    TemplateApplicationPlan,
 )
 
 
@@ -147,6 +148,7 @@ class DocxRenderer:
         output_path: str | os.PathLike[str],
         *,
         template_path: str | os.PathLike[str] | None = None,
+        template_plan: TemplateApplicationPlan | None = None,
         artifact_paths: ArtifactResolver | None = None,
         datasets: Mapping[str, Dataset] | None = None,
         citations: Mapping[str, Citation] | None = None,
@@ -160,6 +162,8 @@ class DocxRenderer:
         datasets = datasets or {}
         citations = citations or {}
 
+        if template_plan is not None and template_path is None:
+            raise DocxRenderError("a TemplateApplicationPlan requires a template_path")
         if template_path is not None:
             template = Path(template_path).expanduser().resolve(strict=True)
             if template.suffix.lower() != ".docx":
@@ -176,7 +180,7 @@ class DocxRenderer:
             self._render_toc(document)
 
         for block in manuscript.blocks:
-            self._render_block(document, block, artifact_paths, datasets, citations)
+            self._render_block(document, block, artifact_paths, datasets, citations, template_plan)
         if manuscript.bibliography:
             self._render_bibliography(document, manuscript.bibliography)
 
@@ -330,9 +334,11 @@ class DocxRenderer:
         artifact_paths: ArtifactResolver | None,
         datasets: Mapping[str, Dataset],
         citations: Mapping[str, Citation],
+        template_plan: TemplateApplicationPlan | None = None,
     ) -> None:
         if isinstance(block, ParagraphBlock):
-            paragraph = document.add_paragraph(style=block.style or "Normal")
+            style = block.style or (template_plan.section_style_map.get("paragraph") if template_plan else None) or "Normal"
+            paragraph = document.add_paragraph(style=style)
             paragraph.add_run(block.text)
             for citation_id in block.citation_ids:
                 citation = citations.get(citation_id)
@@ -342,7 +348,12 @@ class DocxRenderer:
                     self._warnings.append(f"Citation {citation_id} could not be resolved")
             return
         if isinstance(block, HeadingBlock):
-            document.add_paragraph(block.text, style=f"Heading {min(block.level, 6)}")
+            style = (
+                template_plan.section_style_map.get(block.section_id or "")
+                if template_plan
+                else None
+            ) or f"Heading {min(block.level, 6)}"
+            document.add_paragraph(block.text, style=style)
             return
         if isinstance(block, TableBlock):
             self._render_table(document, block, datasets)
@@ -383,7 +394,7 @@ class DocxRenderer:
             document.add_page_break()
             document.add_paragraph(block.title, style="Heading 1")
             for nested in block.blocks:
-                self._render_block(document, nested, artifact_paths, datasets, citations)
+                self._render_block(document, nested, artifact_paths, datasets, citations, template_plan)
             return
         self._warnings.append(f"Unsupported manuscript block: {type(block).__name__}")
 

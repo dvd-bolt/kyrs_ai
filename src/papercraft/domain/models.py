@@ -101,6 +101,62 @@ class Project(DomainModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+class ProjectHealth(DomainModel):
+    """Auditable local-project health report, independent of the UI."""
+
+    project_id: str = Field(min_length=1)
+    schema_version: int = Field(ge=1)
+    integrity_ok: bool
+    input_hash_valid: bool
+    missing_artifact_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    checked_at: datetime = Field(default_factory=utc_now)
+
+
+class BackupRecord(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    automatic: bool = True
+    label: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class MigrationRecord(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str | None = None
+    from_version: int = Field(ge=1)
+    to_version: int = Field(ge=1)
+    applied_at: datetime = Field(default_factory=utc_now)
+    backup_id: str | None = None
+    details: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class MigrationPlan(DomainModel):
+    from_version: int = Field(ge=1)
+    to_version: int = Field(ge=1)
+    steps: list[str] = Field(default_factory=list)
+
+
+class MigrationResult(DomainModel):
+    plan: MigrationPlan
+    applied: bool
+    records: list[MigrationRecord] = Field(default_factory=list)
+    backup: BackupRecord | None = None
+
+
+class RevisionRecord(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    kind: Literal["requirements", "blueprint", "manuscript", "datasets", "qa"]
+    revision: int = Field(ge=1)
+    object_id: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class Locator(DomainModel):
     """Stable pointer to the evidence location inside an imported source."""
 
@@ -203,6 +259,57 @@ class RequirementSet(DomainModel):
     conflicts: list[Conflict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     schema_version: int = Field(default=1, ge=1)
+
+
+class RequirementCoverage(DomainModel):
+    requirement_rule_id: str = Field(min_length=1)
+    status: Literal["SATISFIED", "NOT_APPLICABLE", "FAILED"]
+    evidence: str = ""
+    artifact_id: str | None = None
+
+
+class TemplateSection(DomainModel):
+    title: str
+    level: int = Field(ge=1, le=9)
+    order: int = Field(ge=0)
+
+
+class TemplateStyle(DomainModel):
+    name: str
+    based_on: str | None = None
+    properties: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class TemplateRelationship(DomainModel):
+    relationship_id: str
+    relationship_type: str
+    target: str
+
+
+class TemplateAnalysis(DomainModel):
+    source_id: str | None = None
+    sections: list[TemplateSection] = Field(default_factory=list)
+    styles: list[TemplateStyle] = Field(default_factory=list)
+    relationships: list[TemplateRelationship] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TemplateApplicationPlan(DomainModel):
+    """A safe declarative plan; it never accepts a copied XML body."""
+
+    template_source_id: str | None = None
+    use_styles: list[str] = Field(default_factory=list)
+    preserve_headers_footers: bool = True
+    preserve_page_setup: bool = True
+    section_style_map: dict[str, str] = Field(default_factory=dict)
+    allowed_relationship_types: list[str] = Field(default_factory=list)
+
+    @field_validator("section_style_map")
+    @classmethod
+    def reject_xml_payload(cls, value: dict[str, str]) -> dict[str, str]:
+        if any("<" in key or "<" in style for key, style in value.items()):
+            raise ValueError("TemplateApplicationPlan must not contain raw XML")
+        return value
 
 
 class VisualRequest(DomainModel):
@@ -458,6 +565,7 @@ class ParagraphBlock(DomainModel):
     id: str = Field(default_factory=new_id)
     text: str
     citation_ids: list[str] = Field(default_factory=list)
+    numeric_fact_ids: list[str] = Field(default_factory=list)
     style: str | None = None
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -597,6 +705,14 @@ class StageRun(DomainModel):
     status: StageStatus = StageStatus.QUEUED
     attempts: int = Field(default=0, ge=0)
     input_hash: str = ""
+    dependency_hashes: dict[str, str] = Field(default_factory=dict)
+    heartbeat_at: datetime | None = None
+    progress_current: int = Field(default=0, ge=0)
+    progress_total: int = Field(default=0, ge=0)
+    output_hash: str = ""
+    failure_code: str | None = None
+    failure_details: dict[str, JsonValue] = Field(default_factory=dict)
+    remote_resource_ids: list[str] = Field(default_factory=list)
     output_artifact_ids: list[str] = Field(default_factory=list)
     cost: Decimal = Field(default=Decimal("0"), ge=0)
     created_at: datetime = Field(default_factory=utc_now)
@@ -604,6 +720,22 @@ class StageRun(DomainModel):
     finished_at: datetime | None = None
     error: str | None = None
     checkpoint: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class RemoteResource(DomainModel):
+    """A provider-side resource persisted immediately after upload."""
+
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    stage_id: str | None = None
+    provider: str = "gemini"
+    remote_id: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+    local_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    mime_type: str = "application/octet-stream"
+    deleted_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class Artifact(DomainModel):

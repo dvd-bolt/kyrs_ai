@@ -25,6 +25,12 @@ from papercraft.domain import (
 from papercraft.infrastructure.persistence import AtomicArtifactStore, ProjectPaths
 
 from .ports import RepositoryPort
+from .worker_control import (
+    CancellationToken,
+    RunCancelled,
+    StageDependencyGraph,
+    recover_stale_stages,
+)
 
 
 class PipelineStage(StrEnum):
@@ -67,6 +73,7 @@ class StageContext:
     paths: ProjectPaths
     repository: RepositoryPort
     artifact_store: AtomicArtifactStore
+    cancellation: CancellationToken
 
 
 class StageHandler(Protocol):
@@ -101,6 +108,7 @@ class AutopilotService:
         self.handlers = dict(handlers)
         self.terminal_hook = terminal_hook
         self.artifact_store = AtomicArtifactStore(paths.artifacts)
+        self.dependency_graph = StageDependencyGraph.linear(tuple(stage.value for stage in PIPELINE_ORDER))
 
     def _input_hash(self) -> str:
         # Verified web sources are produced by the pipeline itself and must not
@@ -170,6 +178,10 @@ class AutopilotService:
         self.repository.save_run(run)
         self._event(run, None, "run_started", "Autopilot execution started")
 
+        recovered = recover_stale_stages(self.repository, run)
+        for stage in recovered:
+            self._event(run, stage, "stale_lease_recovered", "Recovered abandoned worker stage")
+
         for stage in self.repository.list_stages(run.id):
             run = self.repository.get_run(run.id) or run
             if run.status == RunStatus.CANCELLED:
@@ -188,6 +200,7 @@ class AutopilotService:
             run.current_stage = stage.name
             stage.status = StageStatus.RUNNING
             stage.started_at = stage.started_at or datetime.now(UTC)
+            stage.heartbeat_at = datetime.now(UTC)
             stage.attempts += 1
             self.repository.save_run(run)
             self.repository.save_stage(stage)
@@ -202,12 +215,20 @@ class AutopilotService:
                         paths=self.paths,
                         repository=self.repository,
                         artifact_store=self.artifact_store,
+                        cancellation=CancellationToken(self.repository, run.id, stage.id),
                     )
                 )
+                run = self.repository.get_run(run.id) or run
+                if run.status == RunStatus.CANCELLED:
+                    raise RunCancelled("run was cancelled during stage execution")
                 for artifact in outcome.artifacts:
                     self.repository.save_artifact(artifact)
                     stage.output_artifact_ids.append(artifact.id)
                 stage.checkpoint = dict(outcome.checkpoint)
+                stage.output_hash = hashlib.sha256(
+                    json.dumps(stage.output_artifact_ids, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                stage.heartbeat_at = datetime.now(UTC)
                 stage.status = StageStatus.SKIPPED if outcome.skipped else StageStatus.SUCCEEDED
                 stage.finished_at = datetime.now(UTC)
                 stage.error = None
@@ -234,6 +255,8 @@ class AutopilotService:
         stage.status = StageStatus.FAILED
         stage.finished_at = datetime.now(UTC)
         stage.error = str(error)
+        stage.failure_code = type(error).__name__
+        stage.failure_details = {"message": str(error)}
         run.status = RunStatus.FAILED
         run.error = f"{stage.name}: {error}"
         run.finished_at = datetime.now(UTC)
@@ -322,15 +345,21 @@ class AutopilotService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        order = PIPELINE_ORDER.index(from_stage)
+        affected = self.dependency_graph.affected_by(from_stage.value)
         for stage in self.repository.list_stages(run_id):
-            if stage.order < order:
+            if stage.name not in affected:
                 continue
             stage.status = StageStatus.QUEUED
             stage.started_at = None
             stage.finished_at = None
             stage.error = None
             stage.output_artifact_ids = []
+            stage.output_hash = ""
+            stage.failure_code = None
+            stage.failure_details = {}
+            stage.progress_current = 0
+            stage.progress_total = 0
+            stage.heartbeat_at = None
             stage.checkpoint = {"invalidated": True}
             stage.input_hash = self._input_hash()
             self.repository.save_stage(stage)

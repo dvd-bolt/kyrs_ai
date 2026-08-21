@@ -33,6 +33,7 @@ from .types import (
     UnsafeArchiveError,
     UnsupportedSourceError,
 )
+from .vision import FakeVision, OCRResult, VisionOCRPort
 
 __all__ = [
     "ALLOWED_SUFFIXES",
@@ -43,12 +44,14 @@ __all__ = [
     "CodeParser",
     "CsvParser",
     "DocxParser",
+    "FakeVision",
     "ImageParser",
     "ImportLimitError",
     "ImportPolicy",
     "ImportRejection",
     "ImportResult",
     "IngestionError",
+    "OCRResult",
     "OptionalDependencyError",
     "ParseResult",
     "ParserRegistry",
@@ -61,6 +64,7 @@ __all__ = [
     "TextParser",
     "UnsafeArchiveError",
     "UnsupportedSourceError",
+    "VisionOCRPort",
     "XlsxParser",
     "classify_source",
     "import_sources",

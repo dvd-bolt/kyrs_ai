@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
+from types import TracebackType
 
 
 def main() -> int:
@@ -20,7 +21,9 @@ def main() -> int:
     application.setApplicationName("PaperCraft AI Studio")
     application.setOrganizationName("PaperCraftAI")
 
-    def exception_hook(exception_type, value, tb) -> None:
+    def exception_hook(
+        exception_type: type[BaseException], value: BaseException, tb: TracebackType | None
+    ) -> None:
         details = "".join(traceback.format_exception(exception_type, value, tb))
         logging.getLogger("papercraft.ui").error(details)
         dialog = QMessageBox(QMessageBox.Icon.Critical, "Ошибка PaperCraft", str(value))

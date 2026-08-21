@@ -88,7 +88,3 @@ exclude = ["^(core|models|ui|tests)/"]
 [[tool.mypy.overrides]]
 module = ["keyring", "keyring.*", "openpyxl", "openpyxl.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["papercraft.ui.*"]
-ignore_errors = true

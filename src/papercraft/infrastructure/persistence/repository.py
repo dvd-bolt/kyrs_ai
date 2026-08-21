@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from papercraft.domain import (
     Artifact,
+    BackupRecord,
     BibliographyEntry,
     Calculation,
     Citation,
@@ -23,10 +25,13 @@ from papercraft.domain import (
     FactRecord,
     GenerationRun,
     Manuscript,
+    MigrationRecord,
     Project,
     ProjectBlueprint,
     QAReport,
+    RemoteResource,
     RequirementSet,
+    RevisionRecord,
     RunEvent,
     Source,
     SourceFragment,
@@ -36,7 +41,7 @@ from papercraft.domain import (
 TModel = TypeVar("TModel", bound=BaseModel)
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -140,6 +145,29 @@ CREATE TABLE IF NOT EXISTS domain_objects (
     PRIMARY KEY(kind, id)
 );
 CREATE INDEX IF NOT EXISTS idx_objects_project ON domain_objects(project_id, kind);
+CREATE TABLE IF NOT EXISTS backup_records (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backups_project ON backup_records(project_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS migration_records (
+    id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    data TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS revisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, kind, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_revisions_project ON revisions(project_id, kind, revision DESC);
 """
 
 
@@ -187,6 +215,9 @@ class SQLiteRepository:
                 raise RuntimeError(
                     f"database schema {current} is newer than supported schema {_SCHEMA_VERSION}"
                 )
+            # All schema additions are additive.  A dedicated MigrationService
+            # creates a backup before upgrading an existing project; this
+            # bootstrap keeps a freshly-created project at the current version.
             connection.executescript(_SCHEMA)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
@@ -576,6 +607,17 @@ class SQLiteRepository:
     def list_calculations(self, project_id: str) -> list[Calculation]:
         return self._list_objects("calculation", project_id, Calculation)
 
+    def save_remote_resource(self, resource: RemoteResource) -> None:
+        self._save_object("remote_resource", resource.project_id, resource.id, resource.run_id, resource)
+
+    def list_remote_resources(self, run_id: str) -> list[RemoteResource]:
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT data FROM domain_objects WHERE kind='remote_resource' AND parent_id=? ORDER BY updated_at,id",
+                (run_id,),
+            ).fetchall()
+        return [RemoteResource.model_validate_json(row["data"]) for row in rows]
+
     def backup_to(self, destination: str | os.PathLike[str]) -> Path:
         """Create a consistent SQLite backup and atomically publish it."""
 
@@ -596,6 +638,79 @@ class SQLiteRepository:
             return target
         finally:
             temporary.unlink(missing_ok=True)
+
+    @property
+    def schema_version(self) -> int:
+        with self._session() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def integrity_check(self) -> tuple[bool, list[str]]:
+        with self._session() as connection:
+            rows = connection.execute("PRAGMA integrity_check").fetchall()
+        messages = [str(row[0]) for row in rows]
+        return messages == ["ok"], messages
+
+    def save_backup_record(self, record: BackupRecord) -> None:
+        with self._session() as connection:
+            connection.execute(
+                """INSERT INTO backup_records(id,project_id,data,created_at) VALUES(?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
+                (record.id, record.project_id, self._json(record), record.created_at.isoformat()),
+            )
+
+    def list_backup_records(self, project_id: str) -> list[BackupRecord]:
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT data FROM backup_records WHERE project_id=? ORDER BY created_at DESC,id DESC",
+                (project_id,),
+            ).fetchall()
+        return [BackupRecord.model_validate_json(row["data"]) for row in rows]
+
+    def delete_backup_record(self, record_id: str) -> None:
+        with self._session() as connection:
+            connection.execute("DELETE FROM backup_records WHERE id=?", (record_id,))
+
+    def save_migration_record(self, record: MigrationRecord) -> None:
+        with self._session() as connection:
+            connection.execute(
+                """INSERT INTO migration_records(id,project_id,data,applied_at) VALUES(?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
+                (record.id, record.project_id, self._json(record), record.applied_at.isoformat()),
+            )
+
+    def save_revision(self, record: RevisionRecord) -> None:
+        with self._session() as connection:
+            connection.execute(
+                """INSERT INTO revisions(id,project_id,kind,revision,data,created_at) VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(project_id,kind,revision) DO UPDATE SET id=excluded.id,data=excluded.data,
+                   created_at=excluded.created_at""",
+                (record.id, record.project_id, record.kind, record.revision, self._json(record), record.created_at.isoformat()),
+            )
+
+    def list_revisions(self, project_id: str, kind: str | None = None) -> list[RevisionRecord]:
+        query = "SELECT data FROM revisions WHERE project_id=?"
+        values: list[str] = [project_id]
+        if kind is not None:
+            query += " AND kind=?"
+            values.append(kind)
+        query += " ORDER BY kind,revision DESC"
+        with self._session() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [RevisionRecord.model_validate_json(row["data"]) for row in rows]
+
+    def record_revision(self, project_id: str, kind: str, object_id: str, payload: str) -> RevisionRecord:
+        if kind not in {"requirements", "blueprint", "manuscript", "datasets", "qa"}:
+            raise ValueError(f"unsupported revision kind: {kind}")
+        existing = self.list_revisions(project_id, kind)
+        record = RevisionRecord(
+            project_id=project_id,
+            kind=cast(Literal["requirements", "blueprint", "manuscript", "datasets", "qa"], kind),
+            revision=(existing[0].revision + 1) if existing else 1,
+            object_id=object_id,
+            sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        )
+        self.save_revision(record)
+        return record
 
 
 # More explicit name for dependency-injection declarations.

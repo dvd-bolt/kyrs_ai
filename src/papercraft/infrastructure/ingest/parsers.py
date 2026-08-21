@@ -16,6 +16,7 @@ from papercraft.domain import Source
 from ._domain import fragment, locator
 from .classification import CODE_SUFFIXES, IMAGE_SUFFIXES
 from .types import OptionalDependencyError, ParseResult, UnsupportedSourceError
+from .vision import VisionOCRPort
 
 
 def _path(source: Source) -> Path:
@@ -111,9 +112,15 @@ class CodeParser(SourceParser):
         text, encoding = _decode(path.read_bytes())
         lines = text.splitlines()
         symbols = self._symbols(path, text)
+        analysis = self._analysis(path, text, symbols)
         result = ParseResult(
             source.id,
-            metadata={"encoding": encoding, "language": path.suffix.lstrip(".").casefold(), "symbols": symbols},
+            metadata={
+                "encoding": encoding,
+                "language": path.suffix.lstrip(".").casefold(),
+                "symbols": symbols,
+                "code_analysis": analysis,
+            },
         )
         for start in range(0, len(lines), self.lines_per_fragment):
             selected = lines[start : start + self.lines_per_fragment]
@@ -172,6 +179,56 @@ class CodeParser(SourceParser):
                     {"kind": "symbol", "name": match.group(1), "line": text.count("\n", 0, match.start()) + 1}
                 )
         return sorted(symbols, key=lambda item: (item["line"], item["name"]))
+
+    @staticmethod
+    def _analysis(path: Path, text: str, symbols: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """Portable tree-sitter-shaped output with AST precision for Python.
+
+        The app deliberately keeps grammars optional; deployments with
+        tree-sitter can substitute an analyser without changing this contract.
+        """
+
+        dependencies: list[dict[str, Any]] = []
+        entrypoints: list[dict[str, Any]] = []
+        endpoints: list[dict[str, Any]] = []
+        tests: list[dict[str, Any]] = []
+        if path.suffix.casefold() == ".py":
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        dependencies.extend({"name": item.name, "line": node.lineno} for item in node.names)
+                    elif isinstance(node, ast.ImportFrom):
+                        dependencies.append({"name": node.module or "", "line": node.lineno})
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        item = {"name": node.name, "line": node.lineno}
+                        if node.name == "main" or any(
+                            isinstance(decorator, ast.Name) and decorator.id == "app"
+                            for decorator in node.decorator_list
+                        ):
+                            entrypoints.append(item)
+                        if node.name.startswith("test_"):
+                            tests.append(item)
+                        for decorator in node.decorator_list:
+                            if isinstance(decorator, ast.Call) and isinstance(
+                                decorator.func, ast.Attribute
+                            ) and decorator.func.attr in {"get", "post", "put", "delete", "route"}:
+                                endpoints.append(item | {"method": decorator.func.attr})
+        else:
+            for match in re.finditer(r"^\s*(?:import|from)\s+([^\s;]+)|require\(['\"]([^'\"]+)", text, re.MULTILINE):
+                dependencies.append({"name": match.group(1) or match.group(2), "line": text.count("\n", 0, match.start()) + 1})
+            tests = [{"name": item["name"], "line": item["line"]} for item in symbols if str(item["name"]).startswith("test")]
+        return {
+            "dependencies": dependencies,
+            "entrypoints": entrypoints,
+            "api_endpoints": endpoints,
+            "classes": [item for item in symbols if item["kind"] == "class"],
+            "functions": [item for item in symbols if item["kind"] in {"function", "symbol"}],
+            "tests": tests,
+        }
 
 
 class CsvParser(SourceParser):
@@ -267,23 +324,46 @@ class XlsxParser(SourceParser):
         path = _path(source)
         result = ParseResult(source.id, metadata={"kind": "workbook"})
         try:
-            workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+            workbook = load_workbook(path, read_only=False, data_only=False, keep_links=False)
+            cached_workbook = load_workbook(path, read_only=False, data_only=True, keep_links=False)
         except Exception as error:  # openpyxl exposes several version-specific errors
             result.warnings.append(f"xlsx-error:{type(error).__name__}:{error}")
             return result
         try:
             result.metadata["sheets"] = list(workbook.sheetnames)
+            result.metadata["named_ranges"] = sorted(workbook.defined_names)
             for worksheet in workbook.worksheets:
+                cached_sheet = cached_workbook[worksheet.title]
+                result.metadata.setdefault("merged_cells", {})[worksheet.title] = [
+                    str(item) for item in worksheet.merged_cells.ranges
+                ]
                 batch: list[list[str]] = []
+                batch_cells: list[list[dict[str, Any]]] = []
                 batch_start = 1
-                for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                for row_index, row in enumerate(worksheet.iter_rows(), start=1):
                     if row_index > self.max_rows_per_sheet:
                         result.warnings.append(f"row-limit:{worksheet.title}:{self.max_rows_per_sheet}")
                         break
-                    batch.append([_clean_cell(value) for value in row])
+                    batch.append([_clean_cell(cell.value) for cell in row])
+                    batch_cells.append(
+                        [
+                            {
+                                "address": cell.coordinate,
+                                "raw_value": _clean_cell(cell.value),
+                                "formula": cell.value if cell.data_type == "f" else None,
+                                "cached_value": _clean_cell(cached_sheet[cell.coordinate].value),
+                                "number_format": cell.number_format,
+                                "data_type": cell.data_type,
+                            }
+                            for cell in row
+                        ]
+                    )
                     if len(batch) >= self.rows_per_fragment:
-                        self._append_batch(result, source, path, worksheet.title, batch, batch_start, row_index)
+                        self._append_batch(
+                            result, source, path, worksheet.title, batch, batch_cells, batch_start, row_index
+                        )
                         batch = []
+                        batch_cells = []
                         batch_start = row_index + 1
                 if batch:
                     self._append_batch(
@@ -292,11 +372,13 @@ class XlsxParser(SourceParser):
                         path,
                         worksheet.title,
                         batch,
+                        batch_cells,
                         batch_start,
                         batch_start + len(batch) - 1,
                     )
         finally:
             workbook.close()
+            cached_workbook.close()
         if not result.fragments:
             result.warnings.append("empty-workbook")
         return result
@@ -308,6 +390,7 @@ class XlsxParser(SourceParser):
         path: Path,
         sheet: str,
         rows: list[list[str]],
+        cells: list[list[dict[str, Any]]],
         start: int,
         end: int,
     ) -> None:
@@ -325,7 +408,7 @@ class XlsxParser(SourceParser):
                     cell_range=f"A{start}:{_column_name(width)}{end}",
                     details={"row_end": end},
                 ),
-                metadata={"row_count": len(rows), "column_count": width},
+                metadata={"row_count": len(rows), "column_count": width, "cells": cells},
                 ordinal=f"xlsx:{sheet}:{start}-{end}",
             )
         )
@@ -346,6 +429,32 @@ class DocxParser(SourceParser):
         except Exception as error:
             result.warnings.append(f"docx-error:{type(error).__name__}:{error}")
             return result
+        properties = document.core_properties
+        result.metadata.update(
+            {
+                "properties": {
+                    "title": properties.title or "",
+                    "author": properties.author or "",
+                    "subject": properties.subject or "",
+                    "keywords": properties.keywords or "",
+                },
+                "sections": [
+                    {
+                        "top_margin": section.top_margin.pt if section.top_margin else None,
+                        "bottom_margin": section.bottom_margin.pt if section.bottom_margin else None,
+                        "left_margin": section.left_margin.pt if section.left_margin else None,
+                        "right_margin": section.right_margin.pt if section.right_margin else None,
+                        "header_paragraphs": len(section.header.paragraphs),
+                        "footer_paragraphs": len(section.footer.paragraphs),
+                    }
+                    for section in document.sections
+                ],
+                "relationships": [
+                    {"id": key, "type": relation.reltype, "target": str(relation.target_ref)}
+                    for key, relation in document.part.rels.items()
+                ],
+            }
+        )
         current_section: str | None = None
         for index, paragraph in enumerate(document.paragraphs, start=1):
             content = paragraph.text.strip()
@@ -389,6 +498,10 @@ class DocxParser(SourceParser):
                 )
             )
         result.metadata["inline_shapes"] = len(document.inline_shapes)
+        body_xml = document.element.body.xml
+        result.metadata["bookmarks"] = body_xml.count("bookmarkStart")
+        result.metadata["formulas"] = body_xml.count("oMath")
+        result.metadata["hyperlinks"] = body_xml.count("hyperlink")
         if not result.fragments:
             result.warnings.append("empty-docx")
         return result
@@ -397,8 +510,9 @@ class DocxParser(SourceParser):
 class PdfParser(SourceParser):
     suffixes = frozenset({".pdf"})
 
-    def __init__(self, max_pages: int = 2_000) -> None:
+    def __init__(self, max_pages: int = 2_000, vision: VisionOCRPort | None = None) -> None:
         self.max_pages = max_pages
+        self.vision = vision
 
     def parse(self, source: Source) -> ParseResult:
         try:
@@ -426,6 +540,7 @@ class PdfParser(SourceParser):
                     continue
                 if not content:
                     result.warnings.append(f"ocr-required:page-{page_number}")
+                    self._ocr_page(result, source, path, page_number)
                     continue
                 result.fragments.append(
                     fragment(
@@ -441,6 +556,40 @@ class PdfParser(SourceParser):
         except Exception as error:
             result.warnings.append(f"pdf-error:{type(error).__name__}:{error}")
         return result
+
+    def _ocr_page(self, result: ParseResult, source: Source, path: Path, page_number: int) -> None:
+        if self.vision is None:
+            return
+        try:
+            fitz = __import__("fitz")
+        except ImportError:
+            result.warnings.append(f"ocr-render-unavailable:page-{page_number}")
+            return
+        try:
+            with fitz.open(path) as document:
+                rendered = document[page_number - 1].get_pixmap(dpi=200, alpha=False).tobytes("png")
+            ocr = self.vision.recognize(rendered, page_number=page_number)
+        except Exception as error:
+            result.warnings.append(f"ocr-error:page-{page_number}:{type(error).__name__}")
+            return
+        if not ocr.text.strip():
+            result.warnings.append(f"ocr-empty:page-{page_number}")
+            return
+        result.fragments.append(
+            fragment(
+                source_id=source.id,
+                content=ocr.text,
+                source_locator=locator(source_id=source.id, path=path, page=page_number),
+                metadata={
+                    "kind": "ocr-page",
+                    "ocr_confidence": ocr.confidence,
+                    "tables": list(ocr.tables),
+                    "captions": list(ocr.captions),
+                    "low_confidence_numbers": list(ocr.low_confidence_numbers),
+                },
+                ordinal=f"ocr-page:{page_number}",
+            )
+        )
 
 
 class ImageParser(SourceParser):

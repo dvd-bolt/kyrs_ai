@@ -629,6 +629,9 @@ class MainWindow(QMainWindow):
         edits: dict[str, tuple[str, int]] = {}
         for index in range(self.plan_tree.topLevelItemCount()):
             item = self.plan_tree.topLevelItem(index)
+            if item is None:
+                self._error("Раздел плана не найден")
+                return
             section_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
             title = item.text(0).strip()
             match = re.search(r"\d+", item.text(1))
@@ -748,7 +751,9 @@ class MainWindow(QMainWindow):
 
     def _read_worker_output(self) -> None:
         assert self.process is not None
-        self.process_buffer += bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        self.process_buffer += bytes(self.process.readAllStandardOutput().data()).decode(
+            "utf-8", errors="replace"
+        )
         while "\n" in self.process_buffer:
             line, self.process_buffer = self.process_buffer.split("\n", 1)
             self._handle_worker_line(line)
@@ -776,14 +781,14 @@ class MainWindow(QMainWindow):
 
     def _read_worker_error(self) -> None:
         assert self.process is not None
-        self.process_error_buffer += bytes(self.process.readAllStandardError()).decode(
+        self.process_error_buffer += bytes(self.process.readAllStandardError().data()).decode(
             "utf-8", errors="replace"
         )
         while "\n" in self.process_error_buffer:
             line, self.process_error_buffer = self.process_error_buffer.split("\n", 1)
             self._handle_worker_line(line)
 
-    def _worker_finished(self, exit_code: int, _status) -> None:
+    def _worker_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         process = self.process
         if process is not None:
             self._read_worker_output()

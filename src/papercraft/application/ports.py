@@ -17,6 +17,7 @@ from papercraft.domain import (
     Project,
     ProjectBlueprint,
     QAReport,
+    RemoteResource,
     RequirementSet,
     RunEvent,
     Source,
@@ -69,6 +70,8 @@ class RepositoryPort(Protocol):
     def list_datasets(self, project_id: str) -> list[Dataset]: ...
     def save_calculation(self, calculation: Calculation) -> None: ...
     def list_calculations(self, project_id: str) -> list[Calculation]: ...
+    def save_remote_resource(self, resource: RemoteResource) -> None: ...
+    def list_remote_resources(self, run_id: str) -> list[RemoteResource]: ...
 
 
 class ArtifactStorePort(Protocol):

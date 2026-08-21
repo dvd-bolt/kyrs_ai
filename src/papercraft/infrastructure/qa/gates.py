@@ -79,6 +79,7 @@ class DeterministicQualityGate:
         )
         self._check_manuscript(context, flattened, words, issues)
         self._check_facts(context, issues)
+        self._check_numeric_provenance(context, flattened, issues)
         self._check_datasets(context, issues, metrics)
         self._check_evidence_and_citations(context, flattened, issues, metrics)
         self._check_requirements(context, flattened, words, issues)
@@ -207,6 +208,22 @@ class DeterministicQualityGate:
             else:
                 for violation in ledger.validate_constraints():
                     issues.append(self._issue(QASeverity.ERROR, "fact_constraint", violation))
+
+    def _check_numeric_provenance(
+        self, context: QAGateContext, blocks: list[Any], issues: list[QAIssue]
+    ) -> None:
+        fact_ids = {fact.id for fact in context.facts}
+        for block in blocks:
+            if not isinstance(block, ParagraphBlock):
+                continue
+            numbers = re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", block.text)
+            if not numbers:
+                continue
+            unknown = set(block.numeric_fact_ids) - fact_ids
+            if unknown:
+                issues.append(self._issue(QASeverity.BLOCKER, "numeric_fact", f"Paragraph {block.id} references unknown facts: {sorted(unknown)}"))
+            elif not block.numeric_fact_ids:
+                issues.append(self._issue(QASeverity.ERROR, "numeric_provenance", f"Paragraph {block.id} has numbers without FactLedger provenance"))
 
     def _check_datasets(
         self,

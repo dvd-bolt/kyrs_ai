@@ -46,6 +46,7 @@ from papercraft.domain import (
     ProjectBlueprint,
     QAIssue,
     QASeverity,
+    RemoteResource,
     RequirementCategory,
     RequirementPriority,
     RequirementRule,
@@ -76,6 +77,7 @@ from papercraft.infrastructure.research import (
 from papercraft.profiles import ProfileRegistry, WorkProfile, default_profile_registry
 
 from .autopilot import PipelineStage, StageContext, StageHandler, StageOutcome
+from .context import ContextBuilder
 from .schemas import (
     BlueprintGeneration,
     DataPreparationPlan,
@@ -233,6 +235,18 @@ class ProductionStageFactory:
                         "mime_type": remote.mime_type or source.mime_type,
                     }
                 )
+                resource = RemoteResource(
+                    project_id=context.project.id,
+                    run_id=context.run.id,
+                    stage_id=context.stage.id,
+                    remote_id=remote.name,
+                    uri=remote.uri,
+                    local_sha256=source.sha256,
+                    mime_type=remote.mime_type or source.mime_type,
+                )
+                context.repository.save_remote_resource(resource)
+                context.stage.remote_resource_ids.append(resource.id)
+                context.repository.save_stage(context.stage)
                 # Persist after each successful upload.  If a later upload or
                 # the worker crashes, terminal cleanup still knows every
                 # remote object that must be deleted.
@@ -597,6 +611,9 @@ class ProductionStageFactory:
         evidence = context.repository.list_evidence(context.project.id)
         bibliography = context.repository.list_bibliography(context.project.id)
         datasets = context.repository.list_datasets(context.project.id)
+        requirements = _need(
+            context.repository.get_latest_requirement_set(context.project.id), "Requirement set"
+        )
         blocks: list[Any] = []
         draft_artifacts: list[Artifact] = []
         for section in sorted(blueprint.outline.sections, key=lambda item: item.order):
@@ -606,14 +623,18 @@ class ProductionStageFactory:
                     raise StageExecutionError(f"Cannot preserve missing section {section.title}")
                 blocks.extend(previous)
                 continue
-            section_claims = [claim for claim in claims if claim.section_id in {None, section.id}]
+            section_context = ContextBuilder().build(
+                section, blueprint, claims, evidence, bibliography, datasets, requirements.rules
+            )
             payload = {
                 "section": section.model_dump(mode="json"),
-                "claims": [item.model_dump(mode="json") for item in section_claims],
-                "evidence": [item.model_dump(mode="json") for item in evidence if any(item.id in claim.evidence_ids for claim in section_claims)],
-                "bibliography": [item.model_dump(mode="json") for item in bibliography],
-                "datasets": [item.model_dump(mode="json") for item in datasets],
-                "glossary": blueprint.glossary,
+                "claims": [item.model_dump(mode="json") for item in section_context.claims],
+                "evidence": [item.model_dump(mode="json") for item in section_context.evidence],
+                "bibliography": [item.model_dump(mode="json") for item in section_context.bibliography],
+                "datasets": [item.model_dump(mode="json") for item in section_context.datasets],
+                "glossary": section_context.glossary,
+                "requirements": [item.model_dump(mode="json") for item in section_context.requirements],
+                "dependency_conclusions": section_context.dependency_conclusions,
             }
             draft = self.gateway.generate_structured(
                 prompt=(
