@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux quality and domain tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra visuals --extra dev
+      - run: uv run ruff check src tests_v2
+      - run: uv run mypy src/papercraft --strict
+      - run: uv run pytest tests_v2 -q
+      - name: Diff whitespace
+        run: git diff --check
+
+  windows:
+    name: Windows desktop and office smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra desktop --extra office --extra visuals --extra dev
+      - run: uv run pytest tests_v2/test_ui_worker.py tests_v2/test_render_qa.py tests_v2/test_autopilot_e2e.py -q
+      - name: LibreOffice smoke (when available)
+        shell: pwsh
+        run: |
+          if (Get-Command libreoffice -ErrorAction SilentlyContinue) {
+            $env:PAPERCRAFT_RUN_OFFICE_TESTS = "1"
+            uv run pytest tests_v2/test_office_integration.py -q
+          } else {
+            Write-Host "LibreOffice is not installed; office smoke remains an integration check."
+          }
+
+  live-gemini:
+    name: Live Gemini (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: live-gemini
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - run: uv run pytest tests_v2/test_gemini_live.py -q
+        env:
+          PAPERCRAFT_RUN_GEMINI_TESTS: "1"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  office-word:
+    name: Word COM (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    environment: office-word
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra desktop --extra office --extra dev
+      - run: uv run pytest tests_v2/test_office_integration.py -q
+        env:
+          PAPERCRAFT_RUN_OFFICE_TESTS: "1"

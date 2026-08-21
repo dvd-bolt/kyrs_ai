@@ -1,0 +1,8 @@
+project_type: school_project
+input_files: []
+required_requirements: []
+required_sections: [title, introduction, theory, practical_part, conclusion, references]
+expected_datasets: []
+expected_visualizations: []
+allowed_volume: "10-25 pages"
+qa_criteria: [age_appropriate_language, structure, sources, rendered_docx, pdf_smoke]

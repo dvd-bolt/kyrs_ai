@@ -1,3 +1,5 @@
+# Legacy compatibility list. New installations must use pyproject.toml and uv.
+# Keep this file for older deployment scripts; it is not the source of truth.
 PyQt6>=6.5.0
 python-docx>=1.0.0
 google-genai>=0.1.0

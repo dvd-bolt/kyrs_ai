@@ -1,0 +1,8 @@
+project_type: it_coursework
+input_files: []
+required_requirements: []
+required_sections: [introduction, implementation, testing, conclusion, references]
+expected_datasets: []
+expected_visualizations: []
+allowed_volume: "20-40 pages"
+qa_criteria: [structure, citations, rendered_docx, pdf_smoke]

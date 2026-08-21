@@ -1,0 +1,8 @@
+project_type: programming_practice_report
+input_files: []
+required_requirements: []
+required_sections: [introduction, organization, work_log, implementation, conclusion, references]
+expected_datasets: []
+expected_visualizations: []
+allowed_volume: "15-30 pages"
+qa_criteria: [requirements, code_evidence, structure, rendered_docx, pdf_smoke]

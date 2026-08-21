@@ -1,0 +1,688 @@
+"""Validated domain models used by the PaperCraft autopilot.
+
+Models are deliberately free of database and UI concerns.  Every model can be
+round-tripped with ``model_dump(mode="json")`` and validated again, which makes
+them suitable both for structured LLM output and durable checkpoints.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from typing import Annotated, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+
+from .enums import (
+    ArtifactKind,
+    ChartType,
+    ClaimStatus,
+    DataType,
+    DomainProfile,
+    FactOrigin,
+    QASeverity,
+    QAStatus,
+    RequirementCategory,
+    RequirementPriority,
+    RunStatus,
+    SourceRole,
+    StageStatus,
+    VisualKind,
+    WorkType,
+)
+
+
+def new_id() -> str:
+    """Return a URL- and filesystem-safe random identifier."""
+
+    return uuid4().hex
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class DomainModel(BaseModel):
+    """Base class with strict, assignment-validated domain semantics."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        populate_by_name=True,
+        str_strip_whitespace=True,
+    )
+
+
+class AutopilotOptions(DomainModel):
+    checkpoint_requirements: bool = False
+    checkpoint_outline: bool = False
+    checkpoint_final_review: bool = False
+    consent_to_remote_processing: bool = False
+    maximum_cost: Decimal | None = Field(default=None, ge=0)
+    currency: str = Field(default="USD", min_length=3, max_length=3)
+    quality_mode: Literal["maximum", "balanced", "economy"] = "maximum"
+    maximum_revision_cycles: int = Field(default=3, ge=1, le=10)
+    allow_synthetic_data: bool = True
+    preferred_finalizer: Literal["auto", "word", "libreoffice"] = "auto"
+    generate_pdf: bool = True
+    generate_qa_report: bool = True
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.upper()
+
+
+class ProjectBrief(DomainModel):
+    title: str = ""
+    topic: str = ""
+    prompt: str = ""
+    work_type: WorkType = WorkType.COURSEWORK
+    domain_profile: DomainProfile = DomainProfile.GENERAL
+    language: str = "ru-RU"
+    title_page: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def derive_title(self) -> ProjectBrief:
+        if not self.title and self.topic:
+            object.__setattr__(self, "title", self.topic)
+        return self
+
+
+class Project(DomainModel):
+    id: str = Field(default_factory=new_id, min_length=1)
+    brief: ProjectBrief = Field(default_factory=ProjectBrief)
+    options: AutopilotOptions = Field(default_factory=AutopilotOptions)
+    schema_version: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Locator(DomainModel):
+    """Stable pointer to the evidence location inside an imported source."""
+
+    source_id: str | None = None
+    page: int | None = Field(default=None, ge=1)
+    sheet: str | None = None
+    cell_range: str | None = None
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    url: str | None = None
+    section: str | None = None
+    details: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_line_range(self) -> Locator:
+        if self.line_end is not None and self.line_start is None:
+            raise ValueError("line_start is required when line_end is set")
+        if self.line_start is not None and self.line_end is not None and self.line_end < self.line_start:
+            raise ValueError("line_end must be greater than or equal to line_start")
+        return self
+
+
+class Source(DomainModel):
+    id: str = Field(default_factory=new_id, min_length=1)
+    project_id: str = Field(min_length=1)
+    role: SourceRole = SourceRole.UNKNOWN
+    original_name: str = Field(min_length=1)
+    stored_path: str = ""
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: str = "application/octet-stream"
+    size_bytes: int = Field(ge=0)
+    classification_confidence: float | None = Field(default=None, ge=0, le=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class SourceFragment(DomainModel):
+    id: str = Field(default_factory=new_id, min_length=1)
+    source_id: str = Field(min_length=1)
+    content: str
+    locator: Locator = Field(default_factory=Locator)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    token_count: int | None = Field(default=None, ge=0)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bind_locator(self) -> SourceFragment:
+        if self.locator.source_id is None:
+            self.locator.source_id = self.source_id
+        elif self.locator.source_id != self.source_id:
+            raise ValueError("locator.source_id must match source_id")
+        if self.sha256 is None:
+            object.__setattr__(self, "sha256", hashlib.sha256(self.content.encode("utf-8")).hexdigest())
+        return self
+
+
+# Backwards-compatible vocabulary used by ingestion implementations.
+SourceChunk = SourceFragment
+
+
+class RuleProvenance(DomainModel):
+    source_id: str | None = None
+    locator: Locator | None = None
+    priority: RequirementPriority = RequirementPriority.BUILTIN
+    extraction_method: str = ""
+    confidence: float = Field(default=1.0, ge=0, le=1)
+
+
+class RequirementRule(DomainModel):
+    id: str = Field(default_factory=new_id, min_length=1)
+    category: RequirementCategory = RequirementCategory.CUSTOM
+    key: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    value: JsonValue = None
+    mandatory: bool = True
+    provenance: list[RuleProvenance] = Field(default_factory=list)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Conflict(DomainModel):
+    id: str = Field(default_factory=new_id)
+    key: str = Field(min_length=1)
+    rule_ids: list[str] = Field(min_length=2)
+    description: str = ""
+    resolved_rule_id: str | None = None
+    resolution_reason: str = ""
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> Conflict:
+        if self.resolved_rule_id is not None and self.resolved_rule_id not in self.rule_ids:
+            raise ValueError("resolved_rule_id must refer to a conflicting rule")
+        return self
+
+
+class RequirementSet(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    rules: list[RequirementRule] = Field(default_factory=list)
+    conflicts: list[Conflict] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    schema_version: int = Field(default=1, ge=1)
+
+
+class VisualRequest(DomainModel):
+    kind: VisualKind
+    purpose: str
+    dataset_id: str | None = None
+    requirements: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class SectionSpec(DomainModel):
+    id: str = Field(default_factory=new_id)
+    title: str = Field(min_length=1)
+    level: int = Field(default=1, ge=1, le=6)
+    order: int = Field(default=0, ge=0)
+    target_words: int = Field(default=0, ge=0)
+    theses: list[str] = Field(default_factory=list)
+    required_fact_ids: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    visual_requests: list[VisualRequest] = Field(default_factory=list)
+    expected_conclusion: str = ""
+    goal_links: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class Outline(DomainModel):
+    id: str = Field(default_factory=new_id)
+    sections: list[SectionSpec] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_sections(self) -> Outline:
+        ids = [section.id for section in self.sections]
+        if len(ids) != len(set(ids)):
+            raise ValueError("section ids must be unique")
+        known = set(ids)
+        for section in self.sections:
+            unknown = set(section.depends_on) - known
+            if unknown:
+                raise ValueError(f"unknown section dependencies: {sorted(unknown)}")
+            if section.id in section.depends_on:
+                raise ValueError("a section cannot depend on itself")
+        return self
+
+
+class ProjectBlueprint(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    goal: str = ""
+    tasks: list[str] = Field(default_factory=list)
+    object_of_study: str = ""
+    subject_of_study: str = ""
+    hypothesis: str = ""
+    methods: list[str] = Field(default_factory=list)
+    glossary: dict[str, str] = Field(default_factory=dict)
+    target_words: int | None = Field(default=None, ge=0)
+    target_pages: int | None = Field(default=None, ge=0)
+    outline: Outline = Field(default_factory=Outline)
+    required_claims: list[str] = Field(default_factory=list)
+    planned_visuals: list[VisualRequest] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class Claim(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    section_id: str | None = None
+    checkable: bool = True
+    evidence_ids: list[str] = Field(default_factory=list)
+    status: ClaimStatus = ClaimStatus.PENDING
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Evidence(DomainModel):
+    id: str = Field(default_factory=new_id)
+    claim_id: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    locator: Locator
+    excerpt: str = ""
+    supports: bool = True
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    verified: bool = False
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bind_source(self) -> Evidence:
+        if self.locator.source_id is None:
+            self.locator.source_id = self.source_id
+        elif self.locator.source_id != self.source_id:
+            raise ValueError("locator.source_id must match source_id")
+        return self
+
+
+EvidenceItem = Evidence
+
+
+class BibliographyEntry(DomainModel):
+    id: str = Field(default_factory=new_id)
+    title: str = Field(min_length=1)
+    authors: list[str] = Field(default_factory=list)
+    year: int | None = Field(default=None, ge=1000, le=9999)
+    publisher: str | None = None
+    source_type: str = "other"
+    doi: str | None = None
+    isbn: str | None = None
+    url: str | None = None
+    accessed_on: date | None = None
+    source_id: str | None = None
+    citation_text: str = ""
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Citation(DomainModel):
+    id: str = Field(default_factory=new_id)
+    claim_id: str | None = None
+    evidence_id: str | None = None
+    bibliography_entry_id: str = Field(min_length=1)
+    marker: str = ""
+    page: str | None = None
+
+
+class FactRecord(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    value: JsonValue
+    unit: str | None = None
+    origin: FactOrigin
+    source_id: str | None = None
+    evidence_id: str | None = None
+    calculation_id: str | None = None
+    synthetic_seed: int | None = None
+    generation_method: str | None = None
+    constraints: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class DatasetColumn(DomainModel):
+    name: str = Field(min_length=1)
+    data_type: DataType = DataType.STRING
+    unit: str | None = None
+    nullable: bool = True
+
+
+class Dataset(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    columns: list[DatasetColumn]
+    rows: list[dict[str, JsonValue]] = Field(default_factory=list)
+    origin: FactOrigin
+    source_ids: list[str] = Field(default_factory=list)
+    synthetic_seed: int | None = None
+    generation_method: str | None = None
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_rows(self) -> Dataset:
+        names = [column.name for column in self.columns]
+        if len(names) != len(set(names)):
+            raise ValueError("dataset column names must be unique")
+        allowed = set(names)
+        for index, row in enumerate(self.rows):
+            unknown = set(row) - allowed
+            if unknown:
+                raise ValueError(f"row {index} has unknown columns: {sorted(unknown)}")
+            missing = {
+                column.name for column in self.columns if not column.nullable and column.name not in row
+            }
+            if missing:
+                raise ValueError(f"row {index} lacks required columns: {sorted(missing)}")
+        return self
+
+
+class Calculation(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    expression: str = Field(min_length=1)
+    input_fact_ids: list[str] = Field(default_factory=list)
+    output_fact_id: str | None = None
+    result: JsonValue = None
+    checks: dict[str, bool] = Field(default_factory=dict)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Metric(DomainModel):
+    name: str = Field(min_length=1)
+    value: float
+    unit: str | None = None
+    target: float | None = None
+    passed: bool | None = None
+    details: str = ""
+
+
+class FactLedger(DomainModel):
+    """Single source of truth for every number used in a manuscript."""
+
+    project_id: str = Field(min_length=1)
+    facts: list[FactRecord] = Field(default_factory=list)
+    datasets: list[Dataset] = Field(default_factory=list)
+    calculations: list[Calculation] = Field(default_factory=list)
+    metrics: list[Metric] = Field(default_factory=list)
+
+
+class TableSpec(DomainModel):
+    caption: str = ""
+    dataset_id: str | None = None
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[JsonValue]] = Field(default_factory=list)
+    column_widths: list[float] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> TableSpec:
+        if self.headers:
+            expected = len(self.headers)
+            if any(len(row) != expected for row in self.rows):
+                raise ValueError("every table row must match the header width")
+        return self
+
+
+class ChartSpec(DomainModel):
+    chart_type: ChartType
+    title: str = ""
+    dataset_id: str
+    x_column: str
+    y_columns: list[str]
+    x_label: str = ""
+    y_label: str = ""
+    options: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class DiagramSpec(DomainModel):
+    title: str = ""
+    language: Literal["mermaid", "graphviz"] = "mermaid"
+    source: str = Field(min_length=1)
+
+
+class FormulaSpec(DomainModel):
+    expression: str = Field(min_length=1)
+    notation: Literal["latex", "mathml", "omml"] = "latex"
+    label: str | None = None
+
+
+class ImageSpec(DomainModel):
+    prompt: str = Field(min_length=1)
+    aspect_ratio: str = "4:3"
+    alt_text: str = ""
+
+
+class ParagraphBlock(DomainModel):
+    type: Literal["paragraph"] = "paragraph"
+    id: str = Field(default_factory=new_id)
+    text: str
+    citation_ids: list[str] = Field(default_factory=list)
+    style: str | None = None
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class HeadingBlock(DomainModel):
+    type: Literal["heading"] = "heading"
+    id: str = Field(default_factory=new_id)
+    text: str
+    level: int = Field(default=1, ge=1, le=6)
+    section_id: str | None = None
+
+
+class TableBlock(DomainModel):
+    type: Literal["table"] = "table"
+    id: str = Field(default_factory=new_id)
+    spec: TableSpec
+
+
+class ChartBlock(DomainModel):
+    type: Literal["chart"] = "chart"
+    id: str = Field(default_factory=new_id)
+    spec: ChartSpec
+    artifact_id: str | None = None
+
+
+class DiagramBlock(DomainModel):
+    type: Literal["diagram"] = "diagram"
+    id: str = Field(default_factory=new_id)
+    spec: DiagramSpec
+    artifact_id: str | None = None
+
+
+class FormulaBlock(DomainModel):
+    type: Literal["formula"] = "formula"
+    id: str = Field(default_factory=new_id)
+    spec: FormulaSpec
+
+
+class CodeListingBlock(DomainModel):
+    type: Literal["code_listing"] = "code_listing"
+    id: str = Field(default_factory=new_id)
+    code: str
+    language: str = "text"
+    caption: str = ""
+    locator: Locator | None = None
+
+
+class FigureBlock(DomainModel):
+    type: Literal["figure"] = "figure"
+    id: str = Field(default_factory=new_id)
+    caption: str
+    artifact_id: str | None = None
+    image_spec: ImageSpec | None = None
+    alt_text: str = ""
+
+    @model_validator(mode="after")
+    def require_figure_source(self) -> FigureBlock:
+        if self.artifact_id is None and self.image_spec is None:
+            raise ValueError("a figure needs artifact_id or image_spec")
+        return self
+
+
+class CitationBlock(DomainModel):
+    type: Literal["citation"] = "citation"
+    id: str = Field(default_factory=new_id)
+    citation_id: str
+    text: str = ""
+
+
+class PageBreakBlock(DomainModel):
+    type: Literal["page_break"] = "page_break"
+    id: str = Field(default_factory=new_id)
+
+
+class AppendixBlock(DomainModel):
+    type: Literal["appendix"] = "appendix"
+    id: str = Field(default_factory=new_id)
+    title: str
+    blocks: list[ManuscriptBlock] = Field(default_factory=list)
+
+
+type ManuscriptBlock = Annotated[
+    ParagraphBlock
+    | HeadingBlock
+    | TableBlock
+    | ChartBlock
+    | DiagramBlock
+    | FormulaBlock
+    | CodeListingBlock
+    | FigureBlock
+    | CitationBlock
+    | PageBreakBlock
+    | AppendixBlock,
+    Field(discriminator="type"),
+]
+
+
+class Manuscript(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    title: str
+    blocks: list[ManuscriptBlock] = Field(default_factory=list)
+    bibliography: list[BibliographyEntry] = Field(default_factory=list)
+    revision: int = Field(default=1, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class GenerationRun(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    status: RunStatus = RunStatus.QUEUED
+    pipeline_version: str = "1"
+    model_policy: dict[str, JsonValue] = Field(default_factory=dict)
+    current_stage: str | None = None
+    input_hash: str = ""
+    cost: Decimal = Field(default=Decimal("0"), ge=0)
+    currency: str = "USD"
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_run_currency(cls, value: str) -> str:
+        return value.upper()
+
+
+class StageRun(DomainModel):
+    id: str = Field(default_factory=new_id)
+    run_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    order: int = Field(default=0, ge=0)
+    status: StageStatus = StageStatus.QUEUED
+    attempts: int = Field(default=0, ge=0)
+    input_hash: str = ""
+    output_artifact_ids: list[str] = Field(default_factory=list)
+    cost: Decimal = Field(default=Decimal("0"), ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    checkpoint: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class Artifact(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    run_id: str | None = None
+    stage_id: str | None = None
+    kind: ArtifactKind = ArtifactKind.OTHER
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: str = "application/octet-stream"
+    size_bytes: int = Field(ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class RunEvent(DomainModel):
+    id: str = Field(default_factory=new_id)
+    run_id: str = Field(min_length=1)
+    stage_id: str | None = None
+    event_type: str = Field(min_length=1)
+    message: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    data: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class QAIssue(DomainModel):
+    id: str = Field(default_factory=new_id)
+    severity: QASeverity
+    category: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    requirement_rule_id: str | None = None
+    artifact_id: str | None = None
+    locator: Locator | None = None
+    auto_fixable: bool = False
+    resolved: bool = False
+    resolution: str = ""
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class QAReport(DomainModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    status: QAStatus = QAStatus.PASS
+    issues: list[QAIssue] = Field(default_factory=list)
+    metrics: list[Metric] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    summary: str = ""
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def derive_status(self) -> QAReport:
+        active = {issue.severity for issue in self.issues if not issue.resolved}
+        derived = QAStatus.PASS
+        if QASeverity.BLOCKER in active or QASeverity.CRITICAL in active or QASeverity.ERROR in active:
+            derived = QAStatus.FAIL
+        elif QASeverity.WARNING in active:
+            derived = QAStatus.WARNING
+        rank = {QAStatus.PASS: 0, QAStatus.WARNING: 1, QAStatus.FAIL: 2}
+        if rank[derived] > rank[self.status]:
+            object.__setattr__(self, "status", derived)
+        return self
+
+
+# Resolve the recursive AppendixBlock -> ManuscriptBlock annotation.
+AppendixBlock.model_rebuild()
+Manuscript.model_rebuild()
+
+
+# Concise names from the architecture plan remain aliases of explicit block
+# models, making their rendering semantics unambiguous while keeping the API
+# pleasant for callers.
+Paragraph = ParagraphBlock
+Heading = HeadingBlock
+Table = TableBlock
+Chart = ChartBlock
+Diagram = DiagramBlock
+Formula = FormulaBlock
+CodeListing = CodeListingBlock
+Figure = FigureBlock
+Appendix = AppendixBlock

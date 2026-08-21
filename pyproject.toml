@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "papercraft-ai-studio"
+version = "0.2.0"
+description = "Windows desktop autopilot for producing evidence-backed academic documents"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "PaperCraft AI Studio contributors" }]
+dependencies = [
+  "google-genai>=2.17,<3",
+  "pydantic>=2.11,<3",
+  "python-docx>=1.2,<2",
+  "pypdf>=5.0,<7",
+  "Pillow>=10,<13",
+  "openpyxl>=3.1,<4",
+  "httpx>=0.28,<1",
+  "platformdirs>=4.3,<5",
+]
+
+[project.optional-dependencies]
+# Core dependencies are installed by the base project itself.
+desktop = [
+  "PySide6>=6.8,<7",
+  "keyring>=25,<27",
+  "pywin32>=308; platform_system == 'Windows'",
+]
+office = [
+  "pywin32>=308; platform_system == 'Windows'",
+]
+visuals = [
+  "matplotlib>=3.9,<4",
+  "pandas>=2.2,<4",
+  "seaborn>=0.13,<1",
+  "PyMuPDF>=1.25,<2",
+]
+legacy-web = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "pytest-qt>=4.4,<5",
+  "hypothesis>=6.130,<7",
+  "ruff>=0.11,<1",
+  "mypy>=1.15,<2",
+]
+build = [
+  "pyinstaller>=6.12,<7",
+]
+
+[project.scripts]
+papercraft = "papercraft.ui.app:main"
+papercraft-worker = "papercraft.worker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/papercraft"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests_v2", "tests"]
+addopts = "-ra"
+markers = [
+  "live: requires a configured external service",
+  "desktop: requires the Qt desktop dependency",
+  "office: requires Microsoft Word or LibreOffice",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "RUF001"]  # Russian UI/profile strings intentionally use Cyrillic.
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["papercraft"]
+exclude = ["^(core|models|ui|tests)/"]
+
+[[tool.mypy.overrides]]
+module = ["keyring", "keyring.*", "openpyxl", "openpyxl.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["papercraft.ui.*"]
+ignore_errors = true

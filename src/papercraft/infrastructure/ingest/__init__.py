@@ -1,0 +1,71 @@
+"""Secure source ingestion and local parsing."""
+
+from .classification import CODE_SUFFIXES, IMAGE_SUFFIXES, SourceClassifier, classify_source
+from .importer import ALLOWED_SUFFIXES, ImportPolicy, SafeSourceImporter, import_sources
+from .parsers import (
+    CodeParser,
+    CsvParser,
+    DocxParser,
+    ImageParser,
+    ParserRegistry,
+    PdfParser,
+    SourceParser,
+    TextParser,
+    XlsxParser,
+    parse_source,
+)
+from .security import (
+    EXCLUDED_DIRS,
+    SecretFinding,
+    SecretScanner,
+    is_excluded_path,
+    is_secret_path,
+    looks_binary,
+)
+from .types import (
+    ClassificationResult,
+    ImportLimitError,
+    ImportRejection,
+    ImportResult,
+    IngestionError,
+    OptionalDependencyError,
+    ParseResult,
+    UnsafeArchiveError,
+    UnsupportedSourceError,
+)
+
+__all__ = [
+    "ALLOWED_SUFFIXES",
+    "CODE_SUFFIXES",
+    "EXCLUDED_DIRS",
+    "IMAGE_SUFFIXES",
+    "ClassificationResult",
+    "CodeParser",
+    "CsvParser",
+    "DocxParser",
+    "ImageParser",
+    "ImportLimitError",
+    "ImportPolicy",
+    "ImportRejection",
+    "ImportResult",
+    "IngestionError",
+    "OptionalDependencyError",
+    "ParseResult",
+    "ParserRegistry",
+    "PdfParser",
+    "SafeSourceImporter",
+    "SecretFinding",
+    "SecretScanner",
+    "SourceClassifier",
+    "SourceParser",
+    "TextParser",
+    "UnsafeArchiveError",
+    "UnsupportedSourceError",
+    "XlsxParser",
+    "classify_source",
+    "import_sources",
+    "is_excluded_path",
+    "is_secret_path",
+    "looks_binary",
+    "parse_source",
+]

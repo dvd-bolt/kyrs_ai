@@ -1,0 +1,8 @@
+project_type: scientific_article
+input_files: []
+required_requirements: []
+required_sections: [abstract, introduction, methods, results, discussion, references]
+expected_datasets: []
+expected_visualizations: []
+allowed_volume: "8-20 pages"
+qa_criteria: [evidence, citations, figures, rendered_docx, pdf_smoke]

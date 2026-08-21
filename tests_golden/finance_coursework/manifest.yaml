@@ -1,0 +1,8 @@
+project_type: finance_coursework
+input_files: []
+required_requirements: []
+required_sections: [introduction, analysis, calculations, recommendations, conclusion, references]
+expected_datasets: []
+expected_visualizations: []
+allowed_volume: "25-45 pages"
+qa_criteria: [formula_traceability, totals, structure, rendered_docx, pdf_smoke]

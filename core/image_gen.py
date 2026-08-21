@@ -1,15 +1,32 @@
-import os
-import logging
-from core.cascade_llm import CascadeLLMClient
+"""Legacy adapter to production Gemini image generation (no mock fallback)."""
 
-logger = logging.getLogger("ImageGenEngine")
+from __future__ import annotations
 
-def generate_ai_illustration(prompt: str, output_png_path: str, cascade_client: CascadeLLMClient = None) -> str:
-    """
-    Генерирует ИИ-иллюстрацию (макет ПО, схема концепта, обложка) с помощью Imagen 4 Ultra / Generate.
-    """
-    client = cascade_client or CascadeLLMClient()
-    logger.info(f"Запуск ИИ-генератора изображений для промпта: '{prompt[:40]}...'")
-    
-    formatted_prompt = f"Professional technical diagram, clean vector layout, high resolution, academic style: {prompt}"
-    return client.generate_image(prompt=formatted_prompt, output_path=output_png_path)
+from pathlib import Path
+from typing import Any
+
+from papercraft.config import AppSettings
+from papercraft.infrastructure.gemini import GeminiGateway
+
+
+def generate_ai_illustration(
+    prompt: str,
+    output_png_path: str,
+    cascade_client: Any | None = None,
+) -> str:
+    if cascade_client is not None:
+        raise RuntimeError(
+            "Legacy CascadeLLMClient is disabled for image generation; configure the production Gemini gateway"
+        )
+    gateway = GeminiGateway(AppSettings.from_environment())
+    output = gateway.generate_image(
+        prompt=(
+            "Professional academic illustration, accurate labels, clean composition, "
+            f"high readability: {prompt}"
+        ),
+        destination=Path(output_png_path),
+    )
+    return str(output)
+
+
+__all__ = ["generate_ai_illustration"]
