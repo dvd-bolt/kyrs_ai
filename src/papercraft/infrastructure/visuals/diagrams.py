@@ -32,7 +32,8 @@ class LocalDiagramRenderer:
     """Render Mermaid locally, falling back to a deterministic Pillow diagram."""
 
     _BLOCKED = re.compile(
-        r"(?i)(%%\s*\{\s*init|\bclick\b|javascript\s*:|file\s*:|<\s*script|<\s*iframe|\bhref\b)"
+        r"(?i)(%%\s*\{|\bclick\b|javascript\s*:|file\s*:|data\s*:|url\s*\(|"
+        r"@import\b|<\s*script|<\s*iframe|\bhref\b)"
     )
 
     def __init__(self, *, mermaid_cli: str | None = None, timeout_seconds: float = 45) -> None:

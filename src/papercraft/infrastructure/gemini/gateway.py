@@ -8,9 +8,12 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
+from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -27,7 +30,15 @@ class GeminiGatewayError(RuntimeError):
 
 
 class GeminiAuthenticationError(GeminiGatewayError):
-    pass
+    waiting_input = True
+
+
+class GeminiConfigurationError(GeminiGatewayError):
+    """A pinned model or provider feature is not available."""
+
+
+class GeminiSafetyError(GeminiGatewayError):
+    """The provider rejected content under its safety policy."""
 
 
 class GeminiUnavailableError(GeminiGatewayError):
@@ -36,6 +47,13 @@ class GeminiUnavailableError(GeminiGatewayError):
 
 class GeminiStructuredOutputError(GeminiGatewayError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractionResponse:
+    payload: Any
+    request_id: str | None = None
+    client_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +116,23 @@ class GeminiGateway:
                 )
             try:
                 from google import genai
+                from google.genai import types
 
-                client = genai.Client(api_key=key)
+                # The application owns HTTP retry classification, bounded
+                # attempts, provider Retry-After handling and jitter. Override
+                # the SDK's retryable HTTP codes with an unused sentinel so a
+                # single logical 429/5xx attempt cannot fan out into enough
+                # requests to keep a quota window permanently hot. The SDK may
+                # still make its one documented transport recovery attempt.
+                client = genai.Client(
+                    api_key=key,
+                    http_options=types.HttpOptions(
+                        retry_options=types.HttpRetryOptions(
+                            attempts=1,
+                            http_status_codes=[599],
+                        )
+                    ),
+                )
             except Exception as exc:  # pragma: no cover - SDK environment dependent
                 raise GeminiAuthenticationError(f"Unable to initialise Gemini: {exc}") from exc
         self.client = client
@@ -112,6 +145,15 @@ class GeminiGateway:
             raise ValueError(f"Unknown Gemini model role: {role}") from exc
         if not isinstance(value, str):
             raise ValueError(f"Model role is not textual: {role}")
+        return value
+
+    def _thinking_level(self, role: str) -> str:
+        try:
+            value = getattr(self.settings.thinking_policy, role)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown Gemini thinking role: {role}") from exc
+        if not isinstance(value, str):
+            raise ValueError(f"Thinking level is not textual: {role}")
         return value
 
     @staticmethod
@@ -144,6 +186,40 @@ class GeminiGateway:
 
         return isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError))
 
+    @staticmethod
+    def _retry_after_seconds(exc: Exception) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or getattr(exc, "headers", None)
+        raw: Any = None
+        if headers is not None:
+            try:
+                raw = headers.get("Retry-After") or headers.get("retry-after")
+            except Exception:
+                raw = None
+        if raw is not None:
+            value = str(raw).strip()
+            try:
+                return max(0.0, float(value))
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(value)
+                except (TypeError, ValueError, OverflowError):
+                    parsed = None
+                if parsed is not None:
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
+
+        # The public Gemini endpoint currently puts its precise delay in the
+        # structured error message and may omit the standard Retry-After
+        # header. Honour that provider instruction instead of exhausting the
+        # bounded retry loop before the quota window reopens.
+        match = re.search(
+            r"(?i)\bretry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s\b",
+            str(exc),
+        )
+        return max(0.0, float(match.group(1))) if match else None
+
     def _call(
         self,
         operation: str,
@@ -164,6 +240,10 @@ class GeminiGateway:
                 if status in {400, 401, 403, 404}:
                     if status in {401, 403}:
                         raise GeminiAuthenticationError(f"{operation} was rejected: {exc}") from exc
+                    if status == 404:
+                        raise GeminiConfigurationError(
+                            f"{operation} references an unavailable model or endpoint: {exc}"
+                        ) from exc
                     raise GeminiGatewayError(f"{operation} is invalid: {exc}") from exc
                 retryable = status in {408, 409, 429, 500, 502, 503, 504} or (
                     status is None and self._is_transport_error(exc)
@@ -176,13 +256,76 @@ class GeminiGateway:
                     retry.maximum_delay_seconds,
                     retry.base_delay_seconds * (2 ** (attempt - 1)),
                 ) + random.uniform(0, retry.jitter_seconds)
+                retry_after = self._retry_after_seconds(exc) if status == 429 else None
+                if retry_after is not None:
+                    delay = max(delay, min(retry.maximum_delay_seconds, retry_after))
                 self._sleep(delay)
         raise GeminiUnavailableError(
             f"{operation} failed after {retry.max_attempts} attempts: {last_error}"
         ) from last_error
 
+    def _create_interaction(self, **body: Any) -> _InteractionResponse:
+        client_request_id = uuid4().hex
+        interactions = self.client.interactions
+        raw_api = getattr(interactions, "with_raw_response", None)
+        raw_create = getattr(raw_api, "create", None)
+        if callable(raw_create):
+            raw = raw_create(**body)
+            parsed = raw.parse()
+            request_id = self._provider_request_id(raw)
+            return _InteractionResponse(
+                payload=parsed,
+                request_id=request_id,
+                client_request_id=client_request_id,
+            )
+        response = interactions.create(**body)
+        request_id = self._provider_request_id(response)
+        return _InteractionResponse(
+            payload=response,
+            request_id=request_id,
+            client_request_id=client_request_id,
+        )
+
+    @staticmethod
+    def _provider_request_id(response: Any) -> str | None:
+        """Extract a traceable provider request ID across SDK response modes."""
+
+        candidates: list[Any] = [getattr(response, "request_id", None)]
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            http_response = getattr(response, "http_response", None)
+            headers = getattr(http_response, "headers", None)
+        if headers is not None:
+            for name in (
+                "x-request-id",
+                "x-goog-request-id",
+                "x-cloud-trace-context",
+                "traceparent",
+            ):
+                try:
+                    candidates.append(headers.get(name))
+                except (AttributeError, TypeError):
+                    break
+        for candidate in candidates:
+            cleaned = str(candidate or "").strip()
+            if cleaned:
+                return cleaned
+        return None
+
+    @staticmethod
+    def _payload(response: Any) -> Any:
+        return response.payload if isinstance(response, _InteractionResponse) else response
+
     def _usage(self, response: Any, operation: str, model: str) -> UsageRecord:
-        usage = getattr(response, "usage", None)
+        payload = self._payload(response)
+        provider_request_id = (
+            response.request_id if isinstance(response, _InteractionResponse) else None
+        )
+        client_request_id = (
+            response.client_request_id if isinstance(response, _InteractionResponse) else None
+        )
+        request_id = provider_request_id or ""
+        usage = getattr(payload, "usage", None)
         input_tokens = int(
             getattr(usage, "total_input_tokens", None)
             or getattr(usage, "input_tokens", 0)
@@ -235,6 +378,12 @@ class GeminiGateway:
                 "tool_use_tokens": tool_use_tokens,
                 "search_queries": search_queries,
                 "pricing_missing": price is None,
+                "interaction_id": str(getattr(payload, "id", "") or ""),
+                "request_id": request_id,
+                "request_id_source": "provider" if provider_request_id else "unavailable",
+                "provider_request_id": provider_request_id or "",
+                "client_request_id": client_request_id or "",
+                "status": str(getattr(payload, "status", "") or ""),
             },
         )
 
@@ -242,21 +391,36 @@ class GeminiGateway:
         if self.usage_sink is not None:
             self.usage_sink(self._usage(response, operation, model))
 
-    def health_check(self) -> None:
-        """Validate credentials and selected architect model with a tiny call."""
+    def _require_usable_response(self, response: Any, *, operation: str) -> Any:
+        payload = self._payload(response)
+        status = str(getattr(payload, "status", "") or "").casefold()
+        errors = getattr(payload, "errors", None) or []
+        diagnostic = " ".join(str(item) for item in errors)
+        if "safety" in diagnostic.casefold() or "blocked" in status:
+            raise GeminiSafetyError(f"{operation} was blocked by Gemini safety policy")
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            raise GeminiGatewayError(f"{operation} returned provider status {status}")
+        return payload
 
-        model = self._model("architect")
+    def health_check(self) -> None:
+        """Validate credentials and the pinned Gemini 3.7 production model."""
+
+        role = "requirements"
+        model = self._model(role)
 
         def invoke() -> Any:
-            return self.client.interactions.create(
+            return self._create_interaction(
                 model=model,
                 input="Reply with OK.",
+                store=False,
+                generation_config={"thinking_level": self._thinking_level(role)},
                 timeout=self.settings.request_timeout_seconds,
             )
 
         response = self._call("Gemini health check", invoke)
         self._record(response, "health_check", model)
-        text = str(getattr(response, "output_text", "") or "").strip()
+        payload = self._require_usable_response(response, operation="Gemini health check")
+        text = str(getattr(payload, "output_text", "") or "").strip()
         if not text:
             raise GeminiUnavailableError("Gemini health check returned an empty response")
 
@@ -273,15 +437,18 @@ class GeminiGateway:
             body: dict[str, Any] = {
                 "model": model,
                 "input": prompt,
+                "store": False,
+                "generation_config": {"thinking_level": self._thinking_level(role)},
                 "timeout": self.settings.request_timeout_seconds,
             }
             if system_instruction:
                 body["system_instruction"] = system_instruction
-            return self.client.interactions.create(**body)
+            return self._create_interaction(**body)
 
         response = self._call(f"text generation ({role})", invoke)
         self._record(response, "generate_text", model)
-        output = str(getattr(response, "output_text", "") or "").strip()
+        payload = self._require_usable_response(response, operation=f"text generation ({role})")
+        output = str(getattr(payload, "output_text", "") or "").strip()
         if not output:
             raise GeminiGatewayError("Gemini returned an empty text response")
         return output
@@ -313,16 +480,18 @@ class GeminiGateway:
             body: dict[str, Any] = {
                 "model": model,
                 "input": interaction_input,
+                "store": False,
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
                     "schema": schema.model_json_schema(),
                 },
+                "generation_config": {"thinking_level": self._thinking_level(role)},
                 "timeout": self.settings.request_timeout_seconds,
             }
             if system_instruction:
                 body["system_instruction"] = system_instruction
-            return self.client.interactions.create(**body)
+            return self._create_interaction(**body)
 
         last_error: ValidationError | None = None
         original_input = list(interaction_input)
@@ -331,7 +500,10 @@ class GeminiGateway:
             # Every completed provider response is billable, including an
             # invalid JSON response that needs a schema-repair interaction.
             self._record(response, "generate_structured", model)
-            raw = getattr(response, "output_text", None)
+            payload = self._require_usable_response(
+                response, operation=f"structured generation ({role})"
+            )
+            raw = getattr(payload, "output_text", None)
             if not isinstance(raw, str) or not raw.strip():
                 raise GeminiStructuredOutputError("Gemini returned no structured text")
             try:
@@ -360,7 +532,7 @@ class GeminiGateway:
         self,
         *,
         prompt: str,
-        role: str = "architect",
+        role: str = "research",
         system_instruction: str | None = None,
     ) -> GroundedResult:
         model = self._model(role)
@@ -369,18 +541,21 @@ class GeminiGateway:
             body: dict[str, Any] = {
                 "model": model,
                 "input": prompt,
+                "store": False,
                 "tools": [{"type": "google_search"}],
+                "generation_config": {"thinking_level": self._thinking_level(role)},
                 "timeout": self.settings.request_timeout_seconds,
             }
             if system_instruction:
                 body["system_instruction"] = system_instruction
-            return self.client.interactions.create(**body)
+            return self._create_interaction(**body)
 
         response = self._call("grounded Google Search", invoke)
         self._record(response, "search_grounded", model)
+        payload = self._require_usable_response(response, operation="grounded Google Search")
         raw_steps: list[dict[str, Any]] = []
         annotations: list[dict[str, Any]] = []
-        for step in getattr(response, "steps", None) or []:
+        for step in getattr(payload, "steps", None) or []:
             if hasattr(step, "model_dump"):
                 dumped = step.model_dump(mode="json", exclude_none=True)
             elif isinstance(step, dict):
@@ -404,7 +579,7 @@ class GeminiGateway:
                             if isinstance(annotation, dict)
                         )
         return GroundedResult(
-            text=str(getattr(response, "output_text", "") or ""),
+            text=str(getattr(payload, "output_text", "") or ""),
             model=model,
             annotations=annotations,
             raw_steps=raw_steps,
@@ -442,9 +617,10 @@ class GeminiGateway:
         model = self._model("image")
 
         def invoke() -> Any:
-            return self.client.interactions.create(
+            return self._create_interaction(
                 model=model,
                 input=prompt,
+                store=False,
                 response_format={
                     "type": "image",
                     "mime_type": "image/jpeg",
@@ -455,7 +631,10 @@ class GeminiGateway:
 
         response = self._call("Gemini image generation", invoke)
         self._record(response, "generate_image", model)
-        content = getattr(response, "output_image", None)
+        payload_response = self._require_usable_response(
+            response, operation="Gemini image generation"
+        )
+        content = getattr(payload_response, "output_image", None)
         encoded = getattr(content, "data", None)
         if not encoded:
             raise GeminiGatewayError("Gemini image generation returned no image bytes")
@@ -488,3 +667,82 @@ class GeminiGateway:
         finally:
             temporary.unlink(missing_ok=True)
         return destination
+
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        output_dimensionality: int = 768,
+    ) -> list[list[float]]:
+        if not texts or any(not item.strip() for item in texts):
+            raise ValueError("Embedding input must contain non-empty text")
+        if output_dimensionality not in {768, 1536, 3072}:
+            raise ValueError("Embedding dimensionality must be 768, 1536 or 3072")
+        model = self._model("embedding")
+
+        rows: list[list[float]] = []
+        # A flat list of strings is interpreted by the SDK as parts of one
+        # multimodal Content object. Submit each logical record separately so
+        # the returned vector count is deterministic across SDK releases.
+        for text in texts:
+            def invoke_embedding(text_value: str = text) -> Any:
+                return self.client.models.embed_content(
+                    model=model,
+                    contents=cast(Any, text_value),
+                    config={"output_dimensionality": output_dimensionality},
+                )
+
+            response = self._call(
+                "Gemini embeddings",
+                invoke_embedding,
+            )
+            embeddings = list(getattr(response, "embeddings", None) or [])
+            if len(embeddings) != 1:
+                raise GeminiGatewayError("Gemini returned the wrong number of embedding vectors")
+            values = getattr(embeddings[0], "values", None)
+            if values is None and isinstance(embeddings[0], dict):
+                values = embeddings[0].get("values")
+            if not isinstance(values, list) or len(values) != output_dimensionality:
+                raise GeminiGatewayError("Gemini returned an invalid embedding vector")
+            rows.append([float(value) for value in values])
+        return rows
+
+    def start_background_text(self, *, prompt: str, role: str) -> str:
+        model = self._model(role)
+
+        def invoke() -> Any:
+            return self._create_interaction(
+                model=model,
+                input=prompt,
+                store=True,
+                background=True,
+                generation_config={"thinking_level": self._thinking_level(role)},
+                extra_headers={"Api-Revision": "2026-05-20"},
+                timeout=self.settings.request_timeout_seconds,
+            )
+
+        response = self._call(f"background generation ({role})", invoke)
+        self._record(response, "start_background_text", model)
+        payload = self._require_usable_response(
+            response, operation=f"background generation ({role})"
+        )
+        interaction_id = str(getattr(payload, "id", "") or "")
+        if not interaction_id:
+            raise GeminiGatewayError("Gemini background request returned no interaction ID")
+        return interaction_id
+
+    def cancel_interaction(self, interaction_id: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9._~-]+", interaction_id) is None:
+            raise ValueError("Unexpected Gemini interaction ID")
+        response = self._call(
+            "Gemini interaction cancellation",
+            lambda: self.client.interactions.cancel(
+                id=interaction_id,
+                extra_headers={"Api-Revision": "2026-05-20"},
+                timeout=self.settings.request_timeout_seconds,
+            ),
+        )
+        status = str(getattr(response, "status", "") or "").casefold()
+        if not status:
+            raise GeminiGatewayError("Gemini cancellation returned no status")
+        return status

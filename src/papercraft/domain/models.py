@@ -161,6 +161,7 @@ class Locator(DomainModel):
     """Stable pointer to the evidence location inside an imported source."""
 
     source_id: str | None = None
+    snapshot_id: str | None = None
     page: int | None = Field(default=None, ge=1)
     sheet: str | None = None
     cell_range: str | None = None
@@ -191,6 +192,41 @@ class Source(DomainModel):
     classification_confidence: float | None = Field(default=None, ge=0, le=1)
     created_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class SourceSnapshot(DomainModel):
+    """Immutable local capture of the exact bytes used to verify web evidence."""
+
+    id: str = Field(default_factory=new_id, min_length=1)
+    project_id: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    canonical_url: str = Field(min_length=1)
+    final_url: str = Field(min_length=1)
+    stored_path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+    title: str = ""
+    authors: list[str] = Field(default_factory=list)
+    organization: str = ""
+    publication_date: date | None = None
+    doi: str | None = None
+    isbn: str | None = None
+    accessed_at: datetime = Field(default_factory=utc_now)
+    locator: Locator = Field(default_factory=Locator)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bind_locator(self) -> SourceSnapshot:
+        if self.locator.source_id is None:
+            self.locator.source_id = self.source_id
+        elif self.locator.source_id != self.source_id:
+            raise ValueError("snapshot locator.source_id must match source_id")
+        if self.locator.snapshot_id is None:
+            self.locator.snapshot_id = self.id
+        elif self.locator.snapshot_id != self.id:
+            raise ValueError("snapshot locator.snapshot_id must match snapshot id")
+        return self
 
 
 class SourceFragment(DomainModel):
@@ -311,6 +347,13 @@ class TemplateApplicationPlan(DomainModel):
             raise ValueError("TemplateApplicationPlan must not contain raw XML")
         return value
 
+    @field_validator("use_styles", "allowed_relationship_types")
+    @classmethod
+    def reject_markup_lists(cls, value: list[str]) -> list[str]:
+        if any("<" in item or ">" in item or any(ord(character) < 32 for character in item) for item in value):
+            raise ValueError("TemplateApplicationPlan values must be plain identifiers")
+        return value
+
 
 class VisualRequest(DomainModel):
     kind: VisualKind
@@ -326,6 +369,7 @@ class SectionSpec(DomainModel):
     order: int = Field(default=0, ge=0)
     target_words: int = Field(default=0, ge=0)
     theses: list[str] = Field(default_factory=list)
+    required_claim_ids: list[str] = Field(default_factory=list)
     required_fact_ids: list[str] = Field(default_factory=list)
     source_ids: list[str] = Field(default_factory=list)
     visual_requests: list[VisualRequest] = Field(default_factory=list)
@@ -387,6 +431,7 @@ class Evidence(DomainModel):
     id: str = Field(default_factory=new_id)
     claim_id: str = Field(min_length=1)
     source_id: str = Field(min_length=1)
+    snapshot_id: str | None = None
     locator: Locator
     excerpt: str = ""
     supports: bool = True
@@ -400,6 +445,12 @@ class Evidence(DomainModel):
             self.locator.source_id = self.source_id
         elif self.locator.source_id != self.source_id:
             raise ValueError("locator.source_id must match source_id")
+        if self.snapshot_id is None and self.locator.snapshot_id is not None:
+            self.snapshot_id = self.locator.snapshot_id
+        elif self.snapshot_id is not None and self.locator.snapshot_id is None:
+            self.locator.snapshot_id = self.snapshot_id
+        elif self.snapshot_id is not None and self.locator.snapshot_id != self.snapshot_id:
+            raise ValueError("locator.snapshot_id must match evidence.snapshot_id")
         return self
 
 

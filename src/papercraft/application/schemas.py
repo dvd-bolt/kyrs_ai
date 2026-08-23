@@ -68,6 +68,8 @@ class EvidenceAssessment(GeneratedModel):
     supported_urls: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0, ge=0, le=1)
     rationale: str = ""
+    evidence_quote: str = Field(default="", max_length=4_000)
+    locator_hint: str = Field(default="", max_length=500)
 
 
 class PlannedVisual(GeneratedModel):
@@ -150,6 +152,7 @@ class DraftParagraph(GeneratedModel):
     text: str = Field(min_length=1)
     claim_ids: list[str] = Field(default_factory=list)
     bibliography_entry_ids: list[str] = Field(default_factory=list)
+    numeric_fact_ids: list[str] = Field(default_factory=list)
 
 
 class DraftTable(GeneratedModel):

@@ -1,21 +1,31 @@
 # V1 acceptance checklist
 
-Этап 1 фиксирует воспроизводимый фундамент, но не объявляет v1 готовой.
+Текущий результат этапа 3: **RELEASE BLOCKED**. Release commit нельзя создавать, пока
+обязательные live-пункты ниже не завершены без `CRITICAL`/`BLOCKER`.
 
 ## Проверки
 
-- [x] Ветка `codex/papercraft-v1` создана с сохранением рабочего дерева.
-- [x] Ruff для `src tests_v2` проходит на доступном Python 3.13.
-- [x] `mypy src/papercraft --strict` проходит.
-- [x] `pytest tests_v2 -q`: 49 passed, 3 skipped.
-- [x] `git diff --check` не сообщает ошибок whitespace.
-- [ ] Python 3.12 и `uv sync` подтверждены на машине разработчика.
-- [ ] LibreOffice smoke подтверждён в окружении с LibreOffice.
-- [ ] Word COM smoke подтверждён вручную.
-- [ ] Live Gemini подтверждён вручную с ключом.
-- [ ] Windows installer принят.
-- [ ] Финальные golden E2E документы сгенерированы и приняты.
+- [x] Production Gemini model/thinking policy закреплена и покрыта contract tests.
+- [x] Реальные SourceSnapshot и Claim → Evidence → Source → Locator реализованы.
+- [x] Crossref/OpenAlex/DOI live integration: 2 passed.
+- [x] OCR/Vision live fixtures: 6/6 passed.
+- [x] Безопасное применение DOCX templates подтверждено.
+- [x] LibreOffice matrix и PDF export: 2 passed.
+- [ ] Microsoft Word COM matrix — Word недоступен в окружении.
+- [x] PDF repair cycle исправил найденную live-проверкой нумерацию страниц.
+- [ ] Финальный live Gemini PDF re-review — 429 provider quota.
+- [x] Fault-injection/security subset: 41 passed.
+- [ ] Шесть live golden E2E минимум дважды — все 12 запущены, 0 passed / 12 failed из-за 429 quota.
+- [x] Полный source и frozen UI smoke выполнен.
+- [x] PyInstaller/Inno Setup build, non-elevated install, first launch, worker, update/uninstall и сохранность projects проверены локально.
+- [ ] Installer проверен на отдельных чистых Windows 10 и Windows 11.
+- [x] TODO/FIXME/mock/stub/placeholder/exec/remote fallback audit выполнен для release scope.
+- [x] Ruff, strict MyPy, pytest и `git diff --check` проходят в release scope.
+- [ ] Code signing — сертификат отсутствует; допустим только unsigned beta после остальных checks.
+
+Подробные результаты и хэши находятся в [`STAGE3_ACCEPTANCE.md`](STAGE3_ACCEPTANCE.md).
 
 ## Правило приёмки
 
-Обычный CI не вызывает Gemini и не требует Word COM. Эти проверки выполняются только ручными jobs или отдельно назначенным окружением.
+Обычный CI не вызывает платные внешние сервисы и не требует Office. Release acceptance
+обязана отдельно выполнить live jobs; локальные fakes не заменяют эти пункты.

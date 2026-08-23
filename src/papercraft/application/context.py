@@ -39,7 +39,11 @@ class ContextBuilder:
         requirements: list[RequirementRule],
         dependency_conclusions: dict[str, str] | None = None,
     ) -> SectionContext:
-        selected_claims = [item for item in claims if item.section_id in {None, section.id}]
+        selected_claims = [
+            item
+            for item in claims
+            if item.id in section.required_claim_ids or item.section_id in {None, section.id}
+        ]
         evidence_ids = {item_id for claim in selected_claims for item_id in claim.evidence_ids}
         selected_evidence = [item for item in evidence if item.id in evidence_ids and item.verified]
         selected_sources = {item.source_id for item in selected_evidence} | set(section.source_ids)

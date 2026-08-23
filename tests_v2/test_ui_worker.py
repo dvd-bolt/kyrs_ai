@@ -15,6 +15,8 @@ from papercraft.domain import (
     ProjectBrief,
     RunStatus,
     SectionSpec,
+    StageRun,
+    StageStatus,
 )
 from papercraft.ui.run_control import RunControlError, RunController
 from papercraft.worker import (
@@ -73,8 +75,14 @@ def test_worker_request_builds_exclusive_commands(tmp_path: Path) -> None:
     )
     assert program.endswith("python.exe")
     assert arguments[:2] == ["-m", "papercraft.worker.cli"]
-    with pytest.raises(FileNotFoundError, match="worker"):
-        worker_invocation(retry, executable=tmp_path / "PaperCraft.exe", frozen=True)
+    frozen_executable = tmp_path / "PaperCraft.exe"
+    frozen_executable.touch()
+    program, arguments = worker_invocation(
+        retry, executable=frozen_executable, frozen=True
+    )
+    assert program == str(frozen_executable.resolve())
+    assert arguments[0] == "--papercraft-worker"
+    assert arguments[1:] == retry.arguments()
 
 
 def test_worker_lease_prevents_duplicate_project_workers(tmp_path: Path) -> None:
@@ -175,6 +183,43 @@ def test_main_window_has_six_connected_screens(tmp_path: Path, monkeypatch: pyte
         window.workspace.repository.save_run(run)
         window._resume_run()
         assert requests[-1].run_id == run.id
+        assert requests[-1].acknowledge_checkpoint is False
+
+        checkpoint = GenerationRun(
+            project_id=window.workspace.project.id,
+            status=RunStatus.WAITING_INPUT,
+            current_stage=PipelineStage.EXTRACT_REQUIREMENTS.value,
+        )
+        window.workspace.repository.save_run(checkpoint)
+        window.workspace.repository.save_stage(
+            StageRun(
+                run_id=checkpoint.id,
+                name=PipelineStage.EXTRACT_REQUIREMENTS.value,
+                status=StageStatus.SUCCEEDED,
+            )
+        )
+        window.active_run_id = checkpoint.id
+        window._resume_run()
+        assert requests[-1].acknowledge_checkpoint is True
+
+        authentication = GenerationRun(
+            project_id=window.workspace.project.id,
+            status=RunStatus.WAITING_INPUT,
+            current_stage=PipelineStage.PREFLIGHT.value,
+        )
+        window.workspace.repository.save_run(authentication)
+        window.workspace.repository.save_stage(
+            StageRun(
+                run_id=authentication.id,
+                name=PipelineStage.PREFLIGHT.value,
+                status=StageStatus.FAILED,
+            )
+        )
+        window.active_run_id = authentication.id
+        window._resume_run()
+        assert requests[-1].acknowledge_checkpoint is False
+
+        window.active_run_id = run.id
         run.status = RunStatus.RUNNING
         window.workspace.repository.save_run(run)
         window._pause_run()

@@ -595,6 +595,9 @@ class PdfParser(SourceParser):
 class ImageParser(SourceParser):
     suffixes = IMAGE_SUFFIXES
 
+    def __init__(self, vision: VisionOCRPort | None = None) -> None:
+        self.vision = vision
+
     def parse(self, source: Source) -> ParseResult:
         try:
             from PIL import Image
@@ -620,6 +623,24 @@ class ImageParser(SourceParser):
                     ordinal="image",
                 )
             )
+            if self.vision is not None:
+                ocr = self.vision.recognize(path.read_bytes(), page_number=1)
+                if ocr.text.strip():
+                    result.fragments.append(
+                        fragment(
+                            source_id=source.id,
+                            content=ocr.text,
+                            source_locator=locator(source_id=source.id, path=path, page=1),
+                            metadata={
+                                "kind": "ocr-image",
+                                "ocr_confidence": ocr.confidence,
+                                "tables": list(ocr.tables),
+                                "captions": list(ocr.captions),
+                                "low_confidence_numbers": list(ocr.low_confidence_numbers),
+                            },
+                            ordinal="ocr-image",
+                        )
+                    )
         except Exception as error:
             result.warnings.append(f"image-error:{type(error).__name__}:{error}")
         return result
@@ -628,15 +649,20 @@ class ImageParser(SourceParser):
 class ParserRegistry:
     """Select a parser without importing optional libraries at module import."""
 
-    def __init__(self, parsers: Iterable[SourceParser] | None = None) -> None:
+    def __init__(
+        self,
+        parsers: Iterable[SourceParser] | None = None,
+        *,
+        vision: VisionOCRPort | None = None,
+    ) -> None:
         self.parsers = list(
             parsers
             or (
                 DocxParser(),
-                PdfParser(),
+                PdfParser(vision=vision),
                 XlsxParser(),
                 CsvParser(),
-                ImageParser(),
+                ImageParser(vision=vision),
                 CodeParser(),
                 TextParser(),
             )

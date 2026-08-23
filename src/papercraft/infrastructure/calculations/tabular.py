@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import io
+import math
+import re
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -97,17 +100,26 @@ def _dataset(
     headers = _unique_headers(raw_rows[0], width)
     data_rows = raw_rows[1:]
     columns: list[DatasetColumn] = []
+    column_types: list[DataType] = []
     for index, header in enumerate(headers):
         values = [row[index] if index < len(row) else None for row in data_rows]
+        data_type = _infer_type(values)
+        column_types.append(data_type)
         columns.append(
             DatasetColumn(
                 name=header,
-                data_type=_infer_type(values),
+                data_type=data_type,
                 nullable=any(value is None for value in values),
             )
         )
     rows = [
-        {headers[index]: row[index] if index < len(row) else None for index in range(width)}
+        {
+            headers[index]: _coerce(
+                row[index] if index < len(row) else None,
+                column_types[index],
+            )
+            for index in range(width)
+        }
         for row in data_rows
     ]
     return Dataset(
@@ -147,7 +159,71 @@ def _infer_type(values: Sequence[Any]) -> DataType:
         return DataType.DATETIME
     if all(isinstance(value, date) for value in actual):
         return DataType.DATE
+    textual = [value.strip() for value in actual if isinstance(value, str)]
+    if len(textual) == len(actual):
+        if all(re.fullmatch(r"[-+]?\d+", value) for value in textual):
+            return DataType.INTEGER
+        if all(_decimal_text(value) is not None for value in textual):
+            return DataType.NUMBER
+        if all(value.casefold() in {"true", "false"} for value in textual):
+            return DataType.BOOLEAN
+        if all(_iso_datetime(value) for value in textual):
+            return DataType.DATETIME
+        if all(_iso_date(value) for value in textual):
+            return DataType.DATE
     return DataType.STRING
+
+
+def _coerce(value: Any, data_type: DataType) -> Any:
+    if value is None or not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if data_type == DataType.INTEGER:
+        return int(cleaned)
+    if data_type == DataType.NUMBER:
+        decimal = _decimal_text(cleaned)
+        if decimal is None:
+            return cleaned
+        if decimal == decimal.to_integral_value():
+            return int(decimal)
+        converted = float(decimal)
+        return converted if math.isfinite(converted) else cleaned
+    if data_type == DataType.BOOLEAN:
+        return cleaned.casefold() == "true"
+    if data_type in {DataType.DATE, DataType.DATETIME}:
+        return cleaned
+    return value
+
+
+def _decimal_text(value: str) -> Decimal | None:
+    normalized = value.replace(" ", "").replace(",", ".")
+    if re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", normalized) is None:
+        return None
+    try:
+        converted = Decimal(normalized)
+    except InvalidOperation:
+        return None
+    return converted if converted.is_finite() else None
+
+
+def _iso_date(value: str) -> bool:
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _iso_datetime(value: str) -> bool:
+    if "T" not in value and " " not in value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _decode(raw: bytes) -> str:
@@ -160,6 +236,8 @@ def _decode(raw: bytes) -> str:
 
 
 def _json_value(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (date, datetime)):

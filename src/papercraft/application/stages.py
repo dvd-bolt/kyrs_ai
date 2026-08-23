@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import re
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import JsonValue
 
@@ -34,6 +35,7 @@ from papercraft.domain import (
     DiagramSpec,
     Evidence,
     FactOrigin,
+    FactRecord,
     FigureBlock,
     FormulaBlock,
     FormulaSpec,
@@ -54,10 +56,12 @@ from papercraft.domain import (
     RuleProvenance,
     SectionSpec,
     Source,
+    SourceFragment,
     SourceRole,
     TableBlock,
     TableSpec,
     VisualRequest,
+    utc_now,
 )
 from papercraft.infrastructure.calculations import (
     Distribution,
@@ -67,17 +71,30 @@ from papercraft.infrastructure.calculations import (
     TabularDatasetImporter,
     validate_finance_dataset,
 )
-from papercraft.infrastructure.gemini import GeminiPort, RemoteFile
+from papercraft.infrastructure.gemini import (
+    GeminiPort,
+    GeminiUnavailableError,
+    GroundedResult,
+    RemoteFile,
+)
+from papercraft.infrastructure.ingest import GeminiVisionOCR, ParserRegistry
 from papercraft.infrastructure.persistence import sha256_file
 from papercraft.infrastructure.research import (
     BibliographyDeduplicator,
     BibliographyValidator,
+    CrossrefClient,
+    OfficialSourcePolicy,
+    OpenAlexClient,
+    ScholarlyDiscovery,
+    ScholarlyRecord,
+    SourceSnapshotStore,
     URLVerifier,
 )
 from papercraft.profiles import ProfileRegistry, WorkProfile, default_profile_registry
 
 from .autopilot import PipelineStage, StageContext, StageHandler, StageOutcome
 from .context import ContextBuilder
+from .ports import RepositoryPort
 from .schemas import (
     BlueprintGeneration,
     DataPreparationPlan,
@@ -115,6 +132,9 @@ class ProductionStageFactory:
     gateway: GeminiPort
     profiles: ProfileRegistry = field(default_factory=default_profile_registry)
     url_verifier: URLVerifier | None = None
+    scholarly_discovery: ScholarlyDiscovery | None = None
+    official_source_policy: OfficialSourcePolicy = field(default_factory=OfficialSourcePolicy)
+    repository: RepositoryPort | None = field(default=None, repr=False)
 
     def build(self) -> dict[PipelineStage, StageHandler]:
         return {
@@ -139,7 +159,35 @@ class ProductionStageFactory:
 
     def cleanup_remote_files(self, run: Any) -> None:
         raw = run.metadata.get("remote_files", [])
-        remaining = _delete_remote_files(self.gateway, raw)
+        records = [
+            cast(dict[str, JsonValue], item)
+            for item in raw
+            if isinstance(raw, list)
+            and isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+        ]
+        resources: list[RemoteResource] = []
+        if self.repository is not None:
+            resources = self.repository.list_remote_resources(run.id)
+            known_names = {str(item["name"]) for item in records}
+            for resource in resources:
+                if resource.deleted_at is None and resource.remote_id not in known_names:
+                    records.append(
+                        {
+                            "name": resource.remote_id,
+                            "uri": resource.uri,
+                            "mime_type": resource.mime_type,
+                        }
+                    )
+                    known_names.add(resource.remote_id)
+        remaining = _delete_remote_files(self.gateway, records)
+        remaining_names = {str(item["name"]) for item in remaining}
+        if self.repository is not None:
+            for resource in resources:
+                if resource.deleted_at is None and resource.remote_id not in remaining_names:
+                    self.repository.save_remote_resource(
+                        resource.model_copy(update={"deleted_at": utc_now()})
+                    )
         run.metadata["remote_files"] = cast(JsonValue, remaining)
         if remaining:
             raise StageExecutionError(
@@ -203,6 +251,7 @@ class ProductionStageFactory:
         )
 
     def ingest(self, context: StageContext) -> StageOutcome:
+        self.repository = context.repository
         # References produced by the research stage are outputs, not user
         # inputs.  Excluding them keeps retry-from-ingest idempotent and avoids
         # attempting to upload an HTTPS URL as though it were a local file.
@@ -220,8 +269,44 @@ class ProductionStageFactory:
                 context.repository.save_run(context.run)
         upload_records: list[dict[str, str]] = []
         artifacts: list[Artifact] = []
+        vision_registry = ParserRegistry(
+            vision=GeminiVisionOCR(
+                self.gateway,
+                on_upload=lambda remote: _remember_remote_file(
+                    context,
+                    {
+                        "source_id": "ocr-temporary-page",
+                        "name": remote.name,
+                        "uri": remote.uri,
+                        "mime_type": remote.mime_type or "image/png",
+                    },
+                ),
+                on_delete=lambda remote: _remove_remote_file_record(context, remote.name),
+            )
+        )
         for source in sources:
             fragments = context.repository.list_fragments(source.id)
+            ingestion = source.metadata.get("ingestion")
+            raw_warnings = ingestion.get("warnings", []) if isinstance(ingestion, dict) else []
+            warnings = raw_warnings if isinstance(raw_warnings, list) else []
+            needs_ocr = any(
+                isinstance(item, str) and item.startswith("ocr-required:")
+                for item in warnings
+            )
+            if needs_ocr or (not fragments and Path(source.stored_path).suffix.casefold() == ".pdf"):
+                parsed = vision_registry.parse(source)
+                context.repository.clear_source_fragments(source.id)
+                for parsed_fragment in parsed.fragments:
+                    context.repository.save_fragment(parsed_fragment)
+                metadata = dict(source.metadata)
+                metadata["ingestion"] = {
+                    "warnings": list(parsed.warnings),
+                    "metadata": parsed.metadata,
+                    "vision_processed": True,
+                }
+                source = source.model_copy(update={"metadata": metadata})
+                context.repository.save_source(source)
+                fragments = parsed.fragments
             if not fragments and source.role not in {SourceRole.IMAGE, SourceRole.TEMPLATE}:
                 raise StageExecutionError(f"No content could be extracted from {source.original_name}")
             if context.project.options.consent_to_remote_processing:
@@ -282,7 +367,7 @@ class ProductionStageFactory:
         generated = self.gateway.generate_structured(
             prompt=prompt,
             schema=RequirementExtraction,
-            role="extractor",
+            role="requirements",
             system_instruction=SYSTEM_GUARD,
             files=self._remote_files(context, {source.id for source in sources}),
         )
@@ -352,7 +437,7 @@ class ProductionStageFactory:
                 f"Profile: {self._profile(context).model_dump_json()}"
             ),
             schema=ResearchPlan,
-            role="architect",
+            role="research",
             system_instruction=SYSTEM_GUARD,
         )
         for item in plan.claims:
@@ -373,6 +458,14 @@ class ProductionStageFactory:
 
     def verified_research(self, context: StageContext) -> StageOutcome:
         claims = context.repository.list_claims(context.project.id)
+        derived_root = context.paths.derived.resolve()
+        for existing_snapshot in context.repository.list_source_snapshots(context.project.id):
+            snapshot_path = Path(existing_snapshot.stored_path).resolve()
+            try:
+                snapshot_path.relative_to(derived_root)
+            except ValueError:
+                continue
+            snapshot_path.unlink(missing_ok=True)
         context.repository.clear_research_data(context.project.id, include_claims=False)
         for claim in claims:
             claim.status = ClaimStatus.PENDING
@@ -382,78 +475,169 @@ class ProductionStageFactory:
         evidence_items: list[Evidence] = []
         validator = BibliographyValidator()
         verifier = self.url_verifier or URLVerifier()
+        discovery = self.scholarly_discovery or ScholarlyDiscovery(
+            CrossrefClient(verifier),
+            OpenAlexClient(verifier),
+        )
+        snapshot_store = SourceSnapshotStore(context.paths.derived / "source_snapshots")
+        warnings: list[str] = []
         for claim in claims:
             query = str(claim.metadata.get("search_query") or claim.text)
-            grounded = self.gateway.search_grounded(
-                prompt=(
-                    f"Find primary or authoritative evidence for this claim: {claim.text}\n"
-                    f"Search query: {query}\nReturn a concise synthesis with citations."
-                ),
-                role="architect",
-                system_instruction=SYSTEM_GUARD,
-            )
-            candidate_urls = sorted(
-                {
-                    str(annotation.get("url") or annotation.get("source") or "").strip()
-                    for annotation in grounded.annotations
-                    if str(annotation.get("url") or annotation.get("source") or "").strip()
-                }
-            )
-            assessment = self.gateway.generate_structured(
-                prompt=(
-                    "Determine whether the grounded synthesis actually supports the claim. Approve only URLs present "
-                    "in CANDIDATE_URLS and only when their cited text directly entails the claim.\n"
-                    f"CLAIM: {claim.text}\nCANDIDATE_URLS: {json.dumps(candidate_urls)}\n"
-                    f"GROUNDED_SYNTHESIS: {grounded.text}\nANNOTATIONS: "
-                    f"{json.dumps(grounded.annotations, ensure_ascii=False)}"
-                ),
-                schema=EvidenceAssessment,
-                role="critic",
-                system_instruction=SYSTEM_GUARD,
-            )
-            approved_urls = set(assessment.supported_urls) & set(candidate_urls)
-            if not assessment.claim_supported or not approved_urls:
-                claim.status = ClaimStatus.UNSUPPORTED
-                context.repository.save_claim(claim)
-                continue
+            try:
+                grounded = self.gateway.search_grounded(
+                    prompt=(
+                        f"Find primary or authoritative evidence for this claim: {claim.text}\n"
+                        f"Search query: {query}\nReturn a concise synthesis with citations."
+                    ),
+                    role="research",
+                    system_instruction=SYSTEM_GUARD,
+                )
+            except GeminiUnavailableError as exc:
+                grounded = GroundedResult(text="", model=context.settings.model_policy.research)
+                warnings.append(f"google-search-unavailable:{type(exc).__name__}")
+            scholarly = discovery.search(query, limit=4)
+            candidates = _research_candidates(scholarly, grounded)
             supported = False
-            for annotation in grounded.annotations:
-                url = str(annotation.get("url") or annotation.get("source") or "").strip()
-                if not url or url not in approved_urls:
-                    continue
+            for candidate in candidates[:6]:
+                canonical_url = candidate.canonical_url
+                fetch_url = _snapshot_fetch_url(candidate)
                 try:
-                    verification = verifier.verify(url)
+                    verification = verifier.verify(fetch_url)
                 except Exception:
                     continue
                 if not verification.verified:
                     continue
-                title = str(annotation.get("title") or verification.title or urlsplit(verification.final_url).hostname or "Web source")
+                provisional = Source(
+                    project_id=context.project.id,
+                    role=SourceRole.REFERENCE,
+                    original_name=(candidate.title or verification.title or "Web source")[:200],
+                    stored_path=verification.final_url,
+                    sha256=verification.content_sha256,
+                    mime_type=verification.content_type or "application/octet-stream",
+                    size_bytes=verification.content_length,
+                    classification_confidence=1.0,
+                    metadata={"generated": True},
+                )
+                try:
+                    capture = snapshot_store.capture(
+                        project_id=context.project.id,
+                        source_id=provisional.id,
+                        canonical_url=canonical_url,
+                        verification=verification,
+                        doi=candidate.doi,
+                        authors=list(candidate.authors),
+                        organization=candidate.organization,
+                        publication_date=(date(candidate.year, 1, 1) if candidate.year else None),
+                        metadata={
+                            "source_api": candidate.source_api,
+                            "official": self.official_source_policy.is_official(canonical_url),
+                        },
+                    )
+                except (OSError, ValueError):
+                    continue
+                snapshot = capture.snapshot
+                source_text = capture.extracted_text.strip()
+                if not source_text:
+                    continue
+                assessment = self.gateway.generate_structured(
+                    prompt=(
+                        "Act as an entailment critic. Approve only when the exact SOURCE_SNAPSHOT text directly "
+                        "supports CLAIM. Return a short verbatim evidence_quote copied from the snapshot and a "
+                        "locator_hint. Never rely on the title or model memory alone.\n"
+                        f"CLAIM: {claim.text}\nCANDIDATE_URLS: {json.dumps([canonical_url])}\n"
+                        f"SOURCE_SNAPSHOT_SHA256: {snapshot.sha256}\n"
+                        f"SOURCE_SNAPSHOT:\n{source_text[:24_000]}"
+                    ),
+                    schema=EvidenceAssessment,
+                    role="critic",
+                    system_instruction=SYSTEM_GUARD,
+                )
+                if (
+                    not assessment.claim_supported
+                    or canonical_url not in set(assessment.supported_urls)
+                    or not assessment.evidence_quote.strip()
+                    or assessment.evidence_quote.strip() not in source_text
+                ):
+                    continue
+                source = provisional.model_copy(
+                    update={
+                        "stored_path": snapshot.stored_path,
+                        "metadata": {
+                            "remote_url": canonical_url,
+                            "final_url": snapshot.final_url,
+                            "snapshot_id": snapshot.id,
+                            "verified": True,
+                            "generated": True,
+                            "official": bool(snapshot.metadata.get("official")),
+                            "source_api": candidate.source_api,
+                        },
+                    }
+                )
+                context.repository.save_source(source)
+                context.repository.save_source_snapshot(snapshot)
+                context.repository.save_fragment(
+                    SourceFragment(
+                        source_id=source.id,
+                        content=source_text,
+                        locator=snapshot.locator.model_copy(
+                            update={
+                                "section": assessment.locator_hint or "document",
+                                "details": {"snapshot_sha256": snapshot.sha256},
+                            }
+                        ),
+                        metadata={"snapshot_id": snapshot.id, "web_snapshot": True},
+                    )
+                )
+                title = candidate.title or snapshot.title or urlsplit(snapshot.final_url).hostname or "Web source"
                 entry = validator.normalize(
                     BibliographyEntry(
                         title=title,
-                        publisher=str(urlsplit(verification.final_url).hostname or ""),
-                        source_type="web",
-                        url=verification.final_url,
-                        accessed_on=date.today(),
-                        metadata={"content_sha256": verification.content_sha256, "verified": True},
+                        authors=list(candidate.authors),
+                        year=candidate.year,
+                        publisher=candidate.organization or snapshot.organization or str(urlsplit(snapshot.final_url).hostname or ""),
+                        source_type="journal" if candidate.doi else "web",
+                        doi=candidate.doi,
+                        isbn=snapshot.isbn,
+                        url=canonical_url,
+                        accessed_on=snapshot.accessed_at.date(),
+                        source_id=source.id,
+                        metadata={
+                            "content_sha256": snapshot.sha256,
+                            "snapshot_id": snapshot.id,
+                            "final_url": snapshot.final_url,
+                            "verified": True,
+                        },
                     )
                 )
-                source = _web_source(context, entry, verification.content_sha256)
-                context.repository.save_source(source)
-                entry = entry.model_copy(update={"source_id": source.id})
                 bibliography.append(entry)
                 evidence = Evidence(
                     claim_id=claim.id,
                     source_id=source.id,
-                    locator=Locator(source_id=source.id, url=verification.final_url),
-                    excerpt=_annotation_excerpt(grounded.text, annotation),
+                    snapshot_id=snapshot.id,
+                    locator=snapshot.locator.model_copy(
+                        update={
+                            "section": assessment.locator_hint or "document",
+                            "details": {
+                                "snapshot_sha256": snapshot.sha256,
+                                "quote_sha256": hashlib.sha256(
+                                    assessment.evidence_quote.strip().encode("utf-8")
+                                ).hexdigest(),
+                            },
+                        }
+                    ),
+                    excerpt=assessment.evidence_quote.strip(),
                     confidence=assessment.confidence,
                     verified=True,
-                    metadata={"bibliography_entry_id": entry.id, "grounded": True},
+                    metadata={
+                        "bibliography_entry_id": entry.id,
+                        "entailment_rationale": assessment.rationale,
+                        "source_api": candidate.source_api,
+                    },
                 )
                 context.repository.save_evidence(context.project.id, evidence)
                 evidence_items.append(evidence)
                 supported = True
+                break
             claim.status = ClaimStatus.SUPPORTED if supported else ClaimStatus.UNSUPPORTED
             claim.evidence_ids = [item.id for item in evidence_items if item.claim_id == claim.id]
             context.repository.save_claim(claim)
@@ -468,12 +652,22 @@ class ProductionStageFactory:
             context.repository.save_bibliography_entry(context.project.id, entry)
         path = context.artifact_store.write_json(
             f"{context.run.id}/verified_research.json",
-            {"claims": [item.model_dump(mode="json") for item in context.repository.list_claims(context.project.id)], "bibliography": [item.model_dump(mode="json") for item in deduplicated.entries]},
+            {
+                "claims": [item.model_dump(mode="json") for item in context.repository.list_claims(context.project.id)],
+                "bibliography": [item.model_dump(mode="json") for item in deduplicated.entries],
+                "snapshots": [item.model_dump(mode="json") for item in context.repository.list_source_snapshots(context.project.id)],
+                "warnings": warnings,
+            },
         )
         return StageOutcome(
             artifacts=[_artifact(context, path, ArtifactKind.OTHER, "application/json")],
-            checkpoint={"evidence": len(evidence_items), "sources": len(deduplicated.entries)},
-            message="Grounded sources verified and linked to claims",
+            checkpoint={
+                "evidence": len(evidence_items),
+                "sources": len(deduplicated.entries),
+                "snapshots": len(context.repository.list_source_snapshots(context.project.id)),
+                "warnings": cast(JsonValue, warnings),
+            },
+            message="Source snapshots verified and linked to claims",
         )
 
     def plan(self, context: StageContext) -> StageOutcome:
@@ -489,7 +683,7 @@ class ProductionStageFactory:
                 f"CLAIMS: {json.dumps([item.model_dump(mode='json') for item in claims], ensure_ascii=False)}"
             ),
             schema=BlueprintGeneration,
-            role="architect",
+            role="blueprint",
             system_instruction=SYSTEM_GUARD,
         )
         blueprint = _blueprint(context.project.id, generated, claims)
@@ -528,7 +722,7 @@ class ProductionStageFactory:
                     f"BLUEPRINT: {blueprint.model_dump_json()}"
                 ),
                 schema=DataPreparationPlan,
-                role="architect",
+                role="blueprint",
                 system_instruction=SYSTEM_GUARD,
             )
             factory = SyntheticDatasetFactory()
@@ -581,10 +775,12 @@ class ProductionStageFactory:
                     f"Financial dataset {dataset.name} failed double-entry validation: "
                     + "; ".join(issue.message for issue in result.issues)
                 )
+        facts = _materialize_dataset_facts(context, datasets)
         path = context.artifact_store.write_json(
             f"{context.run.id}/datasets.json",
             {
                 "datasets": [item.model_dump(mode="json") for item in datasets],
+                "facts": [item.model_dump(mode="json") for item in facts],
                 "finance_checks": finance_checks,
             },
         )
@@ -594,6 +790,7 @@ class ProductionStageFactory:
                 "datasets": len(datasets),
                 "synthetic": sum(item.origin == FactOrigin.SYNTHETIC for item in datasets),
                 "finance_checks": len(finance_checks),
+                "facts": len(facts),
             },
             message="Fact ledger and datasets prepared",
         )
@@ -611,6 +808,7 @@ class ProductionStageFactory:
         evidence = context.repository.list_evidence(context.project.id)
         bibliography = context.repository.list_bibliography(context.project.id)
         datasets = context.repository.list_datasets(context.project.id)
+        facts = context.repository.list_facts(context.project.id)
         requirements = _need(
             context.repository.get_latest_requirement_set(context.project.id), "Requirement set"
         )
@@ -626,12 +824,19 @@ class ProductionStageFactory:
             section_context = ContextBuilder().build(
                 section, blueprint, claims, evidence, bibliography, datasets, requirements.rules
             )
+            selected_dataset_ids = {item.id for item in section_context.datasets}
+            section_facts = [
+                item
+                for item in facts
+                if str(item.metadata.get("dataset_id") or "") in selected_dataset_ids
+            ]
             payload = {
                 "section": section.model_dump(mode="json"),
                 "claims": [item.model_dump(mode="json") for item in section_context.claims],
                 "evidence": [item.model_dump(mode="json") for item in section_context.evidence],
                 "bibliography": [item.model_dump(mode="json") for item in section_context.bibliography],
                 "datasets": [item.model_dump(mode="json") for item in section_context.datasets],
+                "facts": [item.model_dump(mode="json") for item in section_facts],
                 "glossary": section_context.glossary,
                 "requirements": [item.model_dump(mode="json") for item in section_context.requirements],
                 "dependency_conclusions": section_context.dependency_conclusions,
@@ -639,7 +844,8 @@ class ProductionStageFactory:
             draft = self.gateway.generate_structured(
                 prompt=(
                     "Write this section as typed blocks. Use only supplied evidence and datasets. Every factual paragraph "
-                    "must reference claim_ids and bibliography_entry_ids. Numeric statements must exactly match datasets. "
+                    "must reference claim_ids and bibliography_entry_ids. Every numeric statement must exactly match "
+                    "a supplied fact and list its ID in numeric_fact_ids. "
                     "Keep within ±10% of target_words.\n" + json.dumps(payload, ensure_ascii=False)
                 ),
                 schema=SectionDraft,
@@ -649,7 +855,14 @@ class ProductionStageFactory:
             if draft.section_id != section.id:
                 raise StageExecutionError(f"Generated section id mismatch for {section.title}")
             for cycle in range(context.project.options.maximum_revision_cycles):
-                issues = _validate_section_draft(draft, section, {item.id for item in claims}, {item.id for item in bibliography}, {item.id for item in datasets})
+                issues = _validate_section_draft(
+                    draft,
+                    section,
+                    {item.id for item in claims},
+                    {item.id for item in bibliography},
+                    {item.id for item in datasets},
+                    {item.id for item in section_facts},
+                )
                 critique = self.gateway.generate_structured(
                     prompt=(
                         "Critique this draft for evidence, numeric consistency, repetition, scope and target volume.\n"
@@ -898,56 +1111,90 @@ class ProductionStageFactory:
     def pdf_visual_qa(self, context: StageContext) -> StageOutcome:
         if not context.project.options.generate_pdf:
             return StageOutcome(skipped=True, message="PDF visual QA disabled")
-        pdf = _latest_artifact(context, ArtifactKind.PDF)
-        page_dir = context.paths.derived / context.run.id / "pages"
-        images = _render_pdf_pages(Path(pdf.path), page_dir)
-        if not images:
-            raise StageExecutionError("PDF could not be rendered to pages for visual QA")
-        issues = _basic_page_issues(images)
-        remote_records_raw = context.run.metadata.get("remote_files", [])
-        remote_records = list(remote_records_raw) if isinstance(remote_records_raw, list) else []
-        for batch_start in range(0, len(images), 10):
-            batch = images[batch_start : batch_start + 10]
-            remote_pages: list[RemoteFile] = []
-            for page_number, image_path in enumerate(batch, start=batch_start + 1):
-                remote = self.gateway.upload_file(image_path)
-                remote_pages.append(remote)
-                remote_records.append(
-                    {
-                        "source_id": f"pdf-page:{page_number}",
-                        "name": remote.name,
-                        "uri": remote.uri,
-                        "mime_type": remote.mime_type or "image/png",
-                    }
-                )
-            visual_review = self.gateway.generate_structured(
-                prompt=(
-                    f"Inspect these PDF page images in order; they are pages {batch_start + 1} through "
-                    f"{batch_start + len(batch)}. Report only visible layout defects: cropped text, blank pages, "
-                    "orphan headings, overflowing tables, unreadable images, captions, page numbers and spacing."
-                ),
-                schema=VisualQAResult,
-                role="critic",
-                system_instruction=SYSTEM_GUARD,
-                files=remote_pages,
-            )
-            for issue in visual_review.issues:
-                issues.append(
-                    QAIssue(
-                        severity=QASeverity(issue.severity),
-                        category=f"visual_{issue.category}",
-                        message=f"Page {issue.page}: {issue.message}",
-                        locator=Locator(page=issue.page),
+        maximum_cycles = min(3, context.project.options.maximum_revision_cycles)
+        history: list[dict[str, JsonValue]] = []
+        images: list[Path] = []
+        issues: list[QAIssue] = []
+        completed_cycle = 0
+        for cycle in range(1, maximum_cycles + 1):
+            completed_cycle = cycle
+            pdf = _latest_artifact(context, ArtifactKind.PDF)
+            page_dir = context.paths.derived / context.run.id / f"pages-cycle-{cycle}"
+            images = _render_pdf_pages(Path(pdf.path), page_dir)
+            if not images:
+                raise StageExecutionError("PDF could not be rendered to pages for visual QA")
+            issues = _basic_page_issues(Path(pdf.path), images)
+            for batch_start in range(0, len(images), 10):
+                batch = images[batch_start : batch_start + 10]
+                remote_pages: list[RemoteFile] = []
+                try:
+                    for page_number, image_path in enumerate(batch, start=batch_start + 1):
+                        remote = self.gateway.upload_file(image_path)
+                        remote_pages.append(remote)
+                        _remember_remote_file(
+                            context,
+                            {
+                                "source_id": f"pdf-page:{page_number}:cycle:{cycle}",
+                                "name": remote.name,
+                                "uri": remote.uri,
+                                "mime_type": remote.mime_type or "image/png",
+                            },
+                        )
+                    visual_review = self.gateway.generate_structured(
+                        prompt=(
+                            f"Inspect these PDF page images in order; they are pages {batch_start + 1} through "
+                            f"{batch_start + len(batch)}. This is repair cycle {cycle} of {maximum_cycles}. "
+                            "Report only visible layout defects: cropped text, blank pages, orphan headings, "
+                            "overflowing tables, text smaller than 8pt, unreadable or low-resolution images, "
+                            "detached captions, incorrect numbering/contents and bad spacing. A deliberate "
+                            "title page or sparse appendix is not blank. Use critical/blocker only when the "
+                            "document is not fit for submission."
+                        ),
+                        schema=VisualQAResult,
+                        role="visual_qa",
+                        system_instruction=SYSTEM_GUARD,
+                        files=remote_pages,
                     )
-                )
-        context.run.metadata["remote_files"] = cast(JsonValue, remote_records)
+                finally:
+                    _forget_deleted_remote_files(context, self.gateway, remote_pages)
+                for issue in visual_review.issues:
+                    category = f"visual_{issue.category}"
+                    issues.append(
+                        QAIssue(
+                            severity=QASeverity(issue.severity),
+                            category=category,
+                            message=f"Page {issue.page}: {issue.message}",
+                            locator=Locator(page=issue.page),
+                            auto_fixable=issue.category
+                            in {"cropped_text", "orphan_heading", "table_overflow", "caption", "spacing"},
+                        )
+                    )
+            history.append(
+                {
+                    "cycle": cycle,
+                    "pdf_sha256": sha256_file(Path(pdf.path)),
+                    "issues": [item.model_dump(mode="json") for item in issues],
+                }
+            )
+            blockers = [
+                issue
+                for issue in issues
+                if issue.severity in {QASeverity.BLOCKER, QASeverity.CRITICAL}
+            ]
+            if not blockers:
+                break
+            if cycle >= maximum_cycles or any(not issue.auto_fixable for issue in blockers):
+                break
+            self._repair_pdf_layout(context, cycle, blockers)
+
         context.run.metadata["visual_qa_issues"] = cast(
             JsonValue, [issue.model_dump(mode="json") for issue in issues]
         )
+        context.run.metadata["pdf_repair_cycles"] = completed_cycle - 1
         context.repository.save_run(context.run)
         qa_path = context.artifact_store.write_json(
             f"{context.run.id}/pdf_visual_qa.json",
-            [issue.model_dump(mode="json") for issue in issues],
+            {"cycles": history, "final_issues": [issue.model_dump(mode="json") for issue in issues]},
         )
         artifacts = [
             _artifact(
@@ -963,11 +1210,102 @@ class ProductionStageFactory:
         if any(issue.severity in {QASeverity.BLOCKER, QASeverity.CRITICAL} for issue in issues):
             for artifact in artifacts:
                 context.repository.save_artifact(artifact)
-            raise StageExecutionError("PDF visual QA found blocking layout problems")
+            raise StageExecutionError(
+                f"PDF visual QA still has blocking layout problems after {completed_cycle} cycle(s)"
+            )
         return StageOutcome(
             artifacts=artifacts,
-            checkpoint={"pages": len(images), "issues": len(issues)},
+            checkpoint={
+                "pages": len(images),
+                "issues": len(issues),
+                "repair_cycles": completed_cycle - 1,
+            },
             message="Rendered PDF pages passed deterministic and Gemini Vision checks",
+        )
+
+    def _repair_pdf_layout(
+        self,
+        context: StageContext,
+        cycle: int,
+        issues: Sequence[QAIssue],
+    ) -> None:
+        from papercraft.infrastructure.render import DocumentFinalizer, DocxRenderer
+
+        manuscript = _need(
+            context.repository.get_latest_manuscript(context.project.id),
+            "Manuscript",
+        )
+        requirements = context.repository.get_latest_requirement_set(context.project.id)
+        config = _render_config(requirements)
+        categories = {issue.category for issue in issues}
+        config = replace(
+            config,
+            table_font_size_pt=max(8.0, config.table_font_size_pt - cycle),
+            maximum_image_width_cm=max(12.0, config.maximum_image_width_cm - 0.5 * cycle),
+            maximum_image_height_cm=max(14.0, config.maximum_image_height_cm - 1.0 * cycle),
+        )
+        all_artifacts = context.repository.list_artifacts(
+            context.project.id,
+            run_id=context.run.id,
+        )
+        artifact_paths = {artifact.id: artifact.path for artifact in all_artifacts}
+        datasets = {
+            dataset.id: dataset
+            for dataset in context.repository.list_datasets(context.project.id)
+        }
+        citations = {
+            citation.id: citation
+            for citation in context.repository.list_citations(context.project.id)
+        }
+        templates = [
+            source
+            for source in context.repository.list_sources(context.project.id)
+            if source.role == SourceRole.TEMPLATE
+            and Path(source.stored_path).suffix.casefold() == ".docx"
+        ]
+        docx_path = Path(_latest_artifact(context, ArtifactKind.DOCX).path)
+        render_result = DocxRenderer(config).render(
+            manuscript,
+            docx_path,
+            template_path=templates[0].stored_path if templates else None,
+            artifact_paths=artifact_paths,
+            datasets=datasets,
+            citations=citations,
+            title_page=context.project.brief.title_page,
+        )
+        if render_result.unresolved_artifact_ids:
+            raise StageExecutionError("PDF repair introduced unresolved visual artifacts")
+        pdf_path = Path(_latest_artifact(context, ArtifactKind.PDF).path)
+        finalization = DocumentFinalizer().finalize(
+            docx_path,
+            pdf_path=pdf_path,
+            preferred=context.project.options.preferred_finalizer,
+            require_pdf=True,
+        )
+        if finalization.pdf is None or not finalization.pdf.valid_header:
+            raise StageExecutionError("PDF repair did not produce a valid PDF")
+        context.repository.save_artifact(
+            _artifact(
+                context,
+                docx_path,
+                ArtifactKind.DOCX,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                {"repair_cycle": cycle, "categories": sorted(categories)},
+            )
+        )
+        context.repository.save_artifact(
+            _artifact(
+                context,
+                pdf_path,
+                ArtifactKind.PDF,
+                "application/pdf",
+                {
+                    "repair_cycle": cycle,
+                    "categories": sorted(categories),
+                    "engine": finalization.engine,
+                    "fields_updated": finalization.fields_updated,
+                },
+            )
         )
 
     def final_gemini_review(self, context: StageContext) -> StageOutcome:
@@ -979,7 +1317,7 @@ class ProductionStageFactory:
                 f"BRIEF: {context.project.brief.model_dump_json()}\nMANUSCRIPT: {manuscript.model_dump_json()}"
             ),
             schema=GlobalReview,
-            role="critic",
+            role="final_review",
             system_instruction=SYSTEM_GUARD,
         )
         if not review.accepted or review.blocker_issues or review.factual_issues:
@@ -1006,6 +1344,8 @@ class ProductionStageFactory:
                 datasets=context.repository.list_datasets(context.project.id),
                 facts=context.repository.list_facts(context.project.id),
                 citations=context.repository.list_citations(context.project.id),
+                sources=context.repository.list_sources(context.project.id),
+                source_snapshots=context.repository.list_source_snapshots(context.project.id),
                 artifact_paths={artifact.id: artifact.path for artifact in artifacts},
                 docx_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.DOCX), None),
                 pdf_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.PDF), None),
@@ -1108,7 +1448,7 @@ def _blueprint(project_id: str, generated: BlueprintGeneration, claims: Sequence
                 order=planned.order,
                 target_words=planned.target_words,
                 theses=planned.theses,
-                required_fact_ids=required,
+                required_claim_ids=required,
                 source_ids=planned.source_ids,
                 visual_requests=[VisualRequest(kind=item.kind, purpose=item.purpose, requirements=item.requirements) for item in planned.visuals],
                 expected_conclusion=planned.expected_conclusion,
@@ -1156,6 +1496,7 @@ def _draft_blocks(draft: SectionDraft, bibliography: Sequence[BibliographyEntry]
                             "bibliography_entry_ids": block.bibliography_entry_ids,
                         },
                     ),
+                    numeric_fact_ids=block.numeric_fact_ids,
                 )
             )
         elif isinstance(block, DraftTable):
@@ -1180,6 +1521,7 @@ def _validate_section_draft(
     claim_ids: set[str],
     bibliography_ids: set[str],
     dataset_ids: set[str],
+    fact_ids: set[str],
 ) -> list[str]:
     issues: list[str] = []
     if section.target_words and not 0.9 * section.target_words <= draft.word_count <= 1.1 * section.target_words:
@@ -1190,10 +1532,64 @@ def _validate_section_draft(
                 issues.append("paragraph contains unknown claim IDs")
             if set(block.bibliography_entry_ids) - bibliography_ids:
                 issues.append("paragraph contains unknown bibliography IDs")
+            if set(block.numeric_fact_ids) - fact_ids:
+                issues.append("paragraph contains unknown numeric fact IDs")
+            if re.search(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", block.text) and not block.numeric_fact_ids:
+                issues.append("paragraph contains numbers without FactLedger provenance")
         if isinstance(block, (DraftChart, DraftTable)) and block.dataset_id and block.dataset_id not in dataset_ids:
             issues.append(f"visual contains unknown dataset ID {block.dataset_id}")
     issues.extend(f"unresolved claim: {item}" for item in draft.unresolved_claims)
     return issues
+
+
+def _materialize_dataset_facts(
+    context: StageContext,
+    datasets: Sequence[Dataset],
+    *,
+    maximum_facts: int = 100_000,
+) -> list[FactRecord]:
+    facts: list[FactRecord] = []
+    for dataset in datasets:
+        columns = {column.name: column for column in dataset.columns}
+        for row_index, row in enumerate(dataset.rows, start=1):
+            for column_name, column in columns.items():
+                value = row.get(column_name)
+                numeric_identifier = (
+                    isinstance(value, str)
+                    and re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", value.strip()) is not None
+                )
+                if (
+                    value is None
+                    or isinstance(value, bool)
+                    or (not isinstance(value, (int, float)) and not numeric_identifier)
+                ):
+                    continue
+                if len(facts) >= maximum_facts:
+                    raise StageExecutionError(
+                        f"Numeric dataset facts exceed the safe limit of {maximum_facts}"
+                    )
+                source_id = next(iter(dataset.source_ids), None)
+                raw_row_source = row.get("source_id")
+                if isinstance(raw_row_source, str) and raw_row_source:
+                    source_id = raw_row_source
+                fact = FactRecord(
+                    project_id=context.project.id,
+                    name=f"{dataset.name}.row_{row_index}.{column_name}",
+                    value=value,
+                    unit=column.unit,
+                    origin=dataset.origin,
+                    source_id=source_id,
+                    synthetic_seed=dataset.synthetic_seed,
+                    generation_method=dataset.generation_method,
+                    metadata={
+                        "dataset_id": dataset.id,
+                        "row": row_index,
+                        "column": column_name,
+                    },
+                )
+                context.repository.save_fact(fact)
+                facts.append(fact)
+    return facts
 
 
 def _deterministic_manuscript_issues(manuscript: Manuscript, claims: Sequence[Claim], datasets: Sequence[Dataset]) -> list[str]:
@@ -1333,12 +1729,17 @@ def _estimate_run_cost(
     # Extraction, planning/research, drafting plus up to two focused critique
     # passes.  Live usage is persisted separately after every response.
     estimate = token_cost(
-        settings.model_policy.extractor,
+        settings.model_policy.extraction,
         source_tokens,
         control_output_tokens,
     )
     estimate += token_cost(
-        settings.model_policy.architect,
+        settings.model_policy.requirements,
+        source_tokens,
+        control_output_tokens,
+    )
+    estimate += token_cost(
+        settings.model_policy.research,
         source_tokens * Decimal(2),
         control_output_tokens * Decimal(2),
     )
@@ -1359,34 +1760,41 @@ def _estimate_run_cost(
     return estimate.quantize(Decimal("0.0001"))
 
 
-def _web_source(context: StageContext, entry: BibliographyEntry, digest: str) -> Source:
-    url = entry.url or "https://invalid.invalid/"
-    return Source(
-        project_id=context.project.id,
-        role=SourceRole.REFERENCE,
-        original_name=entry.title[:200],
-        stored_path=url,
-        sha256=digest,
-        mime_type="text/html",
-        size_bytes=0,
-        classification_confidence=1.0,
-        metadata={
-            "remote_url": url,
-            "bibliography_entry_id": entry.id,
-            "verified": True,
-            "generated": True,
-        },
-    )
+def _research_candidates(
+    scholarly: Sequence[ScholarlyRecord],
+    grounded: GroundedResult,
+) -> list[ScholarlyRecord]:
+    candidates = list(scholarly)
+    for annotation in grounded.annotations:
+        url = str(annotation.get("url") or annotation.get("source") or "").strip()
+        if not url:
+            continue
+        candidates.append(
+            ScholarlyRecord(
+                title=str(annotation.get("title") or urlsplit(url).hostname or "Web source"),
+                landing_url=url,
+                source_api="google_search",
+                organization=str(urlsplit(url).hostname or ""),
+            )
+        )
+    result: list[ScholarlyRecord] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate.doi or candidate.canonical_url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
 
 
-def _annotation_excerpt(text: str, annotation: Mapping[str, Any]) -> str:
-    try:
-        start = max(0, int(annotation.get("start_index", 0)))
-        end = min(len(text), int(annotation.get("end_index", len(text))))
-    except (TypeError, ValueError):
-        start, end = 0, len(text)
-    excerpt = text[start:end].strip() if end > start else ""
-    return (excerpt or text.strip())[:4000]
+def _snapshot_fetch_url(candidate: ScholarlyRecord) -> str:
+    if candidate.doi:
+        return f"https://api.crossref.org/works/{quote(candidate.doi, safe='/()')}"
+    openalex_id = str(candidate.metadata.get("openalex_id") or "")
+    if openalex_id.startswith("https://openalex.org/"):
+        return openalex_id.replace("https://openalex.org/", "https://api.openalex.org/works/", 1)
+    return candidate.landing_url
 
 
 def _need(value: Any, name: str) -> Any:
@@ -1455,34 +1863,190 @@ def _render_config(requirements: RequirementSet | None) -> Any:
 
 def _render_pdf_pages(pdf: Path, destination: Path) -> list[Path]:
     try:
-        import fitz  # type: ignore[import-untyped]
+        import pymupdf
     except ImportError as exc:
         raise StageExecutionError("PyMuPDF is required for PDF visual QA") from exc
     destination.mkdir(parents=True, exist_ok=True)
-    document = fitz.open(pdf)
+    pymupdf_module = cast(Any, pymupdf)
+    document: Any = pymupdf_module.open(pdf)
     images: list[Path] = []
     try:
-        for index, page in enumerate(document):
+        for index, page in enumerate(cast(Any, document)):
             target = destination / f"page-{index + 1:04d}.png"
-            page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).save(target)
+            page.get_pixmap(matrix=pymupdf_module.Matrix(1.5, 1.5), alpha=False).save(target)
             images.append(target)
     finally:
         document.close()
     return images
 
 
-def _basic_page_issues(images: Sequence[Path]) -> list[QAIssue]:
+def _basic_page_issues(pdf: Path, images: Sequence[Path]) -> list[QAIssue]:
     from PIL import Image, ImageStat
 
     issues: list[QAIssue] = []
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise StageExecutionError("PyMuPDF is required for deterministic PDF QA") from exc
+    document: Any = cast(Any, pymupdf).open(pdf)
+    if len(document) != len(images):
+        document.close()
+        return [
+            QAIssue(
+                severity=QASeverity.BLOCKER,
+                category="page_count",
+                message="Rendered preview count does not match the PDF page count",
+            )
+        ]
     for index, path in enumerate(images):
         with Image.open(path).convert("L") as image:
             statistics = ImageStat.Stat(image)
             if statistics.mean[0] > 254.8 and statistics.var[0] < 0.5:
-                issues.append(QAIssue(severity=QASeverity.WARNING, category="blank_page", message=f"Page {index + 1} appears blank"))
+                issues.append(
+                    QAIssue(
+                        severity=QASeverity.BLOCKER,
+                        category="blank_page",
+                        message=f"Page {index + 1} is blank",
+                        locator=Locator(page=index + 1),
+                    )
+                )
             if image.width < 600 or image.height < 800:
-                issues.append(QAIssue(severity=QASeverity.CRITICAL, category="resolution", message=f"Page {index + 1} preview is too small"))
+                issues.append(
+                    QAIssue(
+                        severity=QASeverity.CRITICAL,
+                        category="resolution",
+                        message=f"Page {index + 1} preview is too small",
+                        locator=Locator(page=index + 1),
+                    )
+                )
+        page = document[index]
+        width, height = float(page.rect.width), float(page.rect.height)
+        if abs(width - height) < 72:
+            issues.append(
+                QAIssue(
+                    severity=QASeverity.CRITICAL,
+                    category="page_geometry",
+                    message=f"Page {index + 1} has an implausibly square page geometry",
+                    locator=Locator(page=index + 1),
+                    auto_fixable=True,
+                )
+            )
+        text = page.get_text("text").strip()
+        if "Обновите оглавление" in text or "[[MISSING ARTIFACT:" in text:
+            issues.append(
+                QAIssue(
+                    severity=QASeverity.BLOCKER,
+                    category="placeholder",
+                    message=f"Page {index + 1} contains an unresolved output placeholder",
+                    locator=Locator(page=index + 1),
+                )
+            )
+        page_dictionary = page.get_text("dict")
+        for block in page_dictionary.get("blocks", []):
+            if not isinstance(block, dict):
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    size = float(span.get("size", 0) or 0)
+                    content = str(span.get("text", "")).strip()
+                    if content and size < 6:
+                        issues.append(
+                            QAIssue(
+                                severity=QASeverity.CRITICAL,
+                                category="small_text",
+                                message=f"Page {index + 1} contains text smaller than 6 pt",
+                                locator=Locator(page=index + 1),
+                            )
+                        )
+                        break
+                    bounds = span.get("bbox", (0, 0, 0, 0))
+                    if (
+                        len(bounds) == 4
+                        and (
+                            float(bounds[0]) < -1
+                            or float(bounds[1]) < -1
+                            or float(bounds[2]) > width + 1
+                            or float(bounds[3]) > height + 1
+                        )
+                    ):
+                        issues.append(
+                            QAIssue(
+                                severity=QASeverity.CRITICAL,
+                                category="cropped_text",
+                                message=f"Page {index + 1} contains text outside the media box",
+                                locator=Locator(page=index + 1),
+                                auto_fixable=True,
+                            )
+                        )
+        for image_info in page.get_images(full=True):
+            xref = int(image_info[0])
+            pixel_width = int(image_info[2])
+            pixel_height = int(image_info[3])
+            for rectangle in page.get_image_rects(xref):
+                if rectangle.width <= 0 or rectangle.height <= 0:
+                    continue
+                dpi = min(
+                    pixel_width / (rectangle.width / 72),
+                    pixel_height / (rectangle.height / 72),
+                )
+                if dpi < 72:
+                    issues.append(
+                        QAIssue(
+                            severity=QASeverity.CRITICAL,
+                            category="unreadable_image",
+                            message=f"Page {index + 1} contains an image below 72 DPI",
+                            locator=Locator(page=index + 1),
+                        )
+                    )
+    document.close()
     return issues
+
+
+def _remember_remote_file(context: StageContext, record: dict[str, str]) -> None:
+    raw = context.run.metadata.get("remote_files", [])
+    records = list(raw) if isinstance(raw, list) else []
+    records.append(cast(JsonValue, record))
+    context.run.metadata["remote_files"] = cast(JsonValue, records)
+    context.repository.save_run(context.run)
+
+
+def _forget_deleted_remote_files(
+    context: StageContext,
+    gateway: GeminiPort,
+    remote_files: Sequence[RemoteFile],
+) -> None:
+    deleted: set[str] = set()
+    for remote in remote_files:
+        try:
+            gateway.delete_file(remote.name)
+        except Exception:
+            continue
+        deleted.add(remote.name)
+    raw = context.run.metadata.get("remote_files", [])
+    records = list(raw) if isinstance(raw, list) else []
+    context.run.metadata["remote_files"] = cast(
+        JsonValue,
+        [
+            item
+            for item in records
+            if not (isinstance(item, dict) and str(item.get("name") or "") in deleted)
+        ],
+    )
+    context.repository.save_run(context.run)
+
+
+def _remove_remote_file_record(context: StageContext, remote_name: str) -> None:
+    raw = context.run.metadata.get("remote_files", [])
+    records = list(raw) if isinstance(raw, list) else []
+    context.run.metadata["remote_files"] = cast(
+        JsonValue,
+        [
+            item
+            for item in records
+            if not (isinstance(item, dict) and str(item.get("name") or "") == remote_name)
+        ],
+    )
+    context.repository.save_run(context.run)
 
 
 def _delete_remote_files(gateway: GeminiPort, raw: Any) -> list[dict[str, JsonValue]]:

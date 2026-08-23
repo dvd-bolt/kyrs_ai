@@ -81,7 +81,7 @@ class FakeGeminiGateway:
         self,
         *,
         prompt: str,
-        role: str = "architect",
+        role: str = "research",
         system_instruction: str | None = None,
     ) -> GroundedResult:
         self.calls.append({"operation": "search_grounded", "prompt": prompt, "role": role})
@@ -112,3 +112,32 @@ class FakeGeminiGateway:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(bytes(payload))
         return destination
+
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        output_dimensionality: int = 768,
+    ) -> list[list[float]]:
+        self.calls.append(
+            {
+                "operation": "embed_texts",
+                "count": len(texts),
+                "output_dimensionality": output_dimensionality,
+            }
+        )
+        queued = self.responses["embed_texts"]
+        if queued:
+            value = self._take("embed_texts")
+            return [[float(item) for item in row] for row in value]
+        return [[0.0] * output_dimensionality for _ in texts]
+
+    def start_background_text(self, *, prompt: str, role: str) -> str:
+        self.calls.append({"operation": "start_background_text", "prompt": prompt, "role": role})
+        queued = self.responses["start_background_text"]
+        return str(self._take("start_background_text")) if queued else "v1_fake"
+
+    def cancel_interaction(self, interaction_id: str) -> str:
+        self.calls.append({"operation": "cancel_interaction", "interaction_id": interaction_id})
+        queued = self.responses["cancel_interaction"]
+        return str(self._take("cancel_interaction")) if queued else "cancelled"

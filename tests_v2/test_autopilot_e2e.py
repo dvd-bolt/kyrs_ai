@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from papercraft.application import (
@@ -20,15 +21,17 @@ from papercraft.infrastructure.research import URLVerificationResult
 
 class AlwaysVerifiedURL:
     def verify(self, url: str) -> URLVerificationResult:
+        body = b"<html><title>Authoritative source</title><body>Automation improves reproducibility when the process is deterministic.</body></html>"
         return URLVerificationResult(
             requested_url=url,
             final_url=url,
             status_code=200,
             content_type="text/html",
-            content_length=100,
-            content_sha256="a" * 64,
+            content_length=len(body),
+            content_sha256=hashlib.sha256(body).hexdigest(),
             verified=True,
             title="Authoritative source",
+            body=body,
         )
 
 
@@ -85,6 +88,8 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
             "supported_urls": ["https://example.org/research"],
             "confidence": 0.95,
             "rationale": "The cited sentence directly supports the claim.",
+            "evidence_quote": "Automation improves reproducibility when the process is deterministic.",
+            "locator_hint": "body",
         },
     )
     fake.enqueue(
@@ -148,3 +153,6 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
     assert any(item.kind == ArtifactKind.DOCX and Path(item.path).is_file() for item in artifacts)
     assert any(item.kind == ArtifactKind.QA_HTML and Path(item.path).is_file() for item in artifacts)
     assert fake.deleted_files
+    resources = workspace.repository.list_remote_resources(run.id)
+    assert resources
+    assert all(item.deleted_at is not None for item in resources)

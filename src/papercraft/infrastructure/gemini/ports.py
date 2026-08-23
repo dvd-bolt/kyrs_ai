@@ -35,7 +35,7 @@ class GeminiPort(Protocol):
         self,
         *,
         prompt: str,
-        role: str = "architect",
+        role: str = "research",
         system_instruction: str | None = None,
     ) -> Any: ...
 
@@ -44,3 +44,14 @@ class GeminiPort(Protocol):
     def delete_file(self, name: str) -> None: ...
 
     def generate_image(self, *, prompt: str, destination: Path) -> Path: ...
+
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        output_dimensionality: int = 768,
+    ) -> list[list[float]]: ...
+
+    def start_background_text(self, *, prompt: str, role: str) -> str: ...
+
+    def cancel_interaction(self, interaction_id: str) -> str: ...

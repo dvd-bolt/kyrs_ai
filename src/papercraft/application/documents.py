@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
 from papercraft.domain import Artifact, ArtifactKind, GenerationRun
+from papercraft.infrastructure.persistence import sha256_file
 
 from .autopilot import AutopilotService, PipelineStage
 from .ports import RepositoryPort
@@ -23,9 +25,9 @@ class DocumentService:
 
     def preview(self, run_id: str) -> list[Path]:
         pages = [
-            Path(artifact.path)
+            self._validated_path(artifact)
             for artifact in self.artifacts(run_id)
-            if artifact.kind == ArtifactKind.PAGE_PREVIEW and Path(artifact.path).is_file()
+            if artifact.kind == ArtifactKind.PAGE_PREVIEW
         ]
         return sorted(pages)
 
@@ -34,9 +36,30 @@ class DocumentService:
         if not candidates:
             raise FileNotFoundError(f"No {kind.value} artifact is available")
         artifact = max(candidates, key=lambda item: item.created_at)
+        return self._validated_path(artifact)
+
+    @staticmethod
+    def _validated_path(artifact: Artifact) -> Path:
+        expected_suffixes = {
+            ArtifactKind.DOCX: {".docx"},
+            ArtifactKind.PDF: {".pdf"},
+            ArtifactKind.PAGE_PREVIEW: {".png", ".jpg", ".jpeg"},
+            ArtifactKind.QA_JSON: {".json"},
+            ArtifactKind.QA_HTML: {".html", ".htm"},
+        }
         path = Path(artifact.path)
+        allowed = expected_suffixes.get(artifact.kind)
+        if allowed is not None and path.suffix.casefold() not in allowed:
+            raise ValueError(f"Artifact extension does not match {artifact.kind.value}")
         if not path.is_file():
             raise FileNotFoundError(path)
+        try:
+            actual_size = path.stat().st_size
+            actual_hash = sha256_file(path)
+        except OSError as error:
+            raise FileNotFoundError(path) from error
+        if actual_size != artifact.size_bytes or not hmac.compare_digest(actual_hash, artifact.sha256):
+            raise OSError(f"Artifact failed integrity verification: {artifact.id}")
         return path
 
     def rebuild_section(

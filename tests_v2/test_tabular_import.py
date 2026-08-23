@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from papercraft.domain import Source, SourceRole
+from papercraft.domain import DataType, Source, SourceRole
 from papercraft.infrastructure.calculations import TabularDatasetImporter
 from papercraft.infrastructure.persistence import sha256_file
 
@@ -20,4 +20,9 @@ def test_csv_becomes_typed_user_dataset(tmp_path: Path) -> None:
     dataset = TabularDatasetImporter().import_source("project", source)[0]
     assert dataset.origin.value == "user"
     assert [column.name for column in dataset.columns] == ["year", "income"]
+    assert [column.data_type for column in dataset.columns] == [
+        DataType.INTEGER,
+        DataType.NUMBER,
+    ]
+    assert dataset.rows == [{"year": 2024, "income": 10.5}, {"year": 2025, "income": 12.25}]
     assert len(dataset.rows) == 2

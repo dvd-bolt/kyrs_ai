@@ -62,7 +62,9 @@ packages = ["src/papercraft"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
-testpaths = ["tests_v2", "tests"]
+# `tests/` exercises the archived PyQt6 prototype and is intentionally not a
+# release gate for the packaged `src/papercraft` PySide6 application.
+testpaths = ["tests_v2"]
 addopts = "-ra"
 markers = [
   "live: requires a configured external service",

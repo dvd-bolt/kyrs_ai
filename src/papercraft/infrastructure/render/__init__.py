@@ -5,7 +5,9 @@ from .docx_renderer import (
     DocxRenderError,
     DocxRenderResult,
     RenderConfig,
+    TemplateInspection,
     TitlePageInfo,
+    inspect_docx_template,
 )
 from .finalizer import (
     DocumentFinalizer,
@@ -25,5 +27,7 @@ __all__ = [
     "FinalizationUnavailableError",
     "PDFResult",
     "RenderConfig",
+    "TemplateInspection",
     "TitlePageInfo",
+    "inspect_docx_template",
 ]

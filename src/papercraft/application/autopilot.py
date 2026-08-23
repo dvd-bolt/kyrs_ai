@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from pydantic import JsonValue
@@ -22,7 +23,7 @@ from papercraft.domain import (
     StageRun,
     StageStatus,
 )
-from papercraft.infrastructure.persistence import AtomicArtifactStore, ProjectPaths
+from papercraft.infrastructure.persistence import AtomicArtifactStore, ProjectPaths, sha256_file
 
 from .ports import RepositoryPort
 from .worker_control import (
@@ -121,7 +122,7 @@ class AutopilotService:
         value = {
             "project": self.project.model_dump(mode="json"),
             "source_hashes": sorted(source.sha256 for source in sources),
-            "pipeline": "2",
+            "pipeline": "3",
         }
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -147,8 +148,11 @@ class AutopilotService:
         run = GenerationRun(
             project_id=self.project.id,
             input_hash=self._input_hash(),
-            pipeline_version="2",
-            model_policy=self.settings.model_policy.model_dump(mode="json"),
+            pipeline_version="3",
+            model_policy={
+                "models": self.settings.model_policy.model_dump(mode="json"),
+                "thinking": self.settings.thinking_policy.model_dump(mode="json"),
+            },
         )
         self.repository.save_run(run)
         for order, name in enumerate(PIPELINE_ORDER):
@@ -166,10 +170,32 @@ class AutopilotService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(f"Unknown run: {run_id}")
-        if run.status in {RunStatus.SUCCEEDED, RunStatus.CANCELLED}:
-            return run
+        if run.status == RunStatus.SUCCEEDED:
+            corrupted = self._first_corrupt_completed_stage(run)
+            if corrupted is None:
+                self._terminal(run)
+                return self.repository.get_run(run_id) or run
+            stage, reason = corrupted
+            self._invalidate_from(run, PipelineStage(stage.name), reason=reason)
+            run.status = RunStatus.RETRYING
+            run.finished_at = None
+            run.error = None
+            run.metadata.pop("terminal_hook_done", None)
+            self.repository.save_run(run)
+            self._event(run, stage, "artifact_corruption_recovered", reason)
+        elif run.status == RunStatus.CANCELLED:
+            # A provider cleanup can fail after the last pipeline stage.  A
+            # repeated worker invocation must retry that terminal obligation.
+            self._terminal(run)
+            return self.repository.get_run(run_id) or run
         if run.input_hash != self._input_hash():
             raise RuntimeError("Project inputs changed; use retry_from to invalidate dependent stages")
+
+        corrupted = self._first_corrupt_completed_stage(run)
+        if corrupted is not None:
+            stage, reason = corrupted
+            self._invalidate_from(run, PipelineStage(stage.name), reason=reason)
+            self._event(run, stage, "artifact_corruption_recovered", reason)
 
         now = datetime.now(UTC)
         run.status = RunStatus.RUNNING
@@ -225,15 +251,15 @@ class AutopilotService:
                     self.repository.save_artifact(artifact)
                     stage.output_artifact_ids.append(artifact.id)
                 stage.checkpoint = dict(outcome.checkpoint)
-                stage.output_hash = hashlib.sha256(
-                    json.dumps(stage.output_artifact_ids, sort_keys=True).encode("utf-8")
-                ).hexdigest()
+                stage.output_hash = self._artifact_set_hash(outcome.artifacts)
                 stage.heartbeat_at = datetime.now(UTC)
                 stage.status = StageStatus.SKIPPED if outcome.skipped else StageStatus.SUCCEEDED
                 stage.finished_at = datetime.now(UTC)
                 stage.error = None
                 self.repository.save_stage(stage)
                 self._event(run, stage, "stage_completed", outcome.message or f"Completed: {stage.name}")
+            except RunCancelled:
+                return self._interrupt(run, stage)
             except Exception as exc:
                 return self._fail(run, stage, exc)
 
@@ -247,9 +273,94 @@ class AutopilotService:
         run.current_stage = None
         run.finished_at = datetime.now(UTC)
         self.repository.save_run(run)
-        self._event(run, None, "run_succeeded", "Autopilot completed successfully")
         self._terminal(run)
+        run = self.repository.get_run(run.id) or run
+        if run.status == RunStatus.SUCCEEDED:
+            self._event(run, None, "run_succeeded", "Autopilot completed successfully")
         return run
+
+    @staticmethod
+    def _artifact_set_hash(artifacts: list[Artifact]) -> str:
+        payload = [
+            {"id": item.id, "sha256": item.sha256, "size_bytes": item.size_bytes}
+            for item in artifacts
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _first_corrupt_completed_stage(
+        self, run: GenerationRun
+    ) -> tuple[StageRun, str] | None:
+        artifacts = {
+            item.id: item
+            for item in self.repository.list_artifacts(self.project.id, run_id=run.id)
+        }
+        for stage in self.repository.list_stages(run.id):
+            if stage.status not in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}:
+                continue
+            for artifact_id in stage.output_artifact_ids:
+                artifact = artifacts.get(artifact_id)
+                if artifact is None:
+                    return stage, f"Output artifact record is missing: {artifact_id}"
+                path = Path(artifact.path)
+                try:
+                    valid = (
+                        path.is_file()
+                        and path.stat().st_size == artifact.size_bytes
+                        and sha256_file(path) == artifact.sha256
+                    )
+                except OSError:
+                    valid = False
+                if not valid:
+                    return stage, f"Output artifact failed integrity verification: {artifact_id}"
+        return None
+
+    def _invalidate_from(
+        self,
+        run: GenerationRun,
+        from_stage: PipelineStage,
+        *,
+        reason: str = "requested rebuild",
+    ) -> None:
+        affected = self.dependency_graph.affected_by(from_stage.value)
+        input_hash = self._input_hash()
+        for stage in self.repository.list_stages(run.id):
+            if stage.name not in affected:
+                continue
+            stage.status = StageStatus.QUEUED
+            stage.started_at = None
+            stage.finished_at = None
+            stage.error = None
+            stage.output_artifact_ids = []
+            stage.output_hash = ""
+            stage.failure_code = None
+            stage.failure_details = {}
+            stage.progress_current = 0
+            stage.progress_total = 0
+            stage.heartbeat_at = None
+            stage.checkpoint = {"invalidated": True, "reason": reason}
+            stage.input_hash = input_hash
+            self.repository.save_stage(stage)
+
+    def _interrupt(self, run: GenerationRun, stage: StageRun) -> GenerationRun:
+        latest = self.repository.get_run(run.id) or run
+        stage.status = StageStatus.QUEUED
+        stage.finished_at = None
+        stage.error = None
+        stage.failure_code = None
+        stage.failure_details = {}
+        stage.heartbeat_at = datetime.now(UTC)
+        self.repository.save_stage(stage)
+        if latest.status == RunStatus.CANCELLED:
+            self._event(latest, stage, "stage_cancelled", "Stage stopped at a durable checkpoint")
+            self._terminal(latest)
+        else:
+            # A pause request is durable state, not a stage failure.
+            latest.status = RunStatus.PAUSED
+            self.repository.save_run(latest)
+            self._event(latest, stage, "stage_paused", "Stage paused at a durable checkpoint")
+        return self.repository.get_run(latest.id) or latest
 
     def _fail(self, run: GenerationRun, stage: StageRun, error: Exception) -> GenerationRun:
         stage.status = StageStatus.FAILED
@@ -257,12 +368,13 @@ class AutopilotService:
         stage.error = str(error)
         stage.failure_code = type(error).__name__
         stage.failure_details = {"message": str(error)}
-        run.status = RunStatus.FAILED
+        needs_input = bool(getattr(error, "waiting_input", False))
+        run.status = RunStatus.WAITING_INPUT if needs_input else RunStatus.FAILED
         run.error = f"{stage.name}: {error}"
-        run.finished_at = datetime.now(UTC)
+        run.finished_at = None if needs_input else datetime.now(UTC)
         self.repository.save_stage(stage)
         self.repository.save_run(run)
-        self._event(run, stage, "stage_failed", str(error))
+        self._event(run, stage, "stage_waiting_input" if needs_input else "stage_failed", str(error))
         self._terminal(run)
         return run
 
@@ -274,10 +386,21 @@ class AutopilotService:
         except Exception as exc:
             # Hooks may have partially completed (for example, deleting all
             # but one remote Gemini file).  Persist their reduced retry set.
+            error_type = type(exc).__name__
+            run.metadata["terminal_cleanup_pending"] = True
+            run.metadata["terminal_cleanup_error_type"] = error_type
+            if run.status == RunStatus.SUCCEEDED:
+                run.status = RunStatus.FAILED
+                run.finished_at = datetime.now(UTC)
+                run.error = f"terminal cleanup failed ({error_type})"
             self.repository.save_run(run)
-            self._event(run, None, "terminal_cleanup_failed", str(exc))
+            # Do not persist provider exception text: it can contain sensitive
+            # request data.  The exception class is sufficient for retry/audit.
+            self._event(run, None, "terminal_cleanup_failed", error_type)
             return
         run.metadata["terminal_hook_done"] = True
+        run.metadata.pop("terminal_cleanup_pending", None)
+        run.metadata.pop("terminal_cleanup_error_type", None)
         self.repository.save_run(run)
 
     def _checkpoint_required(self, stage: PipelineStage) -> bool:
@@ -297,12 +420,23 @@ class AutopilotService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
+        stage_run = next(
+            (item for item in self.repository.list_stages(run_id) if item.name == stage.value),
+            None,
+        )
+        if (
+            run.status != RunStatus.WAITING_INPUT
+            or stage_run is None
+            or stage_run.status not in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}
+            or not self._checkpoint_required(stage)
+        ):
+            raise RuntimeError(f"No pending checkpoint can be acknowledged after {stage.value}")
         raw_acknowledged = run.metadata.get("acknowledged_checkpoints", [])
         acknowledged = list(raw_acknowledged) if isinstance(raw_acknowledged, list) else []
         if stage.value not in acknowledged:
             acknowledged.append(stage.value)
         run.metadata["acknowledged_checkpoints"] = acknowledged
-        run.status = RunStatus.PAUSED
+        run.status = RunStatus.RETRYING
         self.repository.save_run(run)
         return self.execute(run.id)
 
@@ -323,8 +457,23 @@ class AutopilotService:
             raise KeyError(run_id)
         if run.status not in {RunStatus.PAUSED, RunStatus.FAILED, RunStatus.WAITING_INPUT}:
             raise RuntimeError(f"Cannot resume a {run.status} run")
-        run.status = RunStatus.PAUSED
+        pending_checkpoint = next(
+            (
+                PipelineStage(stage.name)
+                for stage in self.repository.list_stages(run_id)
+                if stage.status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}
+                and self._checkpoint_required(PipelineStage(stage.name))
+                and not self._checkpoint_acknowledged(run, PipelineStage(stage.name))
+            ),
+            None,
+        )
+        if pending_checkpoint is not None:
+            raise RuntimeError(
+                f"Checkpoint after {pending_checkpoint.value} must be explicitly acknowledged"
+            )
+        run.status = RunStatus.RETRYING
         run.finished_at = None
+        run.metadata.pop("terminal_hook_done", None)
         self.repository.save_run(run)
         return self.execute(run_id)
 
@@ -345,26 +494,9 @@ class AutopilotService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        affected = self.dependency_graph.affected_by(from_stage.value)
-        for stage in self.repository.list_stages(run_id):
-            if stage.name not in affected:
-                continue
-            stage.status = StageStatus.QUEUED
-            stage.started_at = None
-            stage.finished_at = None
-            stage.error = None
-            stage.output_artifact_ids = []
-            stage.output_hash = ""
-            stage.failure_code = None
-            stage.failure_details = {}
-            stage.progress_current = 0
-            stage.progress_total = 0
-            stage.heartbeat_at = None
-            stage.checkpoint = {"invalidated": True}
-            stage.input_hash = self._input_hash()
-            self.repository.save_stage(stage)
+        self._invalidate_from(run, from_stage)
         run.input_hash = self._input_hash()
-        run.status = RunStatus.PAUSED
+        run.status = RunStatus.RETRYING
         run.finished_at = None
         run.error = None
         run.metadata.pop("terminal_hook_done", None)

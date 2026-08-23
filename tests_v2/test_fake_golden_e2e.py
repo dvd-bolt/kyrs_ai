@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -29,9 +30,10 @@ from papercraft.infrastructure.research import URLVerificationResult
 
 class _VerifiedURL:
     def verify(self, url: str) -> URLVerificationResult:
+        body = b"<html><title>Golden source</title><body>The process is reproducible.</body></html>"
         return URLVerificationResult(
-            requested_url=url, final_url=url, status_code=200, content_type="text/html", content_length=1,
-            content_sha256="a" * 64, verified=True, title="Golden source"
+            requested_url=url, final_url=url, status_code=200, content_type="text/html", content_length=len(body),
+            content_sha256=hashlib.sha256(body).hexdigest(), verified=True, title="Golden source", body=body
         )
 
 
@@ -74,6 +76,14 @@ def test_fake_golden_pipeline(
     assert workspace.repository.get_latest_manuscript(workspace.project.id) is not None
     assert workspace.repository.get_latest_qa_report(run.id).status.value in {"pass", "warning"}  # type: ignore[union-attr]
     assert fake.deleted_files
+    if profile is DomainProfile.ACCOUNTING:
+        facts = workspace.repository.list_facts(workspace.project.id)
+        assert facts
+        assert {str(item.metadata.get("column")) for item in facts} >= {
+            "debit_account",
+            "credit_account",
+            "amount",
+        }
 
 
 def _fake_for(project_id: str, workspace: object, *, accounting: bool) -> FakeGeminiGateway:
@@ -81,7 +91,7 @@ def _fake_for(project_id: str, workspace: object, *, accounting: bool) -> FakeGe
     fake.enqueue("generate_structured", {"rules": [], "conflicts": []})
     fake.enqueue("generate_structured", {"claims": [{"text": "The process is reproducible", "search_query": "reproducibility source", "importance": "critical"}]})
     fake.enqueue("search_grounded", GroundedResult(text="The process is reproducible.", model="fake", annotations=[{"type": "url_citation", "url": "https://example.org/golden", "title": "Golden source"}]))
-    fake.enqueue("generate_structured", {"claim_supported": True, "supported_urls": ["https://example.org/golden"], "confidence": 1, "rationale": "direct support"})
+    fake.enqueue("generate_structured", {"claim_supported": True, "supported_urls": ["https://example.org/golden"], "confidence": 1, "rationale": "direct support", "evidence_quote": "The process is reproducible.", "locator_hint": "body"})
     fake.enqueue("generate_structured", {"topic": "Golden topic", "goal": "Verify a deterministic run", "tasks": ["Validate evidence"], "sections": [{"key": "introduction", "title": "INTRODUCTION", "order": 0, "target_words": 100, "theses": ["Reproducibility"], "required_claim_texts": ["The process is reproducible"], "source_ids": [], "visuals": [], "expected_conclusion": "The run is reproducible."}]})
     fake.enqueue(
         "generate_structured",
@@ -141,11 +151,12 @@ class _FakeLocalFinalizer:
         if not require_pdf:
             return FinalizationResult(docx, None, "none", False)
         pdf = Path(pdf_path) if pdf_path else docx.with_suffix(".pdf")
-        from pypdf import PdfWriter
+        import pymupdf
 
         pdf.parent.mkdir(parents=True, exist_ok=True)
-        writer = PdfWriter()
-        writer.add_blank_page(width=595, height=842)
-        with pdf.open("wb") as stream:
-            writer.write(stream)
+        document = pymupdf.open()
+        page = document.new_page(width=595, height=842)
+        page.insert_text((72, 100), "PaperCraft deterministic PDF fixture", fontsize=12)
+        document.save(pdf)
+        document.close()
         return FinalizationResult(docx, PDFResult(pdf, pdf.stat().st_size, True), "none", False)

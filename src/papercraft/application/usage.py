@@ -50,6 +50,11 @@ class RunUsageTracker:
                     "output_tokens": record.output_tokens,
                     "estimated_cost": float(record.estimated_cost),
                     "currency": run.currency,
+                    "thought_tokens": int(record.metadata.get("thought_tokens", 0) or 0),
+                    "tool_use_tokens": int(record.metadata.get("tool_use_tokens", 0) or 0),
+                    "search_queries": int(record.metadata.get("search_queries", 0) or 0),
+                    "interaction_id": str(record.metadata.get("interaction_id", "") or ""),
+                    "request_id": str(record.metadata.get("request_id", "") or ""),
                 },
             )
         )

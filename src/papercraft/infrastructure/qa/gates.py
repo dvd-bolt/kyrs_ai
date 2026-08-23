@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import zipfile
@@ -35,6 +36,8 @@ from papercraft.domain import (
     QASeverity,
     RequirementCategory,
     RequirementSet,
+    Source,
+    SourceSnapshot,
     TableBlock,
 )
 from papercraft.infrastructure.calculations import FactLedger, FactLedgerError
@@ -50,6 +53,8 @@ class QAGateContext:
     claims: Sequence[Claim] = ()
     evidence: Sequence[Evidence] = ()
     citations: Sequence[Citation] = ()
+    sources: Sequence[Source] = ()
+    source_snapshots: Sequence[SourceSnapshot] = ()
     requirements: RequirementSet | None = None
     artifact_paths: Mapping[str, str | Path] = field(default_factory=dict)
     docx_path: str | Path | None = None
@@ -270,6 +275,22 @@ class DeterministicQualityGate:
         claims = {claim.id: claim for claim in context.claims}
         citations = {citation.id: citation for citation in context.citations}
         bibliography = {entry.id: entry for entry in context.manuscript.bibliography}
+        sources = {source.id: source for source in context.sources}
+        snapshots = {snapshot.id: snapshot for snapshot in context.source_snapshots}
+
+        for snapshot in context.source_snapshots:
+            source = sources.get(snapshot.source_id)
+            if source is None:
+                issues.append(self._issue(QASeverity.BLOCKER, "snapshot_source", f"Snapshot {snapshot.id} references missing source"))
+                continue
+            path = Path(snapshot.stored_path)
+            if not path.is_file():
+                issues.append(self._issue(QASeverity.BLOCKER, "snapshot_file", f"Snapshot {snapshot.id} file is missing"))
+                continue
+            if hashlib.sha256(path.read_bytes()).hexdigest() != snapshot.sha256:
+                issues.append(self._issue(QASeverity.BLOCKER, "snapshot_hash", f"Snapshot {snapshot.id} hash does not match"))
+            if source.sha256 != snapshot.sha256:
+                issues.append(self._issue(QASeverity.BLOCKER, "snapshot_hash", f"Source {source.id} is not bound to snapshot {snapshot.id}"))
 
         for claim in context.claims:
             if claim.project_id != context.project_id:
@@ -282,6 +303,12 @@ class DeterministicQualityGate:
                     issues.append(self._issue(QASeverity.BLOCKER, "missing_evidence", f"Claim {claim.id} references missing evidence {evidence_id}"))
                 elif not item.verified or not item.supports:
                     issues.append(self._issue(QASeverity.BLOCKER, "unverified_evidence", f"Evidence {evidence_id} is not verified support"))
+                elif item.source_id not in sources:
+                    issues.append(self._issue(QASeverity.BLOCKER, "evidence_source", f"Evidence {evidence_id} references missing source"))
+                elif sources[item.source_id].metadata.get("remote_url") and (
+                    not item.snapshot_id or item.snapshot_id not in snapshots
+                ):
+                    issues.append(self._issue(QASeverity.BLOCKER, "evidence_snapshot", f"Web evidence {evidence_id} has no verified snapshot"))
 
         for citation in context.citations:
             if citation.claim_id and citation.claim_id not in claims:
@@ -290,6 +317,13 @@ class DeterministicQualityGate:
                 issues.append(self._issue(QASeverity.ERROR, "citation_evidence", f"Citation {citation.id} references missing evidence"))
             if citation.bibliography_entry_id not in bibliography:
                 issues.append(self._issue(QASeverity.BLOCKER, "citation_bibliography", f"Citation {citation.id} references missing bibliography entry"))
+            if citation.evidence_id and citation.evidence_id in evidence:
+                item = evidence[citation.evidence_id]
+                if citation.claim_id and item.claim_id != citation.claim_id:
+                    issues.append(self._issue(QASeverity.BLOCKER, "citation_binding", f"Citation {citation.id} claim/evidence binding is inconsistent"))
+                entry = bibliography.get(citation.bibliography_entry_id)
+                if entry is not None and entry.source_id != item.source_id:
+                    issues.append(self._issue(QASeverity.BLOCKER, "citation_binding", f"Citation {citation.id} evidence/source/bibliography binding is inconsistent"))
 
         referenced_citations: set[str] = set()
         for block in blocks:

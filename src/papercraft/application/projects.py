@@ -198,6 +198,13 @@ class SourceService:
         if source is None:
             raise KeyError(f"Unknown source: {source_id}")
         parsed = self.parsers.parse(source)
+        self.workspace.repository.clear_source_fragments(source.id)
         for fragment in parsed.fragments:
             self.workspace.repository.save_fragment(fragment)
+        metadata = dict(source.metadata)
+        metadata["ingestion"] = {
+            "warnings": list(parsed.warnings),
+            "metadata": parsed.metadata,
+        }
+        self.workspace.repository.save_source(source.model_copy(update={"metadata": metadata}))
         return parsed

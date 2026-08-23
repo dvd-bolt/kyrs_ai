@@ -14,6 +14,15 @@ from .bibliography import (
     validate_bibliography_entry,
 )
 from .evidence import EvidenceCoverage, EvidenceGraph, evidence_from_fragment, link_claim_evidence
+from .scholarly import (
+    CrossrefClient,
+    DOIResolver,
+    OfficialSourcePolicy,
+    OpenAlexClient,
+    ScholarlyDiscovery,
+    ScholarlyRecord,
+)
+from .snapshots import SnapshotCaptureResult, SourceSnapshotStore
 from .url_verifier import (
     HTTPResponse,
     HTTPTransport,
@@ -33,13 +42,21 @@ __all__ = [
     "BibliographyDeduplicator",
     "BibliographyValidation",
     "BibliographyValidator",
+    "CrossrefClient",
+    "DOIResolver",
     "DeduplicationResult",
     "EvidenceCoverage",
     "EvidenceGraph",
     "HTTPResponse",
     "HTTPTransport",
+    "OfficialSourcePolicy",
+    "OpenAlexClient",
     "PinnedHTTPTransport",
     "SafeTarget",
+    "ScholarlyDiscovery",
+    "ScholarlyRecord",
+    "SnapshotCaptureResult",
+    "SourceSnapshotStore",
     "URLFetchError",
     "URLPolicy",
     "URLVerificationError",

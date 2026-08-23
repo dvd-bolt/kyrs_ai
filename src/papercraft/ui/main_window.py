@@ -54,6 +54,7 @@ from papercraft.domain import (
     ProjectBrief,
     RunStatus,
     SourceRole,
+    StageStatus,
     WorkType,
 )
 from papercraft.infrastructure.gemini import CredentialSecretStore
@@ -695,7 +696,7 @@ class MainWindow(QMainWindow):
                 projects_root=self.settings.projects_root,
                 run_id=self.active_run_id,
                 acknowledge_checkpoint=(
-                    unfinished is not None and unfinished.status == RunStatus.WAITING_INPUT
+                    unfinished is not None and self._waiting_at_checkpoint(unfinished)
                 ),
             )
         )
@@ -870,8 +871,23 @@ class MainWindow(QMainWindow):
                 project_id=self.workspace.project.id,
                 projects_root=self.settings.projects_root,
                 run_id=run.id,
-                acknowledge_checkpoint=run.status == RunStatus.WAITING_INPUT,
+                acknowledge_checkpoint=self._waiting_at_checkpoint(run),
             )
+        )
+
+    def _waiting_at_checkpoint(self, run: GenerationRun) -> bool:
+        """Distinguish approval checkpoints from credential/configuration failures."""
+
+        if (
+            self.workspace is None
+            or run.status != RunStatus.WAITING_INPUT
+            or run.current_stage is None
+        ):
+            return False
+        return any(
+            stage.name == run.current_stage
+            and stage.status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}
+            for stage in self.workspace.repository.list_stages(run.id)
         )
 
     def _cancel_run(self) -> None:

@@ -7,8 +7,10 @@ Only this package imports the Google SDK.  Application code talks to the
 from .fake import FakeGeminiGateway
 from .gateway import (
     GeminiAuthenticationError,
+    GeminiConfigurationError,
     GeminiGateway,
     GeminiGatewayError,
+    GeminiSafetyError,
     GeminiUnavailableError,
     GroundedResult,
     RemoteFile,
@@ -21,9 +23,11 @@ __all__ = [
     "CredentialSecretStore",
     "FakeGeminiGateway",
     "GeminiAuthenticationError",
+    "GeminiConfigurationError",
     "GeminiGateway",
     "GeminiGatewayError",
     "GeminiPort",
+    "GeminiSafetyError",
     "GeminiUnavailableError",
     "GroundedResult",
     "RemoteFile",

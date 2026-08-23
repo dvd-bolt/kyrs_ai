@@ -84,11 +84,9 @@ def worker_invocation(
     is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     if not is_frozen:
         return str(program), ["-m", "papercraft.worker.cli", *request.arguments()]
-    worker_name = "papercraft-worker.exe" if os.name == "nt" else "papercraft-worker"
-    bundled_worker = program.with_name(worker_name)
-    if not bundled_worker.is_file():
-        raise FileNotFoundError(f"Фоновый worker не найден: {bundled_worker}")
-    return str(bundled_worker), request.arguments()
+    if not program.is_file():
+        raise FileNotFoundError(f"Исполняемый файл PaperCraft не найден: {program}")
+    return str(program), ["--papercraft-worker", *request.arguments()]
 
 
 __all__ = ["WorkerAction", "WorkerRequest", "worker_invocation"]

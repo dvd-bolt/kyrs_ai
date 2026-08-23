@@ -29,7 +29,7 @@ def prepare_autopilot(
     gateway: GeminiPort | None = None,
 ) -> AutopilotRuntime:
     provider = gateway or GeminiGateway(settings)
-    stage_factory = ProductionStageFactory(provider)
+    stage_factory = ProductionStageFactory(provider, repository=workspace.repository)
     service = AutopilotService(
         settings,
         workspace.project,

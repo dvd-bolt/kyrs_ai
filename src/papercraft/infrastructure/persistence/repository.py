@@ -35,6 +35,7 @@ from papercraft.domain import (
     RunEvent,
     Source,
     SourceFragment,
+    SourceSnapshot,
     StageRun,
 )
 
@@ -322,6 +323,10 @@ class SQLiteRepository:
             ).fetchall()
         return [SourceFragment.model_validate_json(row["data"]) for row in rows]
 
+    def clear_source_fragments(self, source_id: str) -> None:
+        with self._session() as connection:
+            connection.execute("DELETE FROM fragments WHERE source_id=?", (source_id,))
+
     def save_requirement_set(self, requirements: RequirementSet) -> None:
         self._save_versioned(
             "requirements", requirements.id, requirements.project_id, requirements.created_at.isoformat(), requirements
@@ -527,6 +532,18 @@ class SQLiteRepository:
     def list_evidence(self, project_id: str) -> list[Evidence]:
         return self._list_objects("evidence", project_id, Evidence)
 
+    def save_source_snapshot(self, snapshot: SourceSnapshot) -> None:
+        self._save_object(
+            "source_snapshot",
+            snapshot.project_id,
+            snapshot.id,
+            snapshot.source_id,
+            snapshot,
+        )
+
+    def list_source_snapshots(self, project_id: str) -> list[SourceSnapshot]:
+        return self._list_objects("source_snapshot", project_id, SourceSnapshot)
+
     def save_bibliography_entry(self, project_id: str, entry: BibliographyEntry) -> None:
         self._save_object("bibliography", project_id, entry.id, entry.source_id, entry)
 
@@ -557,7 +574,7 @@ class SQLiteRepository:
         are removed; their fragments cascade with the source row.
         """
 
-        kinds = ["citation", "evidence", "bibliography"]
+        kinds = ["citation", "evidence", "bibliography", "source_snapshot"]
         if include_claims:
             kinds.append("claim")
         placeholders = ",".join("?" for _ in kinds)

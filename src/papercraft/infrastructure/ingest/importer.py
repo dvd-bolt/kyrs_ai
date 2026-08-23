@@ -39,6 +39,7 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"lpt{number}" for number in range(1, 10)),
 }
 _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
+_SECURITY_SCAN_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,8 +109,8 @@ def _hash_stream(stream: IO[bytes], destination: Path, limit: int) -> tuple[str,
             if total > limit:
                 raise ImportLimitError(f"File exceeds {limit} bytes")
             digest.update(block)
-            if len(sample) < 128 * 1024:
-                sample.extend(block[: 128 * 1024 - len(sample)])
+            if len(sample) < _SECURITY_SCAN_BYTES:
+                sample.extend(block[: _SECURITY_SCAN_BYTES - len(sample)])
             output.write(block)
         output.flush()
         os.fsync(output.fileno())
@@ -229,8 +230,19 @@ class SafeSourceImporter:
 
         with package:
             infos = package.infolist()
-            if len(infos) > self.policy.max_files - self._count:
-                raise ImportLimitError("ZIP contains too many members")
+            file_infos = [info for info in infos if not info.is_dir()]
+            if len(file_infos) > self.policy.max_files - self._count:
+                result.rejected.append(ImportRejection(archive, "zip-too-many-members"))
+                return result
+            declared_total = sum(info.file_size for info in file_infos)
+            if declared_total > self.policy.max_total_bytes - self._total_bytes:
+                result.rejected.append(ImportRejection(archive, "zip-total-size-limit"))
+                return result
+            # Reserve all members before filtering. Rejected secret paths,
+            # encrypted members and suspicious ratios still consume the DoS
+            # budget and cannot be spread across several archives.
+            self._count += len(file_infos)
+            self._total_bytes += declared_total
             for info in infos:
                 if info.is_dir():
                     continue
@@ -269,6 +281,7 @@ class SafeSourceImporter:
                             relative=destination_relative,
                             role=role,
                             declared_size=info.file_size,
+                            reserved=True,
                         )
                 except (ImportLimitError, OSError, RuntimeError) as error:
                     result.rejected.append(ImportRejection(display_path, f"read-error:{error}"))
@@ -285,12 +298,18 @@ class SafeSourceImporter:
         relative: Path,
         role: SourceRole | None,
     ) -> Source | ImportRejection:
-        if is_excluded_path(relative) or is_secret_path(relative):
-            return ImportRejection(path, "excluded-path")
         try:
             size = path.stat().st_size
         except OSError as error:
             return ImportRejection(path, f"stat-error:{error}")
+        if self._count >= self.policy.max_files:
+            return ImportRejection(path, "too-many-files")
+        self._count += 1
+        if self._total_bytes + size > self.policy.max_total_bytes:
+            return ImportRejection(path, "total-size-limit")
+        self._total_bytes += size
+        if is_excluded_path(relative) or is_secret_path(relative):
+            return ImportRejection(path, "excluded-path")
         if size > self.policy.max_file_bytes:
             return ImportRejection(path, "file-too-large")
         try:
@@ -301,6 +320,7 @@ class SafeSourceImporter:
                     relative=relative,
                     role=role,
                     declared_size=size,
+                    reserved=True,
                 )
         except (OSError, ImportLimitError) as error:
             return ImportRejection(path, f"read-error:{error}")
@@ -313,11 +333,15 @@ class SafeSourceImporter:
         relative: Path,
         role: SourceRole | None,
         declared_size: int,
+        reserved: bool = False,
     ) -> Source | ImportRejection:
-        if self._count >= self.policy.max_files:
-            raise ImportLimitError("Import contains too many files")
-        if self._total_bytes + declared_size > self.policy.max_total_bytes:
-            raise ImportLimitError("Import exceeds total byte limit")
+        if not reserved:
+            if self._count >= self.policy.max_files:
+                raise ImportLimitError("Import contains too many files")
+            if self._total_bytes + declared_size > self.policy.max_total_bytes:
+                raise ImportLimitError("Import exceeds total byte limit")
+            self._count += 1
+            self._total_bytes += declared_size
         suffix = relative.suffix.casefold()
         if suffix not in _ALLOWED_SUFFIXES and not self.policy.allow_unknown_text_files:
             return ImportRejection(Path(original_name), "unsupported-extension")
@@ -365,8 +389,6 @@ class SafeSourceImporter:
                 created_at=datetime.now(UTC),
                 metadata={"relative_path": original_name, "immutable": True},
             )
-            self._count += 1
-            self._total_bytes += size
             return source
         finally:
             temporary_path.unlink(missing_ok=True)

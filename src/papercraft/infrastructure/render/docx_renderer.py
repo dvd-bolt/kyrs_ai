@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
+import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from xml.etree import ElementTree
 
 from docx import Document
+from docx.enum.section import WD_ORIENT, WD_SECTION_START
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
@@ -40,6 +44,89 @@ from papercraft.domain import (
 
 class DocxRenderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateInspection:
+    path: Path
+    sha256: str
+    part_count: int
+    uncompressed_bytes: int
+    external_hyperlinks: int
+
+
+def inspect_docx_template(path: str | os.PathLike[str]) -> TemplateInspection:
+    """Reject active/remote package features before opening a user template."""
+
+    template = Path(path).expanduser().resolve(strict=True)
+    if template.suffix.casefold() != ".docx" or not zipfile.is_zipfile(template):
+        raise DocxRenderError("the institution template must be a valid DOCX package")
+    forbidden_parts = (
+        "vbaproject.bin",
+        "word/activex/",
+        "word/embeddings/",
+        "word/altchunks/",
+    )
+    total_uncompressed = 0
+    external_hyperlinks = 0
+    with zipfile.ZipFile(template) as archive:
+        entries = archive.infolist()
+        if len(entries) > 2_000:
+            raise DocxRenderError("template package contains too many parts")
+        for entry in entries:
+            normalized = entry.filename.replace("\\", "/")
+            parts = PurePosixPath(normalized).parts
+            if normalized.startswith("/") or ".." in parts:
+                raise DocxRenderError("template package contains an unsafe path")
+            lowered = normalized.casefold()
+            if any(item in lowered for item in forbidden_parts):
+                raise DocxRenderError(f"template contains active or embedded content: {normalized}")
+            total_uncompressed += entry.file_size
+            if (
+                entry.file_size > 1_000_000
+                and entry.compress_size > 0
+                and entry.file_size / entry.compress_size > 500
+            ):
+                raise DocxRenderError("template package has an unsafe compression ratio")
+        if total_uncompressed > 250 * 1024 * 1024:
+            raise DocxRenderError("template package is too large after decompression")
+
+        for entry in entries:
+            lowered = entry.filename.casefold()
+            if lowered.endswith(".rels"):
+                try:
+                    root = ElementTree.fromstring(archive.read(entry))
+                except ElementTree.ParseError as exc:
+                    raise DocxRenderError(f"template relationship XML is invalid: {entry.filename}") from exc
+                for relationship in root:
+                    if relationship.attrib.get("TargetMode", "").casefold() != "external":
+                        continue
+                    kind = relationship.attrib.get("Type", "").rsplit("/", 1)[-1].casefold()
+                    target = relationship.attrib.get("Target", "")
+                    if kind != "hyperlink" or not target.casefold().startswith(
+                        ("https://", "http://", "mailto:")
+                    ):
+                        raise DocxRenderError(
+                            f"template contains a forbidden external relationship: {kind or 'unknown'}"
+                        )
+                    external_hyperlinks += 1
+            if lowered.startswith("word/") and lowered.endswith(".xml"):
+                payload = archive.read(entry)
+                if re.search(
+                    rb"\b(?:DDEAUTO|DDE|INCLUDETEXT|INCLUDEPICTURE)\b",
+                    payload,
+                    flags=re.IGNORECASE,
+                ):
+                    raise DocxRenderError(f"template contains an active field: {entry.filename}")
+                if b"<w:altChunk" in payload or b"<o:OLEObject" in payload:
+                    raise DocxRenderError(f"template contains active embedded content: {entry.filename}")
+    return TemplateInspection(
+        path=template,
+        sha256=_sha256(template),
+        part_count=len(entries),
+        uncompressed_bytes=total_uncompressed,
+        external_hyperlinks=external_hyperlinks,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +228,8 @@ class DocxRenderer:
         self.config = config or RenderConfig()
         self._warnings: list[str] = []
         self._unresolved: list[str] = []
+        self._bookmark_counter = 0
+        self._sequence_counters: dict[str, int] = {}
 
     def render(
         self,
@@ -159,20 +248,36 @@ class DocxRenderer:
             raise DocxRenderError("output path must have a .docx extension")
         self._warnings = []
         self._unresolved = []
+        self._bookmark_counter = 0
+        self._sequence_counters = {}
         datasets = datasets or {}
         citations = citations or {}
 
         if template_plan is not None and template_path is None:
             raise DocxRenderError("a TemplateApplicationPlan requires a template_path")
+        template_inspection: TemplateInspection | None = None
         if template_path is not None:
-            template = Path(template_path).expanduser().resolve(strict=True)
-            if template.suffix.lower() != ".docx":
-                raise DocxRenderError("the institution template must be a DOCX file")
+            template_inspection = inspect_docx_template(template_path)
+            template = template_inspection.path
+            if output == template:
+                raise DocxRenderError("output must not overwrite the retained institution template")
             document = Document(str(template))
-            self._warnings.append(f"Institution template preserved: {template.name}")
+            if template_plan is not None:
+                available_styles = {style.name for style in document.styles}
+                requested_styles = {
+                    *template_plan.use_styles,
+                    *template_plan.section_style_map.values(),
+                }
+                if missing_styles := requested_styles - available_styles:
+                    raise DocxRenderError(
+                        "template plan references missing styles: " + ", ".join(sorted(missing_styles))
+                    )
+            self._warnings.append(
+                f"Institution template safety-checked and retained: {template.name}"
+            )
         else:
             document = Document()
-        self._configure_document(document, manuscript)
+        self._configure_document(document, manuscript, preserve_template=template_path is not None)
         resolved_title = self._title_page(manuscript, title_page)
         if self.config.include_title_page and template_path is None:
             self._render_title_page(document, resolved_title)
@@ -197,6 +302,9 @@ class DocxRenderer:
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
+        if template_inspection is not None and _sha256(template_inspection.path) != template_inspection.sha256:
+            output.unlink(missing_ok=True)
+            raise DocxRenderError("the retained institution template changed during rendering")
         return DocxRenderResult(
             path=output,
             sha256=_sha256(output),
@@ -205,53 +313,60 @@ class DocxRenderer:
             warnings=tuple(self._warnings),
         )
 
-    def _configure_document(self, document: Any, manuscript: Manuscript) -> None:
+    def _configure_document(
+        self,
+        document: Any,
+        manuscript: Manuscript,
+        *,
+        preserve_template: bool,
+    ) -> None:
         document.core_properties.title = manuscript.title
         document.core_properties.subject = "PaperCraft AI Studio generated manuscript"
         document.core_properties.keywords = "academic, evidence-backed"
         document.core_properties.comments = f"Project {manuscript.project_id}; revision {manuscript.revision}"
-        for section in document.sections:
-            section.left_margin = Cm(self.config.margin_left_cm)
-            section.right_margin = Cm(self.config.margin_right_cm)
-            section.top_margin = Cm(self.config.margin_top_cm)
-            section.bottom_margin = Cm(self.config.margin_bottom_cm)
-            section.header_distance = Cm(self.config.header_distance_cm)
-            section.footer_distance = Cm(self.config.footer_distance_cm)
-            section.different_first_page_header_footer = True
-            page_container = (
-                section.header if self.config.page_number_position == "top" else section.footer
-            )
-            self._add_page_field(page_container.paragraphs[0])
+        if not preserve_template:
+            for section in document.sections:
+                section.left_margin = Cm(self.config.margin_left_cm)
+                section.right_margin = Cm(self.config.margin_right_cm)
+                section.top_margin = Cm(self.config.margin_top_cm)
+                section.bottom_margin = Cm(self.config.margin_bottom_cm)
+                section.header_distance = Cm(self.config.header_distance_cm)
+                section.footer_distance = Cm(self.config.footer_distance_cm)
+                section.different_first_page_header_footer = True
+                page_container = (
+                    section.header if self.config.page_number_position == "top" else section.footer
+                )
+                self._add_page_field(page_container.paragraphs[0])
 
-        normal = document.styles["Normal"]
-        _set_style_font(normal, self.config.font_name, self.config.body_font_size_pt)
-        normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        normal.paragraph_format.line_spacing = self.config.line_spacing
-        normal.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
-        normal.paragraph_format.space_before = Pt(0)
-        normal.paragraph_format.space_after = Pt(0)
+            normal = document.styles["Normal"]
+            _set_style_font(normal, self.config.font_name, self.config.body_font_size_pt)
+            normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            normal.paragraph_format.line_spacing = self.config.line_spacing
+            normal.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+            normal.paragraph_format.space_before = Pt(0)
+            normal.paragraph_format.space_after = Pt(0)
 
-        for level in range(1, 7):
-            name = f"Heading {level}"
-            if name not in document.styles:
-                continue
-            style = document.styles[name]
-            size = self.config.heading_1_size_pt if level == 1 else self.config.heading_2_size_pt
-            _set_style_font(style, self.config.font_name, size, bold=True)
-            style.font.color.rgb = RGBColor(0, 0, 0)
-            style.paragraph_format.first_line_indent = Cm(0)
-            style.paragraph_format.alignment = (
-                WD_ALIGN_PARAGRAPH.CENTER if level == 1 else WD_ALIGN_PARAGRAPH.LEFT
-            )
-            style.paragraph_format.space_before = Pt(12)
-            style.paragraph_format.space_after = Pt(6)
-            style.paragraph_format.keep_with_next = True
+            for level in range(1, 7):
+                name = f"Heading {level}"
+                if name not in document.styles:
+                    continue
+                style = document.styles[name]
+                size = self.config.heading_1_size_pt if level == 1 else self.config.heading_2_size_pt
+                _set_style_font(style, self.config.font_name, size, bold=True)
+                style.font.color.rgb = RGBColor(0, 0, 0)
+                style.paragraph_format.first_line_indent = Cm(0)
+                style.paragraph_format.alignment = (
+                    WD_ALIGN_PARAGRAPH.CENTER if level == 1 else WD_ALIGN_PARAGRAPH.LEFT
+                )
+                style.paragraph_format.space_before = Pt(12)
+                style.paragraph_format.space_after = Pt(6)
+                style.paragraph_format.keep_with_next = True
 
-        if "Caption" in document.styles:
-            caption = document.styles["Caption"]
-            _set_style_font(caption, self.config.font_name, 12)
-            caption.font.italic = False
-            caption.font.color.rgb = RGBColor(0, 0, 0)
+            if "Caption" in document.styles:
+                caption = document.styles["Caption"]
+                _set_style_font(caption, self.config.font_name, 12)
+                caption.font.italic = False
+                caption.font.color.rgb = RGBColor(0, 0, 0)
 
         settings = document.settings.element
         update_fields = settings.find(qn("w:updateFields"))
@@ -416,6 +531,34 @@ class DocxRenderer:
         if any(len(row) != len(headers) for row in rows):
             raise DocxRenderError(f"table {block.id} rows do not match headers")
 
+        use_landscape = len(headers) > 6 or (
+            bool(spec.column_widths) and sum(float(value) for value in spec.column_widths) > 17
+        )
+        previous_section = document.sections[-1]
+        previous_orientation = previous_section.orientation
+        previous_page_width = previous_section.page_width
+        previous_page_height = previous_section.page_height
+        previous_left_margin = previous_section.left_margin
+        previous_right_margin = previous_section.right_margin
+        previous_top_margin = previous_section.top_margin
+        previous_bottom_margin = previous_section.bottom_margin
+        previous_header_distance = previous_section.header_distance
+        previous_footer_distance = previous_section.footer_distance
+        if use_landscape:
+            landscape = document.add_section(WD_SECTION_START.NEW_PAGE)
+            landscape.orientation = WD_ORIENT.LANDSCAPE
+            landscape.page_width = previous_page_height
+            landscape.page_height = previous_page_width
+            landscape.left_margin = previous_left_margin
+            landscape.right_margin = previous_right_margin
+            landscape.top_margin = previous_top_margin
+            landscape.bottom_margin = previous_bottom_margin
+            landscape.header_distance = previous_header_distance
+            landscape.footer_distance = previous_footer_distance
+            landscape.different_first_page_header_footer = False
+            landscape.header.is_linked_to_previous = True
+            landscape.footer.is_linked_to_previous = True
+            self._warnings.append(f"Wide table {block.id} placed in a landscape section")
         self._add_caption(document, self.config.table_label, "Table", spec.caption, above=True)
         table = document.add_table(rows=len(rows) + 1, cols=len(headers))
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -443,6 +586,20 @@ class DocxRenderer:
                 if len(spec.column_widths) == len(headers):
                     cell.width = Cm(float(spec.column_widths[column_index]))
         document.add_paragraph().paragraph_format.space_after = Pt(4)
+        if use_landscape:
+            restored = document.add_section(WD_SECTION_START.NEW_PAGE)
+            restored.orientation = previous_orientation
+            restored.page_width = previous_page_width
+            restored.page_height = previous_page_height
+            restored.left_margin = previous_left_margin
+            restored.right_margin = previous_right_margin
+            restored.top_margin = previous_top_margin
+            restored.bottom_margin = previous_bottom_margin
+            restored.header_distance = previous_header_distance
+            restored.footer_distance = previous_footer_distance
+            restored.different_first_page_header_footer = False
+            restored.header.is_linked_to_previous = True
+            restored.footer.is_linked_to_previous = True
 
     def _render_artifact_image(
         self,
@@ -464,6 +621,7 @@ class DocxRenderer:
             return
         image_paragraph = document.add_paragraph()
         _plain_paragraph(image_paragraph, WD_ALIGN_PARAGRAPH.CENTER)
+        image_paragraph.paragraph_format.keep_with_next = True
         width_cm, height_cm = _fit_image(
             path, self.config.maximum_image_width_cm, self.config.maximum_image_height_cm
         )
@@ -524,7 +682,19 @@ class DocxRenderer:
         paragraph.paragraph_format.first_line_indent = Cm(0)
         paragraph.paragraph_format.keep_with_next = above
         paragraph.add_run(f"{label} ")
-        _append_field(paragraph, f"SEQ {sequence_name} \\* ARABIC", "0")
+        self._bookmark_counter += 1
+        sequence_number = self._sequence_counters.get(sequence_name, 0) + 1
+        self._sequence_counters[sequence_name] = sequence_number
+        bookmark_id = str(self._bookmark_counter)
+        bookmark_name = f"pc_{sequence_name}_{sequence_number}"
+        start = OxmlElement("w:bookmarkStart")
+        start.set(qn("w:id"), bookmark_id)
+        start.set(qn("w:name"), bookmark_name)
+        paragraph._p.append(start)
+        _append_field(paragraph, f"SEQ {sequence_name} \\* ARABIC", str(sequence_number))
+        end = OxmlElement("w:bookmarkEnd")
+        end.set(qn("w:id"), bookmark_id)
+        paragraph._p.append(end)
         if caption:
             paragraph.add_run(f" – {caption}")
 
