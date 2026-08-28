@@ -1,6 +1,6 @@
 # Дорожная карта PaperCraft AI Studio
 
-Дата актуализации: 13 августа 2026 года. Документ описывает v2 в `src/papercraft`; legacy-прототип в корневых `core/`, `models/`, `ui/` не используется как доказательство готовности.
+Дата актуализации: 28 августа 2026 года. Документ описывает v2 в `src/papercraft`; legacy-прототип в корневых `core/`, `models/`, `ui/` не используется как доказательство готовности. Production `ResearchPlan` contract уже подтверждён один раз; полный Gemini acceptance и golden-набор остановлены внешней provider quota (HTTP 429).
 
 ## Как читать статусы
 
@@ -8,7 +8,7 @@
 - **Integration required** — реализация существует, но результат зависит от Gemini, Office, Windows UI, сети или окружения сборки и ещё не принят на реальной системе.
 - **Planned** — необходимой release-функции пока нет либо её текущий вариант недостаточен.
 
-Наличие класса или кнопки само по себе не означает готовность функции. Live Gemini, Microsoft Word, LibreOffice и Windows installer на текущем цикле не объявляются проверенными.
+Наличие класса или кнопки само по себе не означает готовность функции. LibreOffice, desktop UI и локальный installer уже прошли ограниченные проверки; полный Gemini acceptance, Microsoft Word и чистые Windows-среды ещё не приняты.
 
 ## Матрица готовности v0.2
 
@@ -18,27 +18,27 @@
 | Профили четырёх видов работ | Working | Registry и обязательные разделы проверены тестами |
 | SQLite, пути проекта, атомарные артефакты | Working | CRUD, события, checkpoints и миграция legacy проверены во временных workspace |
 | Безопасный ingest | Working | Форматы и защитные ограничения проверены локальными fixtures |
-| Research/evidence/bibliography | Working | URL и связи утверждение→evidence→источник проверены без обращения к публичной сети |
-| Gemini structured gateway | Integration required | Контракты, schema и ошибки проверены fake-клиентом; нужен live test matrix |
+| Research/evidence/bibliography | Working | Локальные связи утверждение→evidence→источник и live Crossref/OpenAlex/DOI подтверждены |
+| Gemini structured gateway | Integration required | Production `ResearchPlan` проходит с `google-genai==2.19.0`; полный live test matrix блокирован HTTP 429 provider quota |
 | Возобновляемый pipeline | Working | Порядок стадий, invalidation, pause/resume и fake-E2E подтверждены |
 | Качество live-текста и плана | Integration required | Нужны эталонные задания, экспертная оценка и измерение повторяемости |
 | FactLedger, финансы, synthetic data | Working | Детерминированные операции, double entry, seed и provenance проверены |
 | ChartSpec и локальные диаграммы | Working | Нет `exec`; matplotlib и Pillow paths проверяются тестами при доступности зависимостей |
 | DOCX renderer | Working | OpenXML-поля и блочная сборка проверены автоматически |
 | Слияние вузовского DOCX-шаблона | Planned | Нужен отдельный контракт импорта стилей/секций и golden tests |
-| Word/LibreOffice finalizer | Integration required | Адаптеры готовы, но не запускались в release-окружении |
-| PDF page render и visual QA | Integration required | Нужна серия реальных многостраничных документов и live Gemini Vision |
+| Word/LibreOffice finalizer | Integration required | LibreOffice matrix прошла; Word COM требует отдельной проверки |
+| PDF page render и visual QA | Integration required | Детерминированный review прошёл; live Gemini Vision надо повторить после восстановления quota |
 | HTML/JSON QA report | Working | Статусы, escaping и атомарная запись проверены |
-| PySide6 UI и worker | Integration required | Код собран вокруг application services; нужны GUI и smoke tests на Windows |
-| PyInstaller и Inno Setup | Integration required | Build definitions добавлены; инструменты отсутствовали в текущем окружении |
+| PySide6 UI и worker | Working | Реальное окно, worker и основные пользовательские сценарии прошли smoke на Windows |
+| PyInstaller и Inno Setup | Integration required | Build и локальный install/upgrade/uninstall PASS; нужны чистые Windows 10/11 |
 | Подписанный публичный релиз | Planned | Нет сертификата, signing pipeline и SmartScreen-приёмки |
 
 ## P0 — интеграционная приёмка
 
 Эти задачи блокируют заявление «полный автопилот работает».
 
-1. **Live Gemini contract suite.** Проверить настроенные model IDs, structured output, загрузку/удаление файлов, grounding, image generation, 401/403/429/5xx, timeout, retry и учёт стоимости. Никакой автоматический fake fallback в production.
-2. **Golden-набор из четырёх проектов.** Для курсовой, статьи, отчёта и школьного проекта подготовить методичку, пример, смешанные источники и ожидаемые структурные инварианты. Запуск должен быть повторяемым и сохранять provenance каждого проверяемого утверждения.
+1. **Live Gemini contract suite.** После восстановления quota проверить настроенные model IDs, structured output, загрузку/удаление файлов, grounding, image generation, 401/403/429/5xx, timeout, retry и учёт стоимости. Никакой автоматический fake fallback в production.
+2. **Golden-набор из шести сценариев ×2.** Для курсовых, статьи, отчётов и школьного проекта подготовлены manifests, методички, примеры, смешанные источники и структурные инварианты. Требуются 12 успешных live-запусков с provenance каждого проверяемого утверждения.
 3. **Windows desktop smoke test.** На чистых Windows 10 и 11 проверить создание проекта, импорт файлов, настройку ключа, отдельный worker, pause/resume/retry, открытие результатов и восстановление после принудительного завершения.
 4. **Office matrix.** Проверить Microsoft 365, Word 2021 и актуальный LibreOffice: обновление TOC/PAGE/SEQ, русские шрифты, перенос таблиц, подписи, PDF и отсутствие повреждений DOCX.
 5. **PDF visual QA.** Прогнать документы разного объёма, альбомные таблицы, приложения, код, диаграммы и изображения; согласовать, какие visual issues являются blocker.
@@ -47,7 +47,7 @@
 
 ### Критерий завершения P0
 
-- Все четыре golden-проекта получают DOCX, PDF и QA report без unresolved placeholders.
+- Все шесть golden-сценариев проходят дважды и получают DOCX, PDF и QA report без unresolved placeholders.
 - Каждое проверяемое утверждение имеет verified evidence либо конвейер останавливается.
 - Все вычисляемые числа воспроизводятся из FactLedger/Dataset.
 - После убийства worker продолжает с последнего успешного checkpoint.

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 import mimetypes
 import random
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from uuid import uuid4
@@ -23,6 +27,35 @@ from papercraft.config import AppSettings
 from .secrets import CredentialSecretStore, SecretStore
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+_MAX_PROVIDER_DIAGNOSTIC_CHARS = 2048
+_MAX_PROVIDER_FIELD_VIOLATIONS = 4
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?i)(\bauthorization\b\s*[:=]\s*)(?:bearer\s+)?[^\s,;\"']+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)\bbearer\s+[^\s,;\"']+"),
+        "Bearer [REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)([?&](?:key|api[_-]?key|token|access_token)=)(?!\[REDACTED\])[^&#\s]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)(\b(?:api[_-]?key|key|access[_-]?token|token|secret)\b"
+            r"\s*[:=]\s*[\"']?)(?!\[REDACTED\])[^,\s\"'}\]]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"\b(?:AIza|ghp_|github_pat_|sk-|AQ\.)[A-Za-z0-9._~+/=-]+\b"),
+        "[REDACTED]",
+    ),
+)
 
 
 class GeminiGatewayError(RuntimeError):
@@ -220,12 +253,229 @@ class GeminiGateway:
         )
         return max(0.0, float(match.group(1))) if match else None
 
+    @staticmethod
+    def _sdk_version() -> str:
+        """Return the installed SDK version without importing provider internals."""
+
+        try:
+            return package_version("google-genai")
+        except PackageNotFoundError:
+            # Unit tests can inject a client without installing the production
+            # dependency. The diagnostic remains useful without fabricating a
+            # version number.
+            return "unavailable"
+
+    @staticmethod
+    def _canonical_json_bytes(value: Any) -> bytes:
+        """Encode schema metadata deterministically for fingerprinting only."""
+
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _provider_json_schema(schema_document: dict[str, Any]) -> dict[str, Any]:
+        """Return the Interactions-compatible copy of a Pydantic JSON Schema.
+
+        Gemini's current Interactions endpoint rejects ``maxItems`` for the
+        production ``ResearchPlan`` schema with HTTP 400, even though the
+        keyword is accepted by Pydantic and documented for structured output.
+        Keep the domain schema strict locally and omit only that provider-side
+        constraint from the request.  The recursion also covers nested arrays
+        without altering any other JSON Schema keyword.
+        """
+
+        def transform(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    key: transform(item)
+                    for key, item in value.items()
+                    if key != "maxItems"
+                }
+            if isinstance(value, list):
+                return [transform(item) for item in value]
+            return value
+
+        transformed = transform(schema_document)
+        if not isinstance(transformed, dict):  # pragma: no cover - schema root is an object
+            raise TypeError("Pydantic JSON Schema root must be an object")
+        return transformed
+
+    @staticmethod
+    def _sanitize_provider_text(value: Any, *, limit: int = _MAX_PROVIDER_DIAGNOSTIC_CHARS) -> str:
+        """Keep provider diagnostics compact without exposing credentials.
+
+        This helper intentionally accepts only text selected from provider error
+        fields. It is not used to serialize a request or response body, because
+        either may contain a user prompt or uploaded document content.
+        """
+
+        if not isinstance(value, str):
+            return ""
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        for pattern, replacement in _SECRET_PATTERNS:
+            cleaned = pattern.sub(replacement, cleaned)
+        if len(cleaned) > limit:
+            return f"{cleaned[:limit - 1]}…"
+        return cleaned
+
+    @classmethod
+    def _error_mapping(cls, value: Any) -> dict[str, Any] | None:
+        """Return a structured provider error object, never a raw text body."""
+
+        if isinstance(value, Mapping):
+            return dict(value)
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(mode="json", exclude_none=True)
+            except Exception:
+                dumped = None
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        response_json = getattr(value, "json", None)
+        if callable(response_json):
+            try:
+                decoded = response_json()
+            except Exception:
+                decoded = None
+            if isinstance(decoded, Mapping):
+                return dict(decoded)
+        return None
+
+    @classmethod
+    def _provider_error_payload(cls, exc: Exception) -> dict[str, Any] | None:
+        """Find the SDK's structured error payload without reading raw bodies."""
+
+        for candidate in (
+            getattr(exc, "details", None),
+            getattr(exc, "body", None),
+            getattr(exc, "error", None),
+            getattr(exc, "response", None),
+        ):
+            payload = cls._error_mapping(candidate)
+            if payload is not None:
+                return payload
+        return None
+
+    @classmethod
+    def _field_violation_descriptions(cls, payload: Any) -> list[str]:
+        """Extract only documented field-violation descriptions from an error."""
+
+        results: list[str] = []
+
+        def visit(value: Any, *, depth: int) -> None:
+            if depth > 8 or len(results) >= _MAX_PROVIDER_FIELD_VIOLATIONS:
+                return
+            if isinstance(value, Mapping):
+                violations = value.get("fieldViolations") or value.get("field_violations")
+                if isinstance(violations, list):
+                    for violation in violations:
+                        if not isinstance(violation, Mapping):
+                            continue
+                        description = cls._sanitize_provider_text(
+                            violation.get("description"), limit=256
+                        )
+                        if description:
+                            results.append(description)
+                        if len(results) >= _MAX_PROVIDER_FIELD_VIOLATIONS:
+                            return
+                for key in ("error", "details", "violations"):
+                    nested = value.get(key)
+                    if isinstance(nested, (Mapping, list)):
+                        visit(nested, depth=depth + 1)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested, depth=depth + 1)
+                    if len(results) >= _MAX_PROVIDER_FIELD_VIOLATIONS:
+                        return
+
+        visit(payload, depth=0)
+        return results
+
+    @classmethod
+    def _provider_error_message(
+        cls,
+        exc: Exception,
+        payload: dict[str, Any] | None,
+    ) -> str:
+        """Select a safe, provider-supplied message without falling back to ``str(exc)``."""
+
+        candidates: list[Any] = []
+        if payload is not None:
+            candidates.append(payload.get("message"))
+            nested_error = payload.get("error")
+            if isinstance(nested_error, Mapping):
+                candidates.append(nested_error.get("message"))
+        for candidate in candidates:
+            cleaned = cls._sanitize_provider_text(candidate)
+            if cleaned:
+                return cleaned
+        return "Provider did not supply a safe error message."
+
+    @classmethod
+    def _safe_provider_error_summary(cls, exc: Exception, *, status: int | None) -> str:
+        """Return bounded provider diagnostics suitable for an exception message."""
+
+        payload = cls._provider_error_payload(exc)
+        summary: dict[str, Any] = {
+            "exception_type": type(exc).__name__,
+            "message": cls._provider_error_message(exc, payload),
+            "status_code": status,
+        }
+        request_id = cls._sanitize_provider_text(cls._provider_request_id(exc), limit=512)
+        if request_id:
+            summary["provider_request_id"] = request_id
+        violations = cls._field_violation_descriptions(payload)
+        if violations:
+            summary["field_violations"] = violations
+        return cls._canonical_json_bytes(summary).decode("utf-8")
+
+    @classmethod
+    def _structured_request_metadata(
+        cls,
+        *,
+        model: str,
+        role: str,
+        thinking_level: str,
+        schema: type[BaseModel],
+        schema_document: dict[str, Any],
+        has_files: bool,
+        file_count: int,
+        has_system_instruction: bool,
+    ) -> dict[str, Any]:
+        """Build non-sensitive metadata for a structured request failure.
+
+        The JSON Schema is fingerprinted rather than emitted so exception
+        messages provide reproducibility data without leaking static schema
+        descriptions or request content.
+        """
+
+        encoded_schema = cls._canonical_json_bytes(schema_document)
+        return {
+            "file_count": file_count,
+            "has_system_instruction": has_system_instruction,
+            "input_shape": "multimodal" if has_files else "text",
+            "model": model,
+            "role": role,
+            "schema_bytes": len(encoded_schema),
+            "schema_name": schema.__name__,
+            "schema_sha256": hashlib.sha256(encoded_schema).hexdigest(),
+            "sdk_version": cls._sdk_version(),
+            "thinking_level": thinking_level,
+        }
+
     def _call(
         self,
         operation: str,
         function: Callable[[], Any],
         *,
         not_found_ok: bool = False,
+        error_context: dict[str, Any] | None = None,
     ) -> Any:
         retry = self.settings.retry_policy
         last_error: Exception | None = None
@@ -244,7 +494,11 @@ class GeminiGateway:
                         raise GeminiConfigurationError(
                             f"{operation} references an unavailable model or endpoint: {exc}"
                         ) from exc
-                    raise GeminiGatewayError(f"{operation} is invalid: {exc}") from exc
+                    diagnostic = self._safe_provider_error_summary(exc, status=status)
+                    if error_context is not None:
+                        context = self._canonical_json_bytes(error_context).decode("utf-8")
+                        diagnostic = f"{diagnostic}; structured_request_metadata={context}"
+                    raise GeminiGatewayError(f"{operation} is invalid: {diagnostic}") from exc
                 retryable = status in {408, 409, 429, 500, 502, 503, 504} or (
                     status is None and self._is_transport_error(exc)
                 )
@@ -291,11 +545,17 @@ class GeminiGateway:
         """Extract a traceable provider request ID across SDK response modes."""
 
         candidates: list[Any] = [getattr(response, "request_id", None)]
-        headers = getattr(response, "headers", None)
-        if headers is None:
-            http_response = getattr(response, "http_response", None)
-            headers = getattr(http_response, "headers", None)
-        if headers is not None:
+        response_headers = getattr(response, "headers", None)
+        http_response = getattr(response, "http_response", None)
+        nested_response = getattr(response, "response", None)
+        header_sets = (
+            response_headers,
+            getattr(http_response, "headers", None),
+            getattr(nested_response, "headers", None),
+        )
+        for headers in header_sets:
+            if headers is None:
+                continue
             for name in (
                 "x-request-id",
                 "x-goog-request-id",
@@ -463,18 +723,42 @@ class GeminiGateway:
         files: list[str | RemoteFile] | None = None,
     ) -> SchemaT:
         model = self._model(role)
-        interaction_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for remote in files or []:
-            uri = remote.uri if isinstance(remote, RemoteFile) else remote
-            mime_type = remote.mime_type if isinstance(remote, RemoteFile) else None
-            media_type = "document"
-            if mime_type:
-                media_type = mime_type.split("/", 1)[0]
-                if media_type not in {"image", "audio", "video"}:
-                    media_type = "document"
-            interaction_input.append(
-                {"type": media_type, "uri": uri, "mime_type": mime_type or "application/octet-stream"}
-            )
+        thinking_level = self._thinking_level(role)
+        schema_document = schema.model_json_schema()
+        provider_schema_document = self._provider_json_schema(schema_document)
+        supplied_files = files or []
+        base_multimodal_input: list[dict[str, Any]] | None = None
+        if supplied_files:
+            base_multimodal_input = [{"type": "text", "text": prompt}]
+            for remote in supplied_files:
+                uri = remote.uri if isinstance(remote, RemoteFile) else remote
+                mime_type = remote.mime_type if isinstance(remote, RemoteFile) else None
+                media_type = "document"
+                if mime_type:
+                    media_type = mime_type.split("/", 1)[0]
+                    if media_type not in {"image", "audio", "video"}:
+                        media_type = "document"
+                base_multimodal_input.append(
+                    {
+                        "type": media_type,
+                        "uri": uri,
+                        "mime_type": mime_type or "application/octet-stream",
+                    }
+                )
+
+        request_metadata = self._structured_request_metadata(
+            model=model,
+            role=role,
+            thinking_level=thinking_level,
+            schema=schema,
+            schema_document=provider_schema_document,
+            has_files=base_multimodal_input is not None,
+            file_count=len(supplied_files),
+            has_system_instruction=bool(system_instruction),
+        )
+        interaction_input: str | list[dict[str, Any]] = (
+            base_multimodal_input if base_multimodal_input is not None else prompt
+        )
 
         def invoke() -> Any:
             body: dict[str, Any] = {
@@ -484,9 +768,9 @@ class GeminiGateway:
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
-                    "schema": schema.model_json_schema(),
+                    "schema": provider_schema_document,
                 },
-                "generation_config": {"thinking_level": self._thinking_level(role)},
+                "generation_config": {"thinking_level": thinking_level},
                 "timeout": self.settings.request_timeout_seconds,
             }
             if system_instruction:
@@ -494,9 +778,12 @@ class GeminiGateway:
             return self._create_interaction(**body)
 
         last_error: ValidationError | None = None
-        original_input = list(interaction_input)
         for structured_attempt in range(1, 4):
-            response = self._call(f"structured generation ({role})", invoke)
+            response = self._call(
+                f"structured generation ({role})",
+                invoke,
+                error_context=request_metadata,
+            )
             # Every completed provider response is billable, including an
             # invalid JSON response that needs a schema-repair interaction.
             self._record(response, "generate_structured", model)
@@ -512,16 +799,25 @@ class GeminiGateway:
                 last_error = exc
                 if structured_attempt >= 3:
                     break
-                interaction_input[:] = [
-                    *original_input,
-                    {
-                        "type": "text",
-                        "text": (
-                            "Your previous JSON did not validate. Return a corrected complete JSON object only. "
-                            f"Validation error: {str(exc)[:4000]}. Previous output: {raw[:12000]}"
-                        ),
-                    },
-                ]
+                feedback = (
+                    "Your previous JSON did not validate. Return a corrected complete JSON object only. "
+                    f"Validation error: {str(exc)[:4000]}. Previous output: {raw[:12000]}"
+                )
+                if base_multimodal_input is None:
+                    # Text-only Interactions requests use a string. Include the
+                    # original instruction and repair feedback in the next
+                    # string rather than changing the request shape.
+                    interaction_input = f"{prompt}\n\n{feedback}"
+                else:
+                    # Build a new list. Mutating the first request's list
+                    # retrospectively would corrupt audit/test evidence.
+                    interaction_input = [
+                        *base_multimodal_input,
+                        {
+                            "type": "text",
+                            "text": feedback,
+                        },
+                    ]
                 continue
             return parsed
         raise GeminiStructuredOutputError(

@@ -7,6 +7,7 @@ import pytest
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
+from papercraft.application.schemas import ResearchPlan
 from papercraft.config import AppSettings
 from papercraft.infrastructure.gemini import (
     CredentialSecretStore,
@@ -63,6 +64,33 @@ def test_live_interactions_thinking_and_structured_output(tmp_path: Path) -> Non
     )
     assert all(int(record.metadata.get("thought_tokens", 0)) >= 0 for record in usage)
     assert all(record.estimated_cost >= 0 for record in usage)
+
+
+def test_live_research_plan_structured_contract(tmp_path: Path) -> None:
+    usage: list[UsageRecord] = []
+    gateway = _live_gateway(tmp_path, usage_sink=usage)
+    prompt = (
+        "For an academic paper about reproducible software testing, return exactly one short, "
+        "checkable claim and a precise web search query for verifying it."
+    )
+
+    plan = gateway.generate_structured(
+        prompt=prompt,
+        schema=ResearchPlan,
+        role="research",
+        system_instruction="Return only a research plan that conforms to the JSON schema.",
+    )
+
+    assert isinstance(plan, ResearchPlan)
+    assert plan.claims
+    assert all(claim.text.strip() and claim.search_query.strip() for claim in plan.claims)
+    record = usage[-1]
+    assert record.operation == "generate_structured"
+    assert record.model == gateway.settings.model_policy.research
+    assert record.total_tokens > 0
+    assert record.estimated_cost > 0
+    assert record.metadata.get("client_request_id")
+    assert prompt not in str(record.metadata)
 
 
 def test_live_file_vision_lifecycle(tmp_path: Path) -> None:

@@ -1,9 +1,12 @@
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
+from papercraft.application.schemas import ResearchPlan
 from papercraft.config import AppSettings, ModelPolicy, RetryPolicy, ThinkingPolicy
 from papercraft.infrastructure.gemini import (
     FakeGeminiGateway,
@@ -12,6 +15,7 @@ from papercraft.infrastructure.gemini import (
     GeminiGateway,
     GeminiGatewayError,
     GeminiSafetyError,
+    RemoteFile,
 )
 
 
@@ -89,9 +93,83 @@ def test_structured_generation_uses_schema(tmp_path: Path) -> None:
     result = gateway.generate_structured(prompt="build", schema=Payload, role="blueprint")
     assert result == Payload(title="План", count=3)
     sent = client.interactions.calls[0]
-    assert sent["response_format"]["mime_type"] == "application/json"
-    assert sent["response_format"]["schema"]["required"] == ["title", "count"]
+    assert sent["input"] == "build"
+    assert sent["response_format"] == {
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": Payload.model_json_schema(),
+    }
+    assert "response_mime_type" not in sent
     assert sent["generation_config"] == {"thinking_level": "medium"}
+
+
+def test_structured_generation_uses_multimodal_input_only_when_files_are_present(
+    tmp_path: Path,
+) -> None:
+    response = SimpleNamespace(output_text='{"title":"Vision","count":1}', usage=None)
+    client = SimpleNamespace(interactions=FakeInteractions([response]), files=FakeFiles())
+    gateway = GeminiGateway(settings(tmp_path), client=client)
+
+    result = gateway.generate_structured(
+        prompt="Read the attached material.",
+        schema=Payload,
+        role="extraction",
+        files=[
+            RemoteFile(name="files/image", uri="fake://image", mime_type="image/png"),
+            RemoteFile(name="files/document", uri="fake://document", mime_type="application/pdf"),
+        ],
+    )
+
+    assert result == Payload(title="Vision", count=1)
+    sent = client.interactions.calls[0]
+    assert sent["input"] == [
+        {"type": "text", "text": "Read the attached material."},
+        {"type": "image", "uri": "fake://image", "mime_type": "image/png"},
+        {
+            "type": "document",
+            "uri": "fake://document",
+            "mime_type": "application/pdf",
+        },
+    ]
+    assert sent["response_format"]["type"] == "text"
+    assert sent["response_format"]["mime_type"] == "application/json"
+    assert "response_mime_type" not in sent
+
+
+def test_research_plan_schema_is_deterministic_and_retains_claim_limit() -> None:
+    first = ResearchPlan.model_json_schema()
+    second = ResearchPlan.model_json_schema()
+    canonical_first = json.dumps(first, sort_keys=True, separators=(",", ":"))
+    canonical_second = json.dumps(second, sort_keys=True, separators=(",", ":"))
+
+    assert canonical_first == canonical_second
+    assert hashlib.sha256(canonical_first.encode()).hexdigest() == hashlib.sha256(
+        canonical_second.encode()
+    ).hexdigest()
+    assert first["properties"]["claims"]["maxItems"] == 80
+    with pytest.raises(ValidationError):
+        ResearchPlan.model_validate(
+            {
+                "claims": [
+                    {"text": f"Claim {index}", "search_query": f"query {index}"}
+                    for index in range(81)
+                ]
+            }
+        )
+
+
+def test_structured_generation_omits_only_max_items_from_provider_schema(tmp_path: Path) -> None:
+    response = SimpleNamespace(output_text='{"claims":[]}', usage=None, status="completed")
+    client = SimpleNamespace(interactions=FakeInteractions([response]), files=FakeFiles())
+
+    result = GeminiGateway(settings(tmp_path), client=client).generate_structured(
+        prompt="Build a research plan.", schema=ResearchPlan, role="research"
+    )
+
+    assert result == ResearchPlan()
+    sent_schema = client.interactions.calls[0]["response_format"]["schema"]
+    assert "maxItems" not in json.dumps(sent_schema, sort_keys=True)
+    assert ResearchPlan.model_json_schema()["properties"]["claims"]["maxItems"] == 80
 
 
 def test_usage_preserves_request_id_when_provider_omits_interaction_id(
@@ -274,13 +352,129 @@ def test_malformed_structured_json_is_repaired_with_schema_feedback(tmp_path: Pa
     )
     interactions = FakeInteractions([malformed, repaired])
     client = SimpleNamespace(interactions=interactions, files=FakeFiles())
-    result = GeminiGateway(settings(tmp_path), client=client).generate_structured(
+    usage = []
+    result = GeminiGateway(settings(tmp_path), client=client, usage_sink=usage.append).generate_structured(
         prompt="build", schema=Payload, role="blueprint"
     )
     assert result == Payload(title="Complete", count=2)
     assert len(interactions.calls) == 2
-    repair_input = interactions.calls[1]["input"][-1]["text"]
+    assert interactions.calls[0]["input"] == "build"
+    repair_input = interactions.calls[1]["input"]
+    assert isinstance(repair_input, str)
+    assert repair_input.startswith("build")
     assert "did not validate" in repair_input
+    assert '"title":"Incomplete"' in repair_input
+    assert len(usage) == 2
+
+
+def test_multimodal_structured_repair_preserves_first_request_and_appends_feedback(
+    tmp_path: Path,
+) -> None:
+    malformed = SimpleNamespace(
+        output_text='{"title":"Incomplete"}', usage=None, status="completed", id="v1_bad"
+    )
+    repaired = SimpleNamespace(
+        output_text='{"title":"Complete","count":2}',
+        usage=None,
+        status="completed",
+        id="v1_good",
+    )
+    interactions = FakeInteractions([malformed, repaired])
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+
+    result = GeminiGateway(settings(tmp_path), client=client).generate_structured(
+        prompt="Read this image and return JSON.",
+        schema=Payload,
+        role="extraction",
+        files=[RemoteFile(name="files/image", uri="fake://image", mime_type="image/png")],
+    )
+
+    assert result == Payload(title="Complete", count=2)
+    assert len(interactions.calls) == 2
+    first_input = interactions.calls[0]["input"]
+    repair_input = interactions.calls[1]["input"]
+    assert first_input == [
+        {"type": "text", "text": "Read this image and return JSON."},
+        {"type": "image", "uri": "fake://image", "mime_type": "image/png"},
+    ]
+    assert repair_input[:2] == first_input
+    assert repair_input[-1]["type"] == "text"
+    assert "did not validate" in repair_input[-1]["text"]
+
+
+def test_structured_generation_stops_after_three_invalid_outputs(tmp_path: Path) -> None:
+    invalid = [
+        SimpleNamespace(output_text='{"title":"Incomplete"}', usage=None, status="completed")
+        for _ in range(3)
+    ]
+    interactions = FakeInteractions(invalid)
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+
+    with pytest.raises(GeminiGatewayError, match="after three attempts"):
+        GeminiGateway(settings(tmp_path), client=client).generate_structured(
+            prompt="build", schema=Payload, role="blueprint"
+        )
+
+    assert len(interactions.calls) == 3
+
+
+def test_structured_http_400_is_not_retried_and_exposes_only_safe_diagnostics(
+    tmp_path: Path,
+) -> None:
+    class InvalidStructuredRequest(RuntimeError):
+        status_code = 400
+
+        def __init__(self) -> None:
+            self.response = SimpleNamespace(
+                headers={"x-goog-request-id": "provider-request-for-test"}
+            )
+            self.details = {
+                "error": {
+                    "details": [
+                        {"fieldViolations": [{"description": "unsupported schema field"}]}
+                    ]
+                }
+            }
+            self.message = (
+                "invalid schema; Authorization: Bearer sentinel-bearer-value; "
+                "https://provider.invalid/request?key=sentinel-provider-key"
+            )
+            super().__init__(self.message)
+
+    interactions = FakeInteractions([InvalidStructuredRequest()])
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+    delays: list[float] = []
+    private_prompt = "PRIVATE_USER_PROMPT_MUST_NOT_APPEAR"
+
+    with pytest.raises(GeminiGatewayError) as raised:
+        GeminiGateway(settings(tmp_path), client=client, sleep=delays.append).generate_structured(
+            prompt=private_prompt,
+            schema=Payload,
+            role="blueprint",
+        )
+
+    assert len(interactions.calls) == 1
+    assert delays == []
+    message = str(raised.value)
+    assert "structured generation (blueprint) is invalid" in message
+    assert "provider-request-for-test" in message
+    assert "unsupported schema field" in message
+    assert private_prompt not in message
+    assert "sentinel-bearer-value" not in message
+    assert "sentinel-provider-key" not in message
+
+    metadata = json.loads(message.rsplit("request_metadata=", maxsplit=1)[1])
+    assert metadata["model"] == "gemini-3.7-flash"
+    assert metadata["role"] == "blueprint"
+    assert metadata["thinking_level"] == "medium"
+    assert metadata["schema_name"] == "Payload"
+    assert metadata["input_shape"] == "text"
+    assert metadata["file_count"] == 0
+    assert metadata["has_system_instruction"] is False
+    assert metadata["schema_bytes"] > 0
+    assert isinstance(metadata["sdk_version"], str) and metadata["sdk_version"]
+    assert len(metadata["schema_sha256"]) == 64
+    assert all(character in "0123456789abcdef" for character in metadata["schema_sha256"])
 
 
 def test_safety_block_is_distinct_and_not_retried(tmp_path: Path) -> None:

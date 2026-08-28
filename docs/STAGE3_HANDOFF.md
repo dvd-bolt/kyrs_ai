@@ -1,6 +1,6 @@
 # PaperCraft AI Studio — Stage 3 handoff
 
-Состояние на 2026-08-23. Рабочая ветка: `codex/papercraft-v1`.
+Состояние на 2026-08-28. Рабочая ветка: `codex/papercraft-v1`.
 
 ## Краткий статус
 
@@ -33,7 +33,7 @@ Microsoft Word и отдельными чистыми Windows 10/11. Release-к�
 
 ## Что уже проверено
 
-- `pytest -q`: 99 passed, 28 opt-in integration skips.
+- `uv run --locked python -m pytest -q`: 106 passed, 29 opt-in integration skips.
 - `ruff check src tests_v2 packaging`: PASS.
 - `mypy src/papercraft --strict`: PASS, 70 source files.
 - Fault/security subset: 41 passed.
@@ -41,18 +41,25 @@ Microsoft Word и отдельными чистыми Windows 10/11. Release-к�
 - Live OCR/Vision fixtures: 6/6 passed.
 - LibreOffice matrix: 2 passed.
 - DOCX template safety, PDF deterministic QA, desktop UI и local installer acceptance: PASS.
-- Проверка на утечку фактического Gemini credential: 0 matches.
+- В изменяемых файлах нет фактических credentials; единственное совпадение generic scanner —
+  существующая синтетическая fixture теста secret-scanner.
+
+## Обновление 27.08.2026
+
+HTTP 400 `ResearchPlan` исправлен: gateway удаляет только provider-side `maxItems`, сохраняя
+локальный Pydantic limit 80; text-only structured input теперь строка; SDK закреплён на
+`google-genai==2.19.0`. Новый live research contract прошёл один раз.
 
 ## Что не завершено
 
-1. Полный Gemini contract suite: structured/thinking, Files/Vision и embeddings проходили,
-   но Search, image и background cancel были остановлены provider quota/HTTP 429.
-2. Шесть live golden E2E дважды: все 12 запусков выполнены, 0/12 завершились успешно из-за
-   `GeminiUnavailableError`/HTTP 429. Это внешний blocker, а не разрешённый skip.
-3. Microsoft Word COM matrix: Word не установлен на текущей машине. LibreOffice уже проверен.
-4. Installer acceptance на отдельных чистых Windows 10 и Windows 11: локальная Windows 11
+1. Полный Gemini contract suite остаётся внешне заблокированным provider free-tier HTTP 429:
+   повтор research contract и контрольный `it_coursework-1` остановились на quota после
+   bounded retries. Не считать это разрешённым skip и не запускать 12 golden runs до
+   восстановления quota.
+2. Microsoft Word COM matrix: Word не установлен на текущей машине. LibreOffice уже проверен.
+3. Installer acceptance на отдельных чистых Windows 10 и Windows 11: локальная Windows 11
    проверена, но не считается чистой средой.
-5. Code signing: сертификат отсутствует. После закрытия пунктов 1–4 разрешён unsigned beta.
+4. Code signing: сертификат отсутствует. После закрытия пунктов 1–3 разрешён unsigned beta.
 
 ## Как продолжить
 
@@ -61,21 +68,21 @@ Microsoft Word и отдельными чистыми Windows 10/11. Release-к�
 
 ```powershell
 # Локальные gates
-python -m pytest -q
-python -m ruff check src tests_v2 packaging
-python -m mypy src/papercraft --strict
+uv run --locked python -m pytest -q
+uv run --locked python -m ruff check src tests_v2 packaging
+uv run --locked python -m mypy src/papercraft --strict
 
 # Gemini contracts после восстановления quota
 $env:PAPERCRAFT_RUN_GEMINI_TESTS = "1"
-python -m pytest -q tests_v2/test_gemini_live.py
+uv run --locked python -m pytest -q tests_v2/test_gemini_live.py
 
 # Все шесть golden scenarios в двух повторах
 $env:PAPERCRAFT_RUN_GOLDEN_TESTS = "1"
-python -m pytest -q tests_v2/test_live_golden_e2e.py
+uv run --locked python -m pytest -q tests_v2/test_live_golden_e2e.py
 
 # Word + LibreOffice matrix на машине с установленным Word
 $env:PAPERCRAFT_RUN_OFFICE_TESTS = "1"
-python -m pytest -q tests_v2/test_office_integration.py
+uv run --locked python -m pytest -q tests_v2/test_office_integration.py
 
 # Windows build
 powershell -ExecutionPolicy Bypass -File packaging/build_windows.ps1 `

@@ -1,6 +1,6 @@
 # Stage 3 release acceptance
 
-Дата проверки: 2026-08-21. Целевая ветка: `codex/papercraft-v1`.
+Дата проверки: 2026-08-21, актуализация 2026-08-28. Целевая ветка: `codex/papercraft-v1`.
 
 ## Решение
 
@@ -13,7 +13,7 @@
 | Область | Результат | Проверка / основание |
 | --- | --- | --- |
 | Production Gemini policy | PASS | Роли закреплены за `gemini-3.7-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-image`, `gemini-embedding-2`; thinking policy задаётся явно |
-| Gemini live contract | PARTIAL / EXTERNAL BLOCKER | structured output + thinking PASS (включая восстановление после 429 за 210 с); Files/Vision lifecycle и embedding PASS; Search и background cancel получили 429; image model сообщил нулевую доступную квоту; успешный public `store=False` response не содержит provider interaction/request ID, поэтому локальный `client_request_id` хранится отдельно; повторная проверка двух historical File IDs получила 403 |
+| Gemini live contract | PARTIAL / EXTERNAL BLOCKER | 27.08 устранён HTTP 400 `ResearchPlan`: provider adapter удаляет только outbound `maxItems`, локальный лимит Pydantic остаётся 80; text-only input передаётся строкой; `google-genai==2.19.0`; новый research-role contract PASS один раз. Следующий повтор и golden E2E заблокированы provider free-tier HTTP 429. Исторически structured/thinking, Files/Vision и embedding PASS; Search, image и background cancel требуют свежего PASS. |
 | Source provenance | PASS | byte-exact `SourceSnapshot`, SHA-256, immutable storage и цепочка Claim → Evidence → Source → Snapshot → Locator → Bibliography → Citation |
 | Scholarly integrations | PASS | live Crossref/OpenAlex/DOI: 2 passed; official-source policy и SSRF checks включены |
 | OCR/Vision | PASS | 6/6 live fixtures: русский scan, table/numbers, handwriting, bad quality/uncertain number, caption, mixed PDF page locators |
@@ -21,7 +21,7 @@
 | Office matrix | PARTIAL / EXTERNAL BLOCKER | LibreOffice 26.2.5.2: 2 passed и PDF generated; Word COM недоступен на машине |
 | PDF visual QA | PARTIAL / EXTERNAL BLOCKER | live Gemini review первого цикла нашёл отсутствие page numbers, дефект исправлен; финальный Poppler/deterministic review PASS на 7 страницах, повторный Gemini review заблокирован 429 |
 | Fault/security | PASS | 41 passed: retry classes, single-layer 429 handling, auth/safety fail-closed, pause/resume/cancel, checkpoint, cleanup retry/reconciliation, stale lease, corrupt artifact rebuild, ZIP budgets, secret scanning, diagram injection, atomic write, Office failures |
-| Six live golden E2E ×2 | BLOCKED | все 12 runs реально выполнены за 48:18: 0 passed, 12 failed с `GeminiUnavailableError`/429; первый run дошёл до `extract_requirements`, остальные 11 остановились fail-closed на `preflight`; 12 отдельных acceptance JSON сохранены, новые File uploads очищены 2/2 |
+| Six live golden E2E ×2 | BLOCKED | historical 12 runs: 0 passed из-за `GeminiUnavailableError`/429. После исправления HTTP 400 новый `it_coursework-1` больше не получил invalid-argument, но остановился на `build_evidence_index` после bounded HTTP 429 retries; evidence: `build/stage3/live-golden-fixed-20260827-221148/it_coursework/run-1/acceptance.json`. 12/12 актуальных runs ещё не запускались. |
 | Desktop UI smoke | PASS | реальное PySide6 окно: create/import/save/start/retry/pause/resume/cancel, failure state, completed result fixture, preview, DOCX/PDF export, section rebuild; frozen GUI также запущен |
 | Installer | PARTIAL / EXTERNAL BLOCKER | PyInstaller + Inno Setup build PASS; non-elevated silent install, first launch, upgrade `beta.0 → beta.1`, frozen worker, uninstall и byte-exact сохранность изолированного `%LOCALAPPDATA%\PaperCraftAI\projects` PASS на Windows 11; отдельные clean Windows 10/11 недоступны |
 | Code signing | UNSIGNED | сертификат отсутствует; EXE и installer имеют `NotSigned` |
@@ -31,7 +31,9 @@
 
 - `ruff check src tests_v2 packaging`: PASS.
 - `mypy src/papercraft --strict`: PASS, 70 source files.
-- `pytest -q`: 99 passed, 28 explicit opt-in integration skips.
+- `uv run --locked python -m pytest -q`: 106 passed, 29 explicit opt-in integration skips.
+- `uv run --locked python -m pytest -q tests_v2/test_gemini_gateway.py tests_v2/test_autopilot_e2e.py tests_v2/test_fake_golden_e2e.py`: 34 passed.
+- `test_live_research_plan_structured_contract`: PASS один раз после adapter; последующий повтор BLOCKED HTTP 429.
 - Fault/security regression subset: 41 passed.
 - `PAPERCRAFT_RUN_RESEARCH_TESTS=1`: 2 passed.
 - `PAPERCRAFT_RUN_OFFICE_TESTS=1`: 2 passed.

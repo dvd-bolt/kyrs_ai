@@ -4,15 +4,17 @@
 
 Production-интеграции, provenance, OCR/Vision, DOCX safety, Office/PDF pipeline,
 fault handling, security hardening, desktop workflow и Windows packaging реализованы и
-проверены в доступном окружении. Локальный release-suite: 99 passed; security/fault subset:
-41 passed; live scholarly и LibreOffice jobs: по 2 passed. Собран и проверен unsigned
-installer `1.0.0-beta.1`.
+проверены в доступном окружении. Локальный release-suite: 106 passed, 29 opt-in skips;
+security/fault subset: 41 passed; live scholarly и LibreOffice jobs: по 2 passed. Собран и
+проверен unsigned installer `1.0.0-beta.1`.
 
-Релиз пока **BLOCKED** только обязательными внешними проверками: все 12 live golden runs
-выполнены, но 12/12 fail-closed из-за 429 текущей квоты Gemini; весь live contract также
-не завершён (image quota, Search/background cancel и historical provider cleanup permission).
-Word COM недоступен, отдельные clean Windows 10/11 отсутствуют. Release commit намеренно
-не создан. Полная матрица и хэши:
+HTTP 400 production `ResearchPlan` устранён: outbound JSON Schema удаляет только
+несовместимый provider keyword `maxItems`, а локальный Pydantic limit в 80 claims сохранён.
+Новый live research contract прошёл один раз. Релиз пока **BLOCKED** обязательными внешними
+проверками: provider free-tier quota вернула HTTP 429 при повторном контракте и первом новом
+golden-run, поэтому полный live contract и 12/12 golden runs не завершены. Word COM недоступен,
+отдельные clean Windows 10/11 отсутствуют, code-signing certificate не предоставлен. Release
+commit намеренно не создан. Полная матрица и хэши:
 [`STAGE3_ACCEPTANCE.md`](STAGE3_ACCEPTANCE.md).
 
 ## Этап 2 — блок 1: persistence и миграции

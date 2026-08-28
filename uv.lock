@@ -942,7 +942,7 @@ visuals = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'legacy-web'", specifier = ">=0.115,<1" },
-    { name = "google-genai", specifier = ">=2.17,<3" },
+    { name = "google-genai", specifier = "==2.19.0" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.130,<7" },
     { name = "keyring", marker = "extra == 'desktop'", specifier = ">=25,<27" },

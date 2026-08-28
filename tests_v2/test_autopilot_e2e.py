@@ -6,16 +6,18 @@ from papercraft.application import (
     ProductionStageFactory,
     ProjectService,
     SourceService,
+    prepare_autopilot,
 )
 from papercraft.config import AppSettings
 from papercraft.domain import (
     ArtifactKind,
     AutopilotOptions,
+    Claim,
     ProjectBrief,
     RunStatus,
     SourceRole,
 )
-from papercraft.infrastructure.gemini import FakeGeminiGateway, GroundedResult
+from papercraft.infrastructure.gemini import FakeGeminiGateway, GeminiGatewayError, GroundedResult
 from papercraft.infrastructure.research import URLVerificationResult
 
 
@@ -156,3 +158,41 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
     resources = workspace.repository.list_remote_resources(run.id)
     assert resources
     assert all(item.deleted_at is not None for item in resources)
+
+
+def test_research_plan_failure_clears_previous_claims_without_partial_writes(tmp_path: Path) -> None:
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(
+        ProjectBrief(
+            title="Research failure",
+            topic="Reliable automated systems",
+            prompt="Prepare an evidence-backed academic work",
+        ),
+        AutopilotOptions(consent_to_remote_processing=True, generate_pdf=False),
+    )
+    methodology = tmp_path / "methodology.txt"
+    methodology.write_text("The work must contain an introduction and conclusion.", encoding="utf-8")
+    SourceService(workspace).import_files([methodology], SourceRole.METHODOLOGY)
+    workspace.repository.save_claim(
+        Claim(
+            project_id=workspace.project.id,
+            text="Stale claim from an earlier failed attempt",
+            metadata={"search_query": "stale claim"},
+        )
+    )
+
+    fake = FakeGeminiGateway()
+    fake.enqueue("generate_structured", {"rules": [], "conflicts": []})
+    fake.enqueue("generate_structured", GeminiGatewayError("structured request rejected"))
+
+    runtime = prepare_autopilot(settings, workspace, gateway=fake)
+    run = runtime.service.execute(runtime.run.id)
+
+    assert run.status == RunStatus.FAILED
+    assert workspace.repository.list_claims(workspace.project.id) == []
+    failed_stage = next(
+        item
+        for item in workspace.repository.list_stages(run.id)
+        if item.name == "build_evidence_index"
+    )
+    assert failed_stage.failure_code == "GeminiGatewayError"
