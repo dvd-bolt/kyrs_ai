@@ -62,7 +62,7 @@ def test_classification_uses_name_and_extension(tmp_path: Path) -> None:
 
 def test_secret_scanner_redacts_secret() -> None:
     scanner = SecretScanner()
-    secret = "AIzaSyA123456789012345678901234567890123"
+    secret = "AIza" + ("0" * 35)
     findings = scanner.scan_text(f"GEMINI_API_KEY={secret}\n")
     assert findings
     assert findings[0].kind == "google_api_key"

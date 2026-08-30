@@ -1,4 +1,11 @@
-"""Cross-platform single-worker lease for one project."""
+"""Non-blocking OS leases for project and provider workers.
+
+The project lease prevents two workers from mutating one project's SQLite
+state.  The provider lease is deliberately rooted one level higher: all
+projects opened from the same PaperCraft projects directory share it.  This
+keeps separately launched beta workers from each creating an independent
+Gemini request coordinator and collectively exceeding the API quota.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +19,15 @@ class WorkerAlreadyRunningError(RuntimeError):
     pass
 
 
+class ProviderWorkerAlreadyRunningError(RuntimeError):
+    """Raised when another project is already using the shared Gemini worker."""
+
+
 class WorkerLease:
     """Hold a non-blocking OS lock for the lifetime of a worker command."""
+
+    error_type: type[RuntimeError] = WorkerAlreadyRunningError
+    error_message = "Для этого проекта уже запущен другой worker"
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -43,9 +57,7 @@ class WorkerLease:
                 )
         except (OSError, BlockingIOError) as error:
             stream.close()
-            raise WorkerAlreadyRunningError(
-                "Для этого проекта уже запущен другой worker"
-            ) from error
+            raise self.error_type(self.error_message) from error
         self._stream = stream
         return self
 
@@ -80,4 +92,29 @@ class WorkerLease:
         self.release()
 
 
-__all__ = ["WorkerAlreadyRunningError", "WorkerLease"]
+class ProviderWorkerLease(WorkerLease):
+    """One non-blocking Gemini-worker slot for a shared projects directory.
+
+    This is intentionally a process-level admission gate rather than another
+    request semaphore.  A provider coordinator only knows about requests in
+    its own worker process; holding this lease for the worker lifetime makes
+    the conservative beta limit effective across projects and app windows.
+    """
+
+    error_type = ProviderWorkerAlreadyRunningError
+    error_message = (
+        "Другой проект уже выполняет запросы к Gemini. "
+        "Дождитесь завершения текущей генерации и повторите попытку."
+    )
+
+    def __init__(self, projects_root: str | os.PathLike[str]) -> None:
+        root = Path(projects_root).expanduser().resolve()
+        super().__init__(root / ".papercraft-gemini-worker.lock")
+
+
+__all__ = [
+    "ProviderWorkerAlreadyRunningError",
+    "ProviderWorkerLease",
+    "WorkerAlreadyRunningError",
+    "WorkerLease",
+]

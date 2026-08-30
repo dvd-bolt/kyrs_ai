@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 from uuid import uuid4
@@ -33,16 +35,18 @@ from papercraft.domain import (
     RequirementSet,
     RevisionRecord,
     RunEvent,
+    RunStatus,
     Source,
     SourceFragment,
     SourceSnapshot,
     StageRun,
+    StageStatus,
 )
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -169,6 +173,23 @@ CREATE TABLE IF NOT EXISTS revisions (
     UNIQUE(project_id, kind, revision)
 );
 CREATE INDEX IF NOT EXISTS idx_revisions_project ON revisions(project_id, kind, revision DESC);
+CREATE TABLE IF NOT EXISTS section_revision_payloads (
+    revision_id TEXT PRIMARY KEY REFERENCES revisions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    section_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_section_revision_payloads_project
+    ON section_revision_payloads(project_id, section_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS plan_revision_payloads (
+    revision_id TEXT PRIMARY KEY REFERENCES revisions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_revision_payloads_project
+    ON plan_revision_payloads(project_id, created_at DESC);
 """
 
 
@@ -244,7 +265,7 @@ class SQLiteRepository:
 
     @staticmethod
     def _json(model: BaseModel) -> str:
-        return model.model_dump_json()
+        return str(model.model_dump_json())
 
     @staticmethod
     def _load(row: sqlite3.Row | None, model_type: type[TModel]) -> TModel | None:
@@ -367,6 +388,70 @@ class SQLiteRepository:
 
     def save_manuscript(self, manuscript: Manuscript) -> None:
         with self._session() as connection:
+            self._save_manuscript(connection, manuscript)
+
+    def _save_manuscript(self, connection: sqlite3.Connection, manuscript: Manuscript) -> None:
+        connection.execute(
+            """INSERT INTO manuscripts(id,project_id,revision,data,updated_at) VALUES(?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,data=excluded.data,
+               updated_at=excluded.updated_at""",
+            (
+                manuscript.id,
+                manuscript.project_id,
+                manuscript.revision,
+                self._json(manuscript),
+                manuscript.updated_at.isoformat(),
+            ),
+        )
+
+    def get_latest_manuscript(self, project_id: str) -> Manuscript | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT data FROM manuscripts WHERE project_id=? ORDER BY revision DESC LIMIT 1", (project_id,)
+            ).fetchone()
+        return self._load(row, Manuscript)
+
+    def commit_section_override(
+        self,
+        manuscript: Manuscript,
+        section_id: str,
+        payload: str,
+        *,
+        baseline_payload: str | None = None,
+    ) -> RevisionRecord:
+        """Atomically save a user-facing manuscript revision and its section history.
+
+        The full manuscript remains a normal immutable snapshot in
+        ``manuscripts``.  The compact section payload is stored independently
+        so an editor can compare or restore generated/user versions without
+        treating the manuscript JSON as mutable editor state.
+        """
+
+        normalized_section_id = section_id.strip()
+        if not normalized_section_id:
+            raise ValueError("section_id must not be blank")
+        if not payload:
+            raise ValueError("section revision payload must not be blank")
+        with self.transaction() as connection:
+            if baseline_payload is not None:
+                existing = connection.execute(
+                    """SELECT 1 FROM section_revision_payloads
+                       WHERE project_id=? AND section_id=? LIMIT 1""",
+                    (manuscript.project_id, normalized_section_id),
+                ).fetchone()
+                if existing is None:
+                    self._insert_section_revision(
+                        connection,
+                        manuscript.project_id,
+                        normalized_section_id,
+                        baseline_payload,
+                    )
+            record = self._insert_section_revision(
+                connection,
+                manuscript.project_id,
+                normalized_section_id,
+                payload,
+            )
             connection.execute(
                 """INSERT INTO manuscripts(id,project_id,revision,data,updated_at) VALUES(?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,data=excluded.data,
@@ -379,13 +464,165 @@ class SQLiteRepository:
                     manuscript.updated_at.isoformat(),
                 ),
             )
+        return record
 
-    def get_latest_manuscript(self, project_id: str) -> Manuscript | None:
+    @staticmethod
+    def _insert_section_revision(
+        connection: sqlite3.Connection,
+        project_id: str,
+        section_id: str,
+        payload: str,
+    ) -> RevisionRecord:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM revisions WHERE project_id=? AND kind='manuscript'",
+            (project_id,),
+        ).fetchone()
+        next_revision = int(row["revision"]) + 1
+        record = RevisionRecord(
+            project_id=project_id,
+            kind="manuscript",
+            revision=next_revision,
+            object_id=section_id,
+            sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        )
+        connection.execute(
+            """INSERT INTO revisions(id,project_id,kind,revision,data,created_at) VALUES(?,?,?,?,?,?)""",
+            (
+                record.id,
+                record.project_id,
+                record.kind,
+                record.revision,
+                record.model_dump_json(),
+                record.created_at.isoformat(),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO section_revision_payloads(revision_id,project_id,section_id,payload,created_at)
+               VALUES(?,?,?,?,?)""",
+            (record.id, project_id, section_id, payload, record.created_at.isoformat()),
+        )
+        return record
+
+    def list_section_revisions(self, project_id: str, section_id: str) -> list[RevisionRecord]:
+        with self._session() as connection:
+            rows = connection.execute(
+                """SELECT revisions.data
+                   FROM revisions
+                   INNER JOIN section_revision_payloads
+                     ON section_revision_payloads.revision_id = revisions.id
+                   WHERE section_revision_payloads.project_id=?
+                     AND section_revision_payloads.section_id=?
+                     AND revisions.kind='manuscript'
+                   ORDER BY revisions.revision DESC""",
+                (project_id, section_id),
+            ).fetchall()
+        return [RevisionRecord.model_validate_json(row["data"]) for row in rows]
+
+    def get_section_revision_payload(self, project_id: str, revision_id: str) -> str | None:
         with self._session() as connection:
             row = connection.execute(
-                "SELECT data FROM manuscripts WHERE project_id=? ORDER BY revision DESC LIMIT 1", (project_id,)
+                """SELECT payload FROM section_revision_payloads
+                   WHERE project_id=? AND revision_id=?""",
+                (project_id, revision_id),
             ).fetchone()
-        return self._load(row, Manuscript)
+        return None if row is None else str(row["payload"])
+
+    def commit_plan_override(
+        self,
+        blueprint: ProjectBlueprint,
+        payload: str,
+        *,
+        baseline_payload: str | None = None,
+        baseline_object_id: str | None = None,
+    ) -> RevisionRecord:
+        """Atomically save a user plan snapshot and its separately stored history."""
+
+        if not payload:
+            raise ValueError("plan revision payload must not be blank")
+        with self.transaction() as connection:
+            if baseline_payload is not None:
+                existing = connection.execute(
+                    "SELECT 1 FROM plan_revision_payloads WHERE project_id=? LIMIT 1",
+                    (blueprint.project_id,),
+                ).fetchone()
+                if existing is None:
+                    self._insert_plan_revision(
+                        connection,
+                        blueprint.project_id,
+                        baseline_object_id or blueprint.id,
+                        baseline_payload,
+                    )
+            record = self._insert_plan_revision(connection, blueprint.project_id, blueprint.id, payload)
+            connection.execute(
+                """INSERT INTO blueprints(id,project_id,data,created_at) VALUES(?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
+                (
+                    blueprint.id,
+                    blueprint.project_id,
+                    self._json(blueprint),
+                    blueprint.created_at.isoformat(),
+                ),
+            )
+        return record
+
+    @staticmethod
+    def _insert_plan_revision(
+        connection: sqlite3.Connection,
+        project_id: str,
+        blueprint_id: str,
+        payload: str,
+    ) -> RevisionRecord:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM revisions WHERE project_id=? AND kind='blueprint'",
+            (project_id,),
+        ).fetchone()
+        next_revision = int(row["revision"]) + 1
+        record = RevisionRecord(
+            project_id=project_id,
+            kind="blueprint",
+            revision=next_revision,
+            object_id=blueprint_id,
+            sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        )
+        connection.execute(
+            """INSERT INTO revisions(id,project_id,kind,revision,data,created_at) VALUES(?,?,?,?,?,?)""",
+            (
+                record.id,
+                record.project_id,
+                record.kind,
+                record.revision,
+                record.model_dump_json(),
+                record.created_at.isoformat(),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO plan_revision_payloads(revision_id,project_id,payload,created_at)
+               VALUES(?,?,?,?)""",
+            (record.id, project_id, payload, record.created_at.isoformat()),
+        )
+        return record
+
+    def list_plan_revisions(self, project_id: str) -> list[RevisionRecord]:
+        with self._session() as connection:
+            rows = connection.execute(
+                """SELECT revisions.data
+                   FROM revisions
+                   INNER JOIN plan_revision_payloads
+                     ON plan_revision_payloads.revision_id = revisions.id
+                   WHERE plan_revision_payloads.project_id=? AND revisions.kind='blueprint'
+                   ORDER BY revisions.revision DESC""",
+                (project_id,),
+            ).fetchall()
+        return [RevisionRecord.model_validate_json(row["data"]) for row in rows]
+
+    def get_plan_revision_payload(self, project_id: str, revision_id: str) -> str | None:
+        with self._session() as connection:
+            row = connection.execute(
+                """SELECT payload FROM plan_revision_payloads
+                   WHERE project_id=? AND revision_id=?""",
+                (project_id, revision_id),
+            ).fetchone()
+        return None if row is None else str(row["payload"])
 
     def save_run(self, run: GenerationRun) -> None:
         with self._session() as connection:
@@ -395,6 +632,196 @@ class SQLiteRepository:
                    updated_at=CURRENT_TIMESTAMP""",
                 (run.id, run.project_id, run.status.value, self._json(run)),
             )
+
+    def save_run_preserving_control(
+        self,
+        run: GenerationRun,
+        *,
+        replace_metadata_keys: Collection[str] = (),
+    ) -> GenerationRun:
+        """Save worker state without undoing a cross-process pause/cancel.
+
+        This is deliberately for in-flight worker bookkeeping only. Explicit
+        user actions (resume/retry/pause/cancel) use their own transition
+        methods and may intentionally change the durable status.
+        """
+
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM runs WHERE id=?", (run.id,)).fetchone()
+            current = self._load(row, GenerationRun)
+            if (
+                current is not None
+                and current.status in {RunStatus.PAUSED, RunStatus.CANCELLED}
+                and run.status != current.status
+            ):
+                return current
+            if current is not None:
+                # Cost is monotonic. Retain a usage write that committed after
+                # the caller obtained its in-memory GenerationRun instance.
+                run.cost = max(run.cost, current.cost)
+                merged_metadata = {**current.metadata, **run.metadata}
+                # A shallow merge normally protects independent worker
+                # bookkeeping from an older in-memory run.  Some keys are
+                # intentionally replaced, however: remote-file cleanup and
+                # terminal cleanup must be able to persist an empty value (or
+                # a deletion) instead of resurrecting the old database value.
+                for key in replace_metadata_keys:
+                    if key in run.metadata:
+                        merged_metadata[key] = run.metadata[key]
+                    else:
+                        merged_metadata.pop(key, None)
+                run.metadata = merged_metadata
+            connection.execute(
+                """INSERT INTO runs(id,project_id,status,data,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data,
+                   updated_at=CURRENT_TIMESTAMP""",
+                (run.id, run.project_id, run.status.value, self._json(run)),
+            )
+        return run
+
+    def add_run_usage(
+        self,
+        run_id: str,
+        estimated_cost: Decimal,
+        *,
+        maximum_cost: Decimal | None = None,
+    ) -> GenerationRun:
+        """Atomically add billable usage without overwriting UI state.
+
+        The desktop can pause/cancel a run from another process while section
+        workers are recording usage.  A standalone ``get_run`` followed by
+        ``save_run`` would write an old RUNNING JSON document over that user
+        action.  Load and update both run and current stage in one immediate
+        SQLite transaction instead.
+        """
+
+        if estimated_cost < 0:
+            raise ValueError("estimated_cost must not be negative")
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM runs WHERE id=?", (run_id,)).fetchone()
+            run = self._load(row, GenerationRun)
+            if run is None:
+                raise KeyError(run_id)
+            run.cost += estimated_cost
+            if maximum_cost is not None and run.cost >= maximum_cost:
+                run.metadata["cost_limit_exceeded"] = True
+            connection.execute(
+                """UPDATE runs SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (run.status.value, self._json(run), run.id),
+            )
+            if run.current_stage:
+                stage_row = connection.execute(
+                    "SELECT data FROM stages WHERE run_id=? AND name=?",
+                    (run.id, run.current_stage),
+                ).fetchone()
+                stage = self._load(stage_row, StageRun)
+                if stage is not None:
+                    stage.cost += estimated_cost
+                    connection.execute(
+                        """UPDATE stages SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (stage.status.value, self._json(stage), stage.id),
+                    )
+        return run
+
+    def transition_run_status(
+        self,
+        run_id: str,
+        *,
+        status: RunStatus,
+        allowed_from: set[RunStatus],
+        finished_at: datetime | None = None,
+    ) -> GenerationRun:
+        """Compare-and-set a run status while retaining concurrent cost data."""
+
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM runs WHERE id=?", (run_id,)).fetchone()
+            run = self._load(row, GenerationRun)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status not in allowed_from:
+                raise RuntimeError(f"run status {run.status.value} is not eligible for transition")
+            run.status = status
+            if finished_at is not None:
+                run.finished_at = finished_at
+            connection.execute(
+                """UPDATE runs SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (run.status.value, self._json(run), run.id),
+            )
+        return run
+
+    def prepare_retry(
+        self,
+        run_id: str,
+        *,
+        stage_names: Collection[str],
+        input_hash: str,
+        reason: str,
+        allowed_from: set[RunStatus],
+        maximum_cost: Decimal | None,
+    ) -> GenerationRun:
+        """Atomically invalidate a suffix and claim the retry transition.
+
+        A desktop cancel can race a retry request from another process.  The
+        status CAS and every affected ``StageRun`` reset therefore share one
+        ``BEGIN IMMEDIATE`` boundary: a crash or a cancel leaves either the
+        original run untouched or a complete retry-ready suffix, never a
+        partially queued DAG.
+        """
+
+        if not stage_names:
+            raise ValueError("stage_names must not be empty")
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM runs WHERE id=?", (run_id,)).fetchone()
+            run = self._load(row, GenerationRun)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status not in allowed_from:
+                raise RuntimeError(f"run status {run.status.value} is not eligible for retry")
+            if maximum_cost is not None and run.cost >= maximum_cost:
+                raise RuntimeError("run cost has reached the configured maximum")
+
+            rows = connection.execute(
+                "SELECT data FROM stages WHERE run_id=? ORDER BY stage_order,id", (run_id,)
+            ).fetchall()
+            for stage_row in rows:
+                stage = StageRun.model_validate_json(stage_row["data"])
+                if stage.name not in stage_names:
+                    continue
+                stage.status = StageStatus.QUEUED
+                stage.started_at = None
+                stage.finished_at = None
+                stage.error = None
+                stage.output_artifact_ids = []
+                stage.output_hash = ""
+                stage.failure_code = None
+                stage.failure_details = {}
+                stage.progress_current = 0
+                stage.progress_total = 0
+                stage.heartbeat_at = None
+                stage.checkpoint = {"invalidated": True, "reason": reason}
+                stage.input_hash = input_hash
+                connection.execute(
+                    """UPDATE stages SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (stage.status.value, self._json(stage), stage.id),
+                )
+
+            run.status = RunStatus.RETRYING
+            run.input_hash = input_hash
+            run.current_stage = None
+            run.finished_at = None
+            run.error = None
+            run.metadata.pop("terminal_hook_done", None)
+            # A retry may proceed only when a changed budget leaves room for
+            # another call.  Never clear a reached cap under the same budget.
+            if maximum_cost is None or run.cost < maximum_cost:
+                run.metadata.pop("cost_limit_exceeded", None)
+            else:
+                run.metadata["cost_limit_exceeded"] = True
+            connection.execute(
+                """UPDATE runs SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (run.status.value, self._json(run), run.id),
+            )
+        return run
 
     def get_run(self, run_id: str) -> GenerationRun | None:
         with self._session() as connection:
@@ -554,6 +981,37 @@ class SQLiteRepository:
         """Persist a citation marker independently from manuscript revisions."""
 
         self._save_object("citation", project_id, citation.id, citation.claim_id, citation)
+
+    def replace_citations_and_save_manuscript(
+        self, manuscript: Manuscript, citations: list[Citation]
+    ) -> None:
+        """Atomically publish a complete derived citation graph and manuscript.
+
+        Citation audit is an all-or-nothing rebuild: a validation failure or a
+        process error must leave the prior citations and manuscript untouched.
+        """
+
+        project_id = manuscript.project_id
+        with self.transaction() as connection:
+            connection.execute(
+                "DELETE FROM domain_objects WHERE kind='citation' AND project_id=?",
+                (project_id,),
+            )
+            for citation in citations:
+                connection.execute(
+                    """INSERT INTO domain_objects(kind,id,project_id,parent_id,data,updated_at)
+                       VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+                       ON CONFLICT(kind,id) DO UPDATE SET parent_id=excluded.parent_id,data=excluded.data,
+                       updated_at=CURRENT_TIMESTAMP""",
+                    (
+                        "citation",
+                        citation.id,
+                        project_id,
+                        citation.claim_id,
+                        self._json(citation),
+                    ),
+                )
+            self._save_manuscript(connection, manuscript)
 
     def list_citations(self, project_id: str) -> list[Citation]:
         return self._list_objects("citation", project_id, Citation)

@@ -35,6 +35,7 @@ from papercraft.domain import (
     QAReport,
     QASeverity,
     RequirementCategory,
+    RequirementCoverageReport,
     RequirementSet,
     Source,
     SourceSnapshot,
@@ -56,6 +57,7 @@ class QAGateContext:
     sources: Sequence[Source] = ()
     source_snapshots: Sequence[SourceSnapshot] = ()
     requirements: RequirementSet | None = None
+    requirement_coverage: RequirementCoverageReport | None = None
     artifact_paths: Mapping[str, str | Path] = field(default_factory=dict)
     docx_path: str | Path | None = None
     pdf_path: str | Path | None = None
@@ -88,6 +90,7 @@ class DeterministicQualityGate:
         self._check_datasets(context, issues, metrics)
         self._check_evidence_and_citations(context, flattened, issues, metrics)
         self._check_requirements(context, flattened, words, issues)
+        self._check_requirement_coverage(context, issues)
         self._check_docx(context.docx_path, issues, metrics)
         self._check_pdf(context.pdf_path, issues, metrics)
 
@@ -104,6 +107,7 @@ class DeterministicQualityGate:
             run_id=context.run_id,
             issues=issues,
             metrics=metrics,
+            requirement_coverage=context.requirement_coverage,
             summary=summary,
             metadata={"gate_version": 1, "deterministic": True},
         )
@@ -218,17 +222,54 @@ class DeterministicQualityGate:
         self, context: QAGateContext, blocks: list[Any], issues: list[QAIssue]
     ) -> None:
         fact_ids = {fact.id for fact in context.facts}
+        dataset_ids = {dataset.id for dataset in context.datasets}
         for block in blocks:
-            if not isinstance(block, ParagraphBlock):
+            if isinstance(block, ParagraphBlock):
+                numbers = re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", block.text)
+                if not numbers:
+                    continue
+                unknown = set(block.numeric_fact_ids) - fact_ids
+                if unknown:
+                    issues.append(self._issue(QASeverity.BLOCKER, "numeric_fact", f"Paragraph {block.id} references unknown facts: {sorted(unknown)}"))
+                elif not block.numeric_fact_ids:
+                    issues.append(self._issue(QASeverity.ERROR, "numeric_provenance", f"Paragraph {block.id} has numbers without FactLedger provenance"))
                 continue
-            numbers = re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", block.text)
-            if not numbers:
+
+            # Every inline numeric table needs a verified local provenance
+            # route.  This applies equally to generated and user-authored
+            # blocks; a model can generate literal cell values without a
+            # Dataset. Text-only tables remain freely editable.
+            if not isinstance(block, TableBlock):
+                continue
+            if not _table_has_numeric_values(block):
                 continue
             unknown = set(block.numeric_fact_ids) - fact_ids
             if unknown:
-                issues.append(self._issue(QASeverity.BLOCKER, "numeric_fact", f"Paragraph {block.id} references unknown facts: {sorted(unknown)}"))
-            elif not block.numeric_fact_ids:
-                issues.append(self._issue(QASeverity.ERROR, "numeric_provenance", f"Paragraph {block.id} has numbers without FactLedger provenance"))
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "numeric_fact",
+                        f"Table {block.id} references unknown facts: {sorted(unknown)}",
+                    )
+                )
+            if block.spec.dataset_id:
+                if block.spec.dataset_id not in dataset_ids:
+                    issues.append(
+                        self._issue(
+                            QASeverity.BLOCKER,
+                            "numeric_dataset",
+                            f"Table {block.id} references unknown dataset: {block.spec.dataset_id}",
+                        )
+                    )
+                continue
+            if not block.numeric_fact_ids:
+                issues.append(
+                    self._issue(
+                        QASeverity.ERROR,
+                        "numeric_provenance",
+                        f"Table {block.id} has numbers without dataset or FactLedger provenance",
+                    )
+                )
 
     def _check_datasets(
         self,
@@ -329,6 +370,25 @@ class DeterministicQualityGate:
         for block in blocks:
             if isinstance(block, ParagraphBlock):
                 referenced_citations.update(block.citation_ids)
+                if bool(block.metadata.get("user_override")):
+                    raw_claim_ids = block.metadata.get("claim_ids")
+                    raw_entry_ids = block.metadata.get("bibliography_entry_ids")
+                    claim_ids = raw_claim_ids if isinstance(raw_claim_ids, list) else []
+                    entry_ids = raw_entry_ids if isinstance(raw_entry_ids, list) else []
+                    if (
+                        bool(block.metadata.get("evidence_review_required"))
+                        or not claim_ids
+                        or not entry_ids
+                        or not block.citation_ids
+                    ):
+                        issues.append(
+                            self._issue(
+                                QASeverity.BLOCKER,
+                                "user_edit_evidence",
+                                "User-edited paragraph has no verified evidence binding",
+                                metadata={"block_id": block.id},
+                            )
+                        )
             elif isinstance(block, CitationBlock):
                 referenced_citations.add(block.citation_id)
         for citation_id in referenced_citations:
@@ -375,6 +435,99 @@ class DeterministicQualityGate:
                 required = str(rule.value).casefold()
                 if required not in headings:
                     issues.append(self._issue(QASeverity.ERROR, "required_heading", f"Required heading is missing: {rule.value}", requirement_rule_id=rule.id))
+
+    def _check_requirement_coverage(
+        self, context: QAGateContext, issues: list[QAIssue]
+    ) -> None:
+        report = context.requirement_coverage
+        if report is None:
+            return
+        if report.project_id != context.project_id:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "requirement_coverage_identity",
+                    "Requirement coverage report belongs to another project",
+                )
+            )
+            return
+
+        requirements = context.requirements
+        if requirements is not None:
+            if report.requirement_set_id != requirements.id:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_coverage_requirements",
+                        "Requirement coverage report belongs to another requirement set",
+                    )
+                )
+                return
+            expected_rule_ids = {rule.id for rule in requirements.rules}
+            reported_rule_ids = {entry.requirement_rule_id for entry in report.entries}
+            missing_rule_ids = sorted(expected_rule_ids - reported_rule_ids)
+            unknown_rule_ids = sorted(reported_rule_ids - expected_rule_ids)
+            if missing_rule_ids:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_coverage_incomplete",
+                        "Coverage report omits requirement rules: " + ", ".join(missing_rule_ids),
+                        metadata={"requirement_rule_ids": missing_rule_ids},
+                    )
+                )
+            if unknown_rule_ids:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_coverage_unknown_rule",
+                        "Coverage report contains unknown requirement rules: "
+                        + ", ".join(unknown_rule_ids),
+                        metadata={"requirement_rule_ids": unknown_rule_ids},
+                    )
+                )
+
+        for entry in sorted(report.entries, key=lambda item: item.requirement_rule_id):
+            metadata = {
+                "coverage_status": entry.status,
+                "block_ids": entry.block_ids,
+                "pdf_page_mappings": [item.model_dump(mode="json") for item in entry.pdf_page_mappings],
+                "artifact_id": entry.artifact_id,
+            }
+            if entry.criticality == "critical" and entry.status != "covered":
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_coverage",
+                        f"Critical requirement {entry.requirement_key} is {entry.status}",
+                        requirement_rule_id=entry.requirement_rule_id,
+                        metadata=metadata,
+                    )
+                )
+            if (
+                entry.criticality == "critical"
+                and entry.status == "covered"
+                and not entry.has_coverage_location
+            ):
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_coverage_traceability",
+                        f"Critical requirement {entry.requirement_key} is covered without a block or artifact location",
+                        requirement_rule_id=entry.requirement_rule_id,
+                        metadata=metadata,
+                    )
+                )
+            for gap in entry.evidence_gaps:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "requirement_evidence_gap",
+                        f"Requirement {entry.requirement_key} has an evidence gap: {gap}",
+                        requirement_rule_id=entry.requirement_rule_id,
+                        metadata={**metadata, "evidence_gap": gap},
+                    )
+                )
 
     def _check_docx(
         self, raw_path: str | Path | None, issues: list[QAIssue], metrics: list[Metric]
@@ -487,6 +640,31 @@ def _block_text(block: Any) -> str:
     if isinstance(block, FigureBlock):
         return block.caption
     return ""
+
+
+def _table_has_numeric_values(block: TableBlock) -> bool:
+    """Return whether an inline table carries a numeric factual value.
+
+    Only row values are inspected. A caption such as ``Table 1`` is a layout
+    label rather than a claim, whereas a number inside a cell needs a dataset
+    or FactLedger provenance.
+    """
+
+    return any(_json_value_has_number(value) for row in block.spec.rows for value in row)
+
+
+def _json_value_has_number(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return bool(re.search(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", value))
+    if isinstance(value, Mapping):
+        return any(_json_value_has_number(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_json_value_has_number(item) for item in value)
+    return False
 
 
 def _words(text: str) -> list[str]:

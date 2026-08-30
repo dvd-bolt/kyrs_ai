@@ -42,12 +42,33 @@ class ContextBuilder:
         selected_claims = [
             item
             for item in claims
-            if item.id in section.required_claim_ids or item.section_id in {None, section.id}
+            # Unassigned claims used to be copied into every section.  The
+            # blueprint now binds planned claims to their section, so only an
+            # explicit required claim may cross section boundaries.
+            if item.id in section.required_claim_ids or item.section_id == section.id
         ]
         evidence_ids = {item_id for claim in selected_claims for item_id in claim.evidence_ids}
         selected_evidence = [item for item in evidence if item.id in evidence_ids and item.verified]
-        selected_sources = {item.source_id for item in selected_evidence} | set(section.source_ids)
-        selected_bibliography = [item for item in bibliography if item.source_id in selected_sources]
+        # A fresh web verification can deduplicate a new URL record into an
+        # existing canonical bibliography entry.  Select that entry by the
+        # evidence binding rather than only by source_id; otherwise a writer
+        # could cite the discarded duplicate and later fail citation audit.
+        evidence_bibliography_ids = {
+            str(item.metadata.get("bibliography_entry_id") or "")
+            for item in selected_evidence
+            if str(item.metadata.get("bibliography_entry_id") or "")
+        }
+        sources_without_bibliography_binding = {
+            item.source_id
+            for item in selected_evidence
+            if not str(item.metadata.get("bibliography_entry_id") or "")
+        }
+        selected_sources = sources_without_bibliography_binding | set(section.source_ids)
+        selected_bibliography = [
+            item
+            for item in bibliography
+            if item.id in evidence_bibliography_ids or item.source_id in selected_sources
+        ]
         dataset_ids = set(section.required_fact_ids)
         selected_datasets = [item for item in datasets if not dataset_ids or item.id in dataset_ids]
         return SectionContext(

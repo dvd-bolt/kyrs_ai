@@ -14,8 +14,11 @@ from papercraft.infrastructure.gemini import (
     GeminiConfigurationError,
     GeminiGateway,
     GeminiGatewayError,
+    GeminiRequestCancelled,
     GeminiSafetyError,
+    GeminiUnavailableError,
     RemoteFile,
+    UsageRecord,
 )
 
 
@@ -35,6 +38,46 @@ class FakeInteractions:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class FakeStoredInteractions:
+    """Small SDK double for the stored background-interaction lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        create_response: object,
+        cancel_response: object,
+        get_responses: list[object],
+        delete_response: object = None,
+    ) -> None:
+        self.create_response = create_response
+        self.cancel_response = cancel_response
+        self.get_responses = list(get_responses)
+        self.delete_response = delete_response
+        self.calls: list[dict[str, object]] = []
+
+    @staticmethod
+    def _response(value: object) -> object:
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append({"operation": "create", **kwargs})
+        return self._response(self.create_response)
+
+    def cancel(self, *, id: str, **kwargs: object) -> object:
+        self.calls.append({"operation": "cancel", "id": id, **kwargs})
+        return self._response(self.cancel_response)
+
+    def get(self, *, id: str, **kwargs: object) -> object:
+        self.calls.append({"operation": "get", "id": id, **kwargs})
+        return self._response(self.get_responses.pop(0))
+
+    def delete(self, *, id: str, **kwargs: object) -> object:
+        self.calls.append({"operation": "delete", "id": id, **kwargs})
+        return self._response(self.delete_response)
 
 
 class FakeFiles:
@@ -239,6 +282,154 @@ def test_fake_gateway_is_explicit_and_schema_checked() -> None:
     assert fake.calls[0]["role"] == "writer"
 
 
+def test_fake_gateway_tracks_stored_background_interaction_lifecycle() -> None:
+    fake = FakeGeminiGateway()
+    fake.enqueue("start_background_text", "int_fake_123")
+
+    interaction_id = fake.start_background_text(prompt="safe fixture", role="research")
+
+    assert interaction_id == "int_fake_123"
+    assert fake.get_interaction_status(interaction_id) == "in_progress"
+    assert fake.cancel_interaction(interaction_id) == "cancelled"
+    assert fake.get_interaction_status(interaction_id) == "cancelled"
+    fake.delete_interaction(interaction_id)
+    assert fake.get_interaction_status(interaction_id) is None
+    assert fake.deleted_interactions == [interaction_id]
+
+
+def test_stored_background_interaction_lifecycle_is_safe_and_idempotent(tmp_path: Path) -> None:
+    class NotFound(RuntimeError):
+        status_code = 404
+
+    interaction_id = "int_background_123"
+    interactions = FakeStoredInteractions(
+        create_response=SimpleNamespace(id=interaction_id, status="in_progress", usage=None),
+        cancel_response=SimpleNamespace(status="in_progress"),
+        get_responses=[
+            SimpleNamespace(status="in_progress"),
+            SimpleNamespace(status="cancelled"),
+            NotFound("already deleted"),
+        ],
+        delete_response=NotFound("already deleted"),
+    )
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+    gateway = GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None)
+
+    assert gateway.start_background_text(prompt="safe fixture", role="research") == interaction_id
+    assert gateway.cancel_interaction(interaction_id) == "in_progress"
+    assert gateway.get_interaction_status(interaction_id) == "in_progress"
+    assert gateway.get_interaction_status(interaction_id) == "cancelled"
+    gateway.delete_interaction(interaction_id)
+    assert gateway.get_interaction_status(interaction_id) is None
+
+    assert [call["operation"] for call in interactions.calls] == [
+        "create",
+        "cancel",
+        "get",
+        "get",
+        "delete",
+        "get",
+    ]
+    assert interactions.calls[0]["store"] is True
+    assert interactions.calls[0]["background"] is True
+    for call in interactions.calls[1:]:
+        assert call["id"] == interaction_id
+        assert call["extra_headers"] == {"Api-Revision": "2026-05-20"}
+
+
+def test_remote_cleanup_and_background_lifecycle_bypass_a_spent_cost_limit(
+    tmp_path: Path,
+) -> None:
+    class SpentBudget:
+        def __call__(self, _record: UsageRecord) -> None:
+            raise AssertionError("Cleanup must not emit paid usage")
+
+        @staticmethod
+        def limit_reached() -> bool:
+            return True
+
+    class TrackingFiles(FakeFiles):
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def delete(self, *, name: str) -> None:
+            self.deleted.append(name)
+
+    interaction_id = "int_cleanup_123"
+    interactions = FakeStoredInteractions(
+        create_response=SimpleNamespace(id=interaction_id, status="in_progress", usage=None),
+        cancel_response=SimpleNamespace(status="cancelled"),
+        get_responses=[SimpleNamespace(status="cancelled")],
+    )
+    files = TrackingFiles()
+    gateway = GeminiGateway(
+        settings(tmp_path),
+        client=SimpleNamespace(interactions=interactions, files=files),
+        usage_sink=SpentBudget(),
+        sleep=lambda _: None,
+    )
+
+    with gateway.cancellation_scope(lambda: True):
+        gateway.delete_file("files/example")
+        assert gateway.cancel_interaction(interaction_id) == "cancelled"
+        assert gateway.get_interaction_status(interaction_id) == "cancelled"
+        gateway.delete_interaction(interaction_id)
+        with pytest.raises(GeminiRequestCancelled):
+            gateway.start_background_text(prompt="cancelled", role="research")
+
+    assert files.deleted == ["files/example"]
+    assert [call["operation"] for call in interactions.calls] == ["cancel", "get", "delete"]
+
+    # The exception is limited to idempotent control paths. Starting a new
+    # stored interaction remains a paid, capped provider request.
+    with pytest.raises(GeminiGatewayError, match="cost limit"):
+        gateway.start_background_text(prompt="blocked", role="research")
+    assert [call["operation"] for call in interactions.calls] == ["cancel", "get", "delete"]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["cancel_interaction", "get_interaction_status", "delete_interaction"],
+)
+def test_stored_background_interaction_operations_reject_unexpected_ids(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    interactions = FakeStoredInteractions(
+        create_response=SimpleNamespace(id="int_unused", status="in_progress", usage=None),
+        cancel_response=SimpleNamespace(status="cancelled"),
+        get_responses=[],
+    )
+    gateway = GeminiGateway(
+        settings(tmp_path),
+        client=SimpleNamespace(interactions=interactions, files=FakeFiles()),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(ValueError, match="Unexpected Gemini interaction ID"):
+        getattr(gateway, operation)("../not-an-interaction")
+
+    assert interactions.calls == []
+
+
+def test_stored_background_creation_rejects_an_unexpected_provider_id(tmp_path: Path) -> None:
+    interactions = FakeStoredInteractions(
+        create_response=SimpleNamespace(id="../unexpected", status="in_progress", usage=None),
+        cancel_response=SimpleNamespace(status="cancelled"),
+        get_responses=[],
+    )
+    gateway = GeminiGateway(
+        settings(tmp_path),
+        client=SimpleNamespace(interactions=interactions, files=FakeFiles()),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(ValueError, match="Unexpected Gemini interaction ID"):
+        gateway.start_background_text(prompt="safe fixture", role="research")
+
+    assert [call["operation"] for call in interactions.calls] == ["create"]
+
+
 def test_production_policy_is_pinned_to_stage_three_models() -> None:
     models = ModelPolicy()
     thinking = ThinkingPolicy()
@@ -256,6 +447,55 @@ def test_production_policy_is_pinned_to_stage_three_models() -> None:
     assert models.embedding == "gemini-embedding-2"
     assert thinking.classification == thinking.extraction == "minimal"
     assert thinking.critic == thinking.final_review == "high"
+
+
+def test_embeddings_record_conservative_usage_and_stop_after_the_cost_cap(
+    tmp_path: Path,
+) -> None:
+    class CostCapSink:
+        def __init__(self) -> None:
+            self.records: list[UsageRecord] = []
+            self.reached = False
+
+        def __call__(self, record: UsageRecord) -> None:
+            self.records.append(record)
+            self.reached = True
+
+        def limit_reached(self) -> bool:
+            return self.reached
+
+    class FakeModels:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def embed_content(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.0] * 768)],
+                usage=None,
+            )
+
+    models = FakeModels()
+    cost_cap = CostCapSink()
+    gateway = GeminiGateway(
+        settings(tmp_path),
+        client=SimpleNamespace(models=models),
+        usage_sink=cost_cap,
+    )
+    source_text = "проверяемое утверждение"
+
+    assert gateway.embed_texts([source_text]) == [[0.0] * 768]
+    assert len(cost_cap.records) == 1
+    record = cost_cap.records[0]
+    assert record.operation == "embed_texts"
+    assert record.model == "gemini-embedding-2"
+    assert record.input_tokens == len(source_text.encode("utf-8"))
+    assert record.estimated_cost > 0
+    assert record.metadata["input_tokens_source"] == "conservative_estimate"
+
+    with pytest.raises(GeminiGatewayError, match="cost limit"):
+        gateway.embed_texts(["must not reach the provider"])
+    assert len(models.calls) == 1
 
 
 def test_model_not_found_is_a_configuration_error(tmp_path: Path) -> None:
@@ -318,8 +558,78 @@ def test_authentication_failure_marks_run_as_waiting_input() -> None:
     assert GeminiAuthenticationError.waiting_input is True
 
 
-@pytest.mark.parametrize("status_code", [408, 500, 502, 503, 504])
-def test_transient_provider_failures_are_retried(tmp_path: Path, status_code: int) -> None:
+@pytest.mark.parametrize(
+    ("status_code", "error_type"),
+    [
+        (401, GeminiAuthenticationError),
+        (404, GeminiConfigurationError),
+        (418, GeminiGatewayError),
+    ],
+)
+def test_non_retryable_provider_errors_do_not_expose_raw_request_data(
+    tmp_path: Path,
+    status_code: int,
+    error_type: type[GeminiGatewayError],
+) -> None:
+    private_prompt = "PRIVATE_USER_PROMPT_MUST_NOT_APPEAR"
+    private_key = "sentinel-provider-key"
+
+    class PrivateProviderError(RuntimeError):
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.response = SimpleNamespace(
+                headers={
+                    "Authorization": "Bearer sentinel-bearer-value",
+                    "x-goog-request-id": "safe-provider-request-id",
+                }
+            )
+            super().__init__(
+                f"provider rejected {private_prompt}; Authorization: Bearer sentinel-bearer-value; "
+                f"https://provider.invalid/request?key={private_key}"
+            )
+
+    interactions = FakeInteractions([PrivateProviderError()])
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+
+    with pytest.raises(error_type) as raised:
+        GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
+
+    message = str(raised.value)
+    assert "safe-provider-request-id" in message
+    assert private_prompt not in message
+    assert private_key not in message
+    assert "sentinel-bearer-value" not in message
+
+
+def test_429_retry_exhaustion_does_not_expose_raw_provider_error_text(tmp_path: Path) -> None:
+    private_prompt = "PRIVATE_USER_PROMPT_MUST_NOT_APPEAR"
+    private_key = "sentinel-provider-key"
+
+    class PrivateTransientError(RuntimeError):
+        status_code = 429
+
+        def __init__(self) -> None:
+            super().__init__(
+                f"provider transient failure for {private_prompt}; "
+                f"Authorization: Bearer sentinel-bearer-value; key={private_key}"
+            )
+
+    interactions = FakeInteractions([PrivateTransientError(), PrivateTransientError()])
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+
+    with pytest.raises(GeminiUnavailableError) as raised:
+        GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
+
+    message = str(raised.value)
+    assert "failed after 2 attempts" in message
+    assert private_prompt not in message
+    assert private_key not in message
+    assert "sentinel-bearer-value" not in message
+    assert len(interactions.calls) == 2
+
+
+@pytest.mark.parametrize("status_code", [408, 409, 500, 502, 503, 504])
+def test_ambiguous_provider_failures_are_not_retried(tmp_path: Path, status_code: int) -> None:
     class Transient(RuntimeError):
         pass
 
@@ -328,16 +638,18 @@ def test_transient_provider_failures_are_retried(tmp_path: Path, status_code: in
     response = SimpleNamespace(output_text="OK", usage=None, status="completed", id="v1_ok")
     interactions = FakeInteractions([error, response])
     client = SimpleNamespace(interactions=interactions, files=FakeFiles())
-    GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
-    assert len(interactions.calls) == 2
+    with pytest.raises(GeminiUnavailableError, match="could not be safely retried"):
+        GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
+    assert len(interactions.calls) == 1
 
 
-def test_transport_timeout_is_retried(tmp_path: Path) -> None:
+def test_transport_timeout_is_not_retried(tmp_path: Path) -> None:
     response = SimpleNamespace(output_text="OK", usage=None, status="completed", id="v1_ok")
     interactions = FakeInteractions([TimeoutError("socket timeout"), response])
     client = SimpleNamespace(interactions=interactions, files=FakeFiles())
-    GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
-    assert len(interactions.calls) == 2
+    with pytest.raises(GeminiUnavailableError, match="could not be safely retried"):
+        GeminiGateway(settings(tmp_path), client=client, sleep=lambda _: None).health_check()
+    assert len(interactions.calls) == 1
 
 
 def test_malformed_structured_json_is_repaired_with_schema_feedback(tmp_path: Path) -> None:

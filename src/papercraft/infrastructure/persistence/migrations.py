@@ -27,7 +27,13 @@ class MigrationService:
     def plan(self, from_version: int, to_version: int = _SCHEMA_VERSION) -> MigrationPlan:
         if from_version < 1 or to_version < from_version or to_version > _SCHEMA_VERSION:
             raise ValueError("unsupported migration range")
-        steps = [] if from_version == to_version else ["add revision, backup and migration metadata tables"]
+        steps: list[str] = []
+        if from_version < 2 <= to_version:
+            steps.append("add revision, backup and migration metadata tables")
+        if from_version < 3 <= to_version:
+            steps.append("add append-only section revision payload history")
+        if from_version < 4 <= to_version:
+            steps.append("add append-only plan revision payload history")
         return MigrationPlan(from_version=from_version, to_version=to_version, steps=steps)
 
     def apply(self, plan: MigrationPlan, *, project_id: str | None = None) -> MigrationResult:

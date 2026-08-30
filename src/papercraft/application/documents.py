@@ -7,8 +7,9 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 
-from papercraft.domain import Artifact, ArtifactKind, GenerationRun
+from papercraft.domain import Artifact, ArtifactKind, GenerationRun, RunStatus
 from papercraft.infrastructure.persistence import sha256_file
 
 from .autopilot import AutopilotService, PipelineStage
@@ -32,11 +33,63 @@ class DocumentService:
         return sorted(pages)
 
     def latest(self, kind: ArtifactKind, run_id: str | None = None) -> Path:
+        return self._validated_path(self._latest_artifact(kind, run_id))
+
+    def export_block_reason(self, kind: ArtifactKind, run_id: str | None = None) -> str | None:
+        """Return the release-QA reason that currently prevents an export."""
+
+        try:
+            artifact = self._latest_artifact(kind, run_id)
+            self._assert_export_allowed(artifact)
+        except DocumentExportBlocked as error:
+            return str(error)
+        return None
+
+    def _latest_artifact(self, kind: ArtifactKind, run_id: str | None = None) -> Artifact:
         candidates = [artifact for artifact in self.artifacts(run_id) if artifact.kind == kind]
         if not candidates:
             raise FileNotFoundError(f"No {kind.value} artifact is available")
-        artifact = max(candidates, key=lambda item: item.created_at)
-        return self._validated_path(artifact)
+        return max(candidates, key=lambda item: item.created_at)
+
+    def _assert_export_allowed(self, artifact: Artifact) -> None:
+        """Require a matching passing release-QA report for final documents.
+
+        DOCX/PDF artifacts intentionally exist before Package so that QA can
+        inspect them.  They are not user-exportable until Package records a
+        passing report for this exact manuscript, blueprint and artifact.
+        """
+
+        if artifact.kind not in {ArtifactKind.DOCX, ArtifactKind.PDF}:
+            return
+        if not artifact.run_id:
+            raise DocumentExportBlocked("Export is blocked until release QA is completed.")
+        run = self.repository.get_run(artifact.run_id)
+        if run is None or run.status is not RunStatus.SUCCEEDED:
+            raise DocumentExportBlocked("Export is blocked until the release run succeeds.")
+        report = self.repository.get_latest_qa_report(artifact.run_id)
+        if report is None:
+            raise DocumentExportBlocked("Export is blocked until release QA is completed.")
+        if report.status.value == "fail":
+            raise DocumentExportBlocked("Export is blocked by unresolved release-QA issues.")
+        raw_scope = report.metadata.get("release_scope")
+        if not isinstance(raw_scope, dict):
+            raise DocumentExportBlocked("Export is blocked: the release-QA scope is unavailable.")
+        expected_artifact_id = raw_scope.get(
+            "docx_artifact_id" if artifact.kind is ArtifactKind.DOCX else "pdf_artifact_id"
+        )
+        if expected_artifact_id != artifact.id:
+            raise DocumentExportBlocked("Export is blocked until the latest document passes release QA.")
+        manuscript = self.repository.get_latest_manuscript(self.project_id)
+        if manuscript is None or raw_scope.get("manuscript_id") != manuscript.id:
+            raise DocumentExportBlocked("Export is blocked until the edited manuscript passes release QA.")
+        blueprint = self.repository.get_latest_blueprint(self.project_id)
+        if blueprint is None or raw_scope.get("blueprint_id") != blueprint.id:
+            raise DocumentExportBlocked("Export is blocked until the edited plan passes release QA.")
+        requirements = self.repository.get_latest_requirement_set(self.project_id)
+        if requirements is None or raw_scope.get("requirement_set_id") != requirements.id:
+            raise DocumentExportBlocked(
+                "Export is blocked until the current requirements pass release QA."
+            )
 
     @staticmethod
     def _validated_path(artifact: Artifact) -> Path:
@@ -74,12 +127,33 @@ class DocumentService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        run.metadata["rebuild_section_ids"] = [section_id]
-        self.repository.save_run(run)
+        # A dependent section receives predecessor conclusions in its writer
+        # context, so rebuilding an upstream section must also rebuild the
+        # downstream closure rather than leaving it internally stale.
+        target_ids = {section_id}
+        changed = True
+        while changed:
+            changed = False
+            for section in blueprint.outline.sections:
+                if section.id not in target_ids and set(section.depends_on) & target_ids:
+                    target_ids.add(section.id)
+                    changed = True
+        run.metadata["rebuild_section_ids"] = [
+            section.id
+            for section in sorted(blueprint.outline.sections, key=lambda item: item.order)
+            if section.id in target_ids
+        ]
+        # A rebuild commonly reuses the original run ID. This token separates
+        # new target drafts from its old artifacts, yet remains stable if the
+        # rebuild is paused and resumed.
+        run.metadata["rebuild_section_token"] = uuid4().hex
+        self.repository.save_run_preserving_control(run)
         return autopilot.retry_from(run_id, PipelineStage.GENERATE_SECTIONS)
 
     def export(self, kind: ArtifactKind, destination: str | Path, run_id: str | None = None) -> Path:
-        source = self.latest(kind, run_id)
+        artifact = self._latest_artifact(kind, run_id)
+        self._assert_export_allowed(artifact)
+        source = self._validated_path(artifact)
         target = Path(destination).expanduser().resolve()
         if target.is_dir():
             target = target / source.name
@@ -107,4 +181,8 @@ class DocumentService:
             raise RuntimeError(f"Unable to open {path}")
 
 
-__all__ = ["DocumentService"]
+class DocumentExportBlocked(RuntimeError):
+    """Raised when a final document has not passed release QA."""
+
+
+__all__ = ["DocumentExportBlocked", "DocumentService"]

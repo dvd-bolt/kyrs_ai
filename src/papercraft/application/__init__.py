@@ -8,9 +8,22 @@ from .autopilot import (
     StageOutcome,
 )
 from .context import ContextBuilder, SectionContext
-from .documents import DocumentService
+from .documents import DocumentExportBlocked, DocumentService
 from .projects import ProjectService, ProjectWorkspace, SourceService
-from .requirements import RequirementConflictError, RequirementResolver, coverage_for_rules
+from .requirements import (
+    RequirementConflictError,
+    RequirementResolver,
+    build_requirement_coverage_report,
+    coverage_for_rules,
+)
+from .revisions import (
+    PlanRevision,
+    PlanRevisionResult,
+    SectionInvalidation,
+    SectionRevision,
+    SectionRevisionResult,
+    SectionRevisionService,
+)
 from .runtime import AutopilotRuntime, prepare_autopilot
 from .stages import ProductionStageFactory, StageExecutionError
 from .usage import CostLimitExceeded, RunUsageTracker
@@ -20,8 +33,11 @@ __all__ = [
     "AutopilotService",
     "ContextBuilder",
     "CostLimitExceeded",
+    "DocumentExportBlocked",
     "DocumentService",
     "PipelineStage",
+    "PlanRevision",
+    "PlanRevisionResult",
     "ProductionStageFactory",
     "ProjectService",
     "ProjectWorkspace",
@@ -30,10 +46,15 @@ __all__ = [
     "RunQuery",
     "RunUsageTracker",
     "SectionContext",
+    "SectionInvalidation",
+    "SectionRevision",
+    "SectionRevisionResult",
+    "SectionRevisionService",
     "SourceService",
     "StageContext",
     "StageExecutionError",
     "StageOutcome",
+    "build_requirement_coverage_report",
     "coverage_for_rules",
     "prepare_autopilot",
 ]

@@ -27,6 +27,14 @@ ENV/
 env/
 .env
 .env.local
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+service-account*.json
+credentials*.json
+secrets/
 
 # IDEs and Editors
 .vscode/

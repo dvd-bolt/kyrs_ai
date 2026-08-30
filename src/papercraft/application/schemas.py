@@ -106,6 +106,10 @@ class BlueprintGeneration(GeneratedModel):
     target_words: int | None = Field(default=None, ge=0, le=1_000_000)
     target_pages: int | None = Field(default=None, ge=0, le=10_000)
     sections: list[PlannedSection] = Field(min_length=1)
+    # Keys are exact claim texts supplied in the planning prompt; values are
+    # PlannedSection.key values.  Kept optional for legacy saved responses,
+    # while _blueprint supplies a deterministic compatibility fallback.
+    claim_section_keys: dict[str, str] = Field(default_factory=dict)
     required_claims: list[str] = Field(default_factory=list)
     planned_visuals: list[PlannedVisual] = Field(default_factory=list)
 
@@ -115,6 +119,9 @@ class BlueprintGeneration(GeneratedModel):
         if len(keys) != len(set(keys)):
             raise ValueError("section keys must be unique")
         known = set(keys)
+        unknown_claim_sections = set(self.claim_section_keys.values()) - known
+        if unknown_claim_sections:
+            raise ValueError(f"unknown claim section: {sorted(unknown_claim_sections)}")
         for section in self.sections:
             unknown = set(section.depends_on_keys) - known
             if unknown:
@@ -161,6 +168,11 @@ class DraftTable(GeneratedModel):
     dataset_id: str | None = None
     headers: list[str] = Field(default_factory=list)
     rows: list[list[JsonValue]] = Field(default_factory=list)
+    # An inline numeric table which is not a rendering of a Dataset must name
+    # the FactLedger records that support its values.  Keeping this in the
+    # structured contract prevents a model response from silently losing the
+    # provenance before it becomes a domain TableBlock.
+    numeric_fact_ids: list[str] = Field(default_factory=list)
 
 
 class DraftChart(GeneratedModel):

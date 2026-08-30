@@ -1,5 +1,10 @@
 # Implementation status
 
+> **Historical stage record.** For the current LibreOffice-only private-beta
+> gate, use [`BETA_ACCEPTANCE_MATRIX.md`](BETA_ACCEPTANCE_MATRIX.md) and
+> [`BETA_ACCEPTANCE_RUNBOOK.md`](BETA_ACCEPTANCE_RUNBOOK.md). Microsoft Word
+> compatibility is not a beta criterion and is not used as a fallback.
+
 ## Этап 3 — critical integration, hardening и release acceptance
 
 Production-интеграции, provenance, OCR/Vision, DOCX safety, Office/PDF pipeline,

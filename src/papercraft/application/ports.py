@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Collection
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
@@ -19,7 +22,9 @@ from papercraft.domain import (
     QAReport,
     RemoteResource,
     RequirementSet,
+    RevisionRecord,
     RunEvent,
+    RunStatus,
     Source,
     SourceFragment,
     SourceSnapshot,
@@ -44,8 +49,62 @@ class RepositoryPort(Protocol):
     def save_blueprint(self, blueprint: ProjectBlueprint) -> None: ...
     def get_latest_blueprint(self, project_id: str) -> ProjectBlueprint | None: ...
     def save_manuscript(self, manuscript: Manuscript) -> None: ...
+    def replace_citations_and_save_manuscript(
+        self, manuscript: Manuscript, citations: list[Citation]
+    ) -> None: ...
     def get_latest_manuscript(self, project_id: str) -> Manuscript | None: ...
+    def commit_section_override(
+        self,
+        manuscript: Manuscript,
+        section_id: str,
+        payload: str,
+        *,
+        baseline_payload: str | None = None,
+    ) -> RevisionRecord: ...
+    def list_section_revisions(self, project_id: str, section_id: str) -> list[RevisionRecord]: ...
+    def get_section_revision_payload(self, project_id: str, revision_id: str) -> str | None: ...
+    def commit_plan_override(
+        self,
+        blueprint: ProjectBlueprint,
+        payload: str,
+        *,
+        baseline_payload: str | None = None,
+        baseline_object_id: str | None = None,
+    ) -> RevisionRecord: ...
+    def list_plan_revisions(self, project_id: str) -> list[RevisionRecord]: ...
+    def get_plan_revision_payload(self, project_id: str, revision_id: str) -> str | None: ...
     def save_run(self, run: GenerationRun) -> None: ...
+    def save_run_preserving_control(
+        self,
+        run: GenerationRun,
+        *,
+        replace_metadata_keys: Collection[str] = (),
+    ) -> GenerationRun: ...
+    def add_run_usage(
+        self,
+        run_id: str,
+        estimated_cost: Decimal,
+        *,
+        maximum_cost: Decimal | None = None,
+    ) -> GenerationRun: ...
+    def transition_run_status(
+        self,
+        run_id: str,
+        *,
+        status: RunStatus,
+        allowed_from: set[RunStatus],
+        finished_at: datetime | None = None,
+    ) -> GenerationRun: ...
+    def prepare_retry(
+        self,
+        run_id: str,
+        *,
+        stage_names: Collection[str],
+        input_hash: str,
+        reason: str,
+        allowed_from: set[RunStatus],
+        maximum_cost: Decimal | None,
+    ) -> GenerationRun: ...
     def get_run(self, run_id: str) -> GenerationRun | None: ...
     def list_runs(self, project_id: str) -> list[GenerationRun]: ...
     def save_stage(self, stage: StageRun) -> None: ...

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import RLock
 
 import pytest
 from PIL import Image, ImageDraw
@@ -28,6 +32,77 @@ class _LiveVisionReply(BaseModel):
     number: int
 
 
+def _required_positive_usd_limit(variable: str) -> Decimal:
+    """Fail closed before an opt-in live suite can spend provider quota."""
+
+    raw = os.getenv(variable, "").strip()
+    if not raw:
+        pytest.fail(f"{variable} must be set to a positive USD limit for live Gemini tests")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        pytest.fail(f"{variable} must be a decimal USD limit")
+    if not value.is_finite() or value <= 0:
+        pytest.fail(f"{variable} must be a finite positive USD limit")
+    return value
+
+
+@dataclass(slots=True)
+class _LiveUsageBudget:
+    """A process-wide ceiling for direct gateway contract tests.
+
+    Autopilot runs already have a persisted per-run cap. The isolated gateway
+    tests do not, so this sink exposes the same pre-admission ``limit_reached``
+    protocol and records the aggregate suite spend without logging prompts or
+    credentials.
+    """
+
+    limit: Decimal
+    spent: Decimal = Decimal("0")
+    _lock: RLock = field(default_factory=RLock, repr=False)
+
+    def __call__(self, record: UsageRecord) -> None:
+        with self._lock:
+            self.spent += record.estimated_cost
+            if self.spent > self.limit:
+                pytest.fail(
+                    "Live Gemini test cost exceeded PAPERCRAFT_LIVE_TEST_MAX_COST_USD "
+                    f"({self.spent} > {self.limit} USD)"
+                )
+
+    def limit_reached(self) -> bool:
+        with self._lock:
+            return self.spent >= self.limit
+
+
+@dataclass(slots=True)
+class _LiveUsageSink:
+    budget: _LiveUsageBudget
+    records: list[UsageRecord] | None = None
+
+    def __call__(self, record: UsageRecord) -> None:
+        self.budget(record)
+        if self.records is not None:
+            self.records.append(record)
+
+    def limit_reached(self) -> bool:
+        return self.budget.limit_reached()
+
+
+_LIVE_BUDGET: _LiveUsageBudget | None = None
+_BACKGROUND_POLL_ATTEMPTS = 20
+_BACKGROUND_POLL_SECONDS = 0.5
+
+
+def _live_budget() -> _LiveUsageBudget:
+    global _LIVE_BUDGET
+    if _LIVE_BUDGET is None:
+        _LIVE_BUDGET = _LiveUsageBudget(
+            _required_positive_usd_limit("PAPERCRAFT_LIVE_TEST_MAX_COST_USD")
+        )
+    return _LIVE_BUDGET
+
+
 def _live_gateway(
     tmp_path: Path,
     *,
@@ -35,10 +110,49 @@ def _live_gateway(
 ) -> GeminiGateway:
     if os.getenv("PAPERCRAFT_RUN_GEMINI_TESTS") != "1":
         pytest.skip("set PAPERCRAFT_RUN_GEMINI_TESTS=1 for live tests")
+    budget = _live_budget()
     if not CredentialSecretStore().get_api_key():
-        pytest.skip("Gemini is not configured in Credential Manager or GEMINI_API_KEY")
+        pytest.fail(
+            "PAPERCRAFT_RUN_GEMINI_TESTS=1 but Gemini is not configured in "
+            "Credential Manager or GEMINI_API_KEY"
+        )
     settings = AppSettings.from_environment().model_copy(update={"projects_root": tmp_path})
-    return GeminiGateway(settings, usage_sink=usage_sink.append if usage_sink is not None else None)
+    return GeminiGateway(settings, usage_sink=_LiveUsageSink(budget, usage_sink))
+
+
+def _wait_for_background_cancellation(gateway: GeminiGateway, interaction_id: str) -> None:
+    """Wait a bounded amount of time for the provider to finish cancellation."""
+
+    for _ in range(_BACKGROUND_POLL_ATTEMPTS):
+        status = gateway.get_interaction_status(interaction_id)
+        if status in {"cancelled", "canceled"}:
+            return
+        if status is None:
+            break
+        time.sleep(_BACKGROUND_POLL_SECONDS)
+    pytest.fail("Background interaction did not reach cancelled status before cleanup")
+
+
+def _wait_for_deleted_interaction(gateway: GeminiGateway, interaction_id: str) -> None:
+    """Prove the stored provider object is gone after the delete request."""
+
+    for _ in range(_BACKGROUND_POLL_ATTEMPTS):
+        if gateway.get_interaction_status(interaction_id) is None:
+            return
+        time.sleep(_BACKGROUND_POLL_SECONDS)
+    pytest.fail("Background interaction remained stored after deletion")
+
+
+def test_live_budget_requires_explicit_positive_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    global _LIVE_BUDGET
+    _LIVE_BUDGET = None
+    monkeypatch.delenv("PAPERCRAFT_LIVE_TEST_MAX_COST_USD", raising=False)
+    with pytest.raises(pytest.fail.Exception, match="PAPERCRAFT_LIVE_TEST_MAX_COST_USD"):
+        _live_budget()
+
+    monkeypatch.setenv("PAPERCRAFT_LIVE_TEST_MAX_COST_USD", "0.25")
+    assert _live_budget().limit == Decimal("0.25")
+    _LIVE_BUDGET = None
 
 
 def test_live_interactions_thinking_and_structured_output(tmp_path: Path) -> None:
@@ -166,13 +280,23 @@ def test_live_embedding_2_contract(tmp_path: Path) -> None:
 
 
 def test_live_background_cancellation(tmp_path: Path) -> None:
+    if os.getenv("PAPERCRAFT_RUN_BACKGROUND_LIFECYCLE_TESTS") != "1":
+        pytest.skip(
+            "set PAPERCRAFT_RUN_BACKGROUND_LIFECYCLE_TESTS=1 for the stored background lifecycle"
+        )
     gateway = _live_gateway(tmp_path)
-    interaction_id = gateway.start_background_text(
-        prompt=(
-            "Produce a highly detailed 50,000-word technical history of distributed systems, "
-            "with a long chronological appendix."
-        ),
-        role="research",
-    )
-    status = gateway.cancel_interaction(interaction_id)
-    assert "cancel" in status
+    interaction_id: str | None = None
+    try:
+        interaction_id = gateway.start_background_text(
+            prompt=(
+                "Write one 200-word technical note about safe cancellation of an "
+                "asynchronous task."
+            ),
+            role="research",
+        )
+        gateway.cancel_interaction(interaction_id)
+        _wait_for_background_cancellation(gateway, interaction_id)
+    finally:
+        if interaction_id is not None:
+            gateway.delete_interaction(interaction_id)
+            _wait_for_deleted_interaction(gateway, interaction_id)

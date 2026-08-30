@@ -10,9 +10,11 @@ from .gateway import (
     GeminiConfigurationError,
     GeminiGateway,
     GeminiGatewayError,
+    GeminiRequestCancelled,
     GeminiSafetyError,
     GeminiUnavailableError,
     GroundedResult,
+    ProviderRequestCoordinator,
     RemoteFile,
     UsageRecord,
 )
@@ -27,9 +29,11 @@ __all__ = [
     "GeminiGateway",
     "GeminiGatewayError",
     "GeminiPort",
+    "GeminiRequestCancelled",
     "GeminiSafetyError",
     "GeminiUnavailableError",
     "GroundedResult",
+    "ProviderRequestCoordinator",
     "RemoteFile",
     "UsageRecord",
 ]

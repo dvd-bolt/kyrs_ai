@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -275,6 +276,43 @@ def test_foreign_keys_prevent_orphan_pipeline_rows(tmp_path: Path) -> None:
     repository = SQLiteRepository(tmp_path / "project.db")
     with pytest.raises(sqlite3.IntegrityError):
         repository.save_run(GenerationRun(project_id="missing"))
+
+
+def test_preserving_run_save_keeps_usage_and_allows_metadata_cleanup(tmp_path: Path) -> None:
+    project = make_project()
+    paths = ProjectPaths.for_project(project.id, tmp_path, create=True)
+    repository = SQLiteRepository(paths.database)
+    repository.save_project(project)
+    run = GenerationRun(
+        project_id=project.id,
+        status=RunStatus.RUNNING,
+        metadata={
+            "remote_files": [{"name": "files/page-1"}],
+            "terminal_hook_done": True,
+        },
+    )
+    repository.save_run(run)
+    stale_run = repository.get_run(run.id)
+    assert stale_run is not None
+
+    repository.add_run_usage(
+        run.id,
+        Decimal("1.25"),
+        maximum_cost=Decimal("1.00"),
+    )
+    stale_run.metadata["remote_files"] = []
+    stale_run.metadata.pop("terminal_hook_done")
+    repository.save_run_preserving_control(
+        stale_run,
+        replace_metadata_keys={"remote_files", "terminal_hook_done"},
+    )
+
+    persisted = repository.get_run(run.id)
+    assert persisted is not None
+    assert persisted.cost == Decimal("1.25")
+    assert persisted.metadata["cost_limit_exceeded"] is True
+    assert persisted.metadata["remote_files"] == []
+    assert "terminal_hook_done" not in persisted.metadata
 
 
 def test_legacy_courseproject_import_is_additive_and_complete(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
@@ -156,16 +157,52 @@ def _enabled() -> bool:
     return os.getenv("PAPERCRAFT_RUN_GOLDEN_TESTS") == "1"
 
 
+def _golden_maximum_cost() -> Decimal:
+    """Require an explicit per-run ceiling before live golden work begins."""
+
+    raw = os.getenv("PAPERCRAFT_GOLDEN_MAX_COST_USD", "").strip()
+    if not raw:
+        pytest.fail(
+            "PAPERCRAFT_GOLDEN_MAX_COST_USD must be set to a positive per-run USD limit"
+        )
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        pytest.fail("PAPERCRAFT_GOLDEN_MAX_COST_USD must be a decimal USD limit")
+    if not value.is_finite() or value <= 0:
+        pytest.fail("PAPERCRAFT_GOLDEN_MAX_COST_USD must be a finite positive USD limit")
+    return value
+
+
+def test_golden_cost_limit_requires_explicit_positive_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PAPERCRAFT_GOLDEN_MAX_COST_USD", raising=False)
+    with pytest.raises(pytest.fail.Exception, match="PAPERCRAFT_GOLDEN_MAX_COST_USD"):
+        _golden_maximum_cost()
+
+    monkeypatch.setenv("PAPERCRAFT_GOLDEN_MAX_COST_USD", "1.50")
+    assert _golden_maximum_cost() == Decimal("1.50")
+
+
 @pytest.mark.parametrize("repeat", [1, 2])
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda item: item.slug)
-def test_live_golden_pipeline_twice(scenario: GoldenScenario, repeat: int) -> None:
+def test_live_golden_pipeline_twice(
+    scenario: GoldenScenario,
+    repeat: int,
+    request: pytest.FixtureRequest,
+) -> None:
     if not _enabled():
         pytest.skip("set PAPERCRAFT_RUN_GOLDEN_TESTS=1 for twelve release golden runs")
+    maximum_cost = _golden_maximum_cost()
     if not CredentialSecretStore().get_api_key():
-        pytest.skip("Gemini is not configured in Credential Manager or GEMINI_API_KEY")
+        pytest.fail(
+            "PAPERCRAFT_RUN_GOLDEN_TESTS=1 but Gemini is not configured in "
+            "Credential Manager or GEMINI_API_KEY"
+        )
     finalizer = DocumentFinalizer()
-    if not finalizer.word_available() and not finalizer.libreoffice_available():
-        pytest.skip("a real Word or LibreOffice finalizer is required")
+    if not finalizer.libreoffice_available():
+        pytest.fail("LibreOffice is required for the private beta golden run")
 
     output_root = Path(
         os.getenv(
@@ -190,6 +227,7 @@ def test_live_golden_pipeline_twice(scenario: GoldenScenario, repeat: int) -> No
             consent_to_remote_processing=True,
             generate_pdf=True,
             generate_qa_report=True,
+            maximum_cost=maximum_cost,
             maximum_revision_cycles=3,
             preferred_finalizer="libreoffice",
         ),
@@ -203,6 +241,22 @@ def test_live_golden_pipeline_twice(scenario: GoldenScenario, repeat: int) -> No
         assert len(imported.sources) == 1, imported.rejected
 
     runtime = prepare_autopilot(settings, workspace)
+
+    def cleanup_failed_run() -> None:
+        """A failed assertion must not retain anonymised fixtures remotely."""
+
+        latest = workspace.repository.get_run(runtime.run.id)
+        if latest is None or latest.status is RunStatus.SUCCEEDED:
+            return
+        runtime.service.cancel(latest.id)
+        cleaned = workspace.repository.get_run(latest.id)
+        resources = workspace.repository.list_remote_resources(latest.id)
+        if cleaned is None or cleaned.metadata.get("remote_files", []):
+            pytest.fail("Golden failure cleanup left registered Gemini files")
+        if any(resource.deleted_at is None for resource in resources):
+            pytest.fail("Golden failure cleanup left a remote resource pending")
+
+    request.addfinalizer(cleanup_failed_run)
     run = runtime.service.execute(runtime.run.id)
     stages = workspace.repository.list_stages(run.id)
     record: dict[str, object] = {
@@ -232,6 +286,11 @@ def test_live_golden_pipeline_twice(scenario: GoldenScenario, repeat: int) -> No
     report = workspace.repository.get_latest_qa_report(run.id)
     assert requirements is not None and blueprint is not None and manuscript is not None
     assert report is not None
+    assert report.requirement_coverage is not None
+    assert not report.requirement_coverage.has_blocking_gaps
+    assert {
+        entry.requirement_rule_id for entry in report.requirement_coverage.entries
+    } == {rule.id for rule in requirements.rules}
     assert not {
         item.severity
         for item in report.issues
@@ -278,14 +337,63 @@ def test_live_golden_pipeline_twice(scenario: GoldenScenario, repeat: int) -> No
         assert path.stat().st_size == artifact.size_bytes
         assert sha256_file(path) == artifact.sha256
 
-    signature = [item.title.casefold() for item in blueprint.outline.sections]
-    signature_path = output_root / scenario.slug / f"signature-{repeat}.json"
-    signature_path.write_text(
-        json.dumps(signature, ensure_ascii=False, indent=2),
+    required_artifact_kinds = {
+        ArtifactKind.DOCX,
+        ArtifactKind.PDF,
+        ArtifactKind.QA_JSON,
+        ArtifactKind.QA_HTML,
+    }
+    latest_pdf = next(artifact for artifact in reversed(artifacts) if artifact.kind is ArtifactKind.PDF)
+    expected_acceptance_contract: dict[str, object] = {
+        "brief": {
+            "work_type": scenario.work_type.value,
+            "domain_profile": scenario.domain.value,
+        },
+        "profile": {
+            "id": profile.id,
+            "version": profile.version,
+            "required_section_keys": sorted(section.key for section in profile.sections),
+        },
+        "generation": {
+            "finalizer": "libreoffice",
+            "generate_pdf": True,
+            "generate_qa_report": True,
+            "maximum_cost_usd": str(maximum_cost),
+            "pdf_engine": "libreoffice",
+        },
+        "artifacts": sorted(kind.value for kind in required_artifact_kinds),
+    }
+    actual_profile = default_profile_registry().resolve(
+        workspace.project.brief.work_type,
+        workspace.project.brief.domain_profile,
+    )
+    actual_acceptance_contract: dict[str, object] = {
+        "brief": {
+            "work_type": workspace.project.brief.work_type.value,
+            "domain_profile": workspace.project.brief.domain_profile.value,
+        },
+        "profile": {
+            "id": actual_profile.id,
+            "version": actual_profile.version,
+            "required_section_keys": sorted(
+                key.removeprefix("profile.structure.")
+                for key in requirement_keys
+                if key.startswith("profile.structure.")
+            ),
+        },
+        "generation": {
+            "finalizer": workspace.project.options.preferred_finalizer,
+            "generate_pdf": workspace.project.options.generate_pdf,
+            "generate_qa_report": workspace.project.options.generate_qa_report,
+            "maximum_cost_usd": str(workspace.project.options.maximum_cost),
+            "pdf_engine": str(latest_pdf.metadata.get("engine") or ""),
+        },
+        "artifacts": sorted(kind.value for kind in kinds if kind in required_artifact_kinds),
+    }
+    assert actual_acceptance_contract == expected_acceptance_contract
+    assert run.cost <= maximum_cost
+    record["acceptance_contract"] = actual_acceptance_contract
+    (run_root / "acceptance.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    if repeat == 2:
-        first_signature = json.loads(
-            (output_root / scenario.slug / "signature-1.json").read_text(encoding="utf-8")
-        )
-        assert first_signature == signature

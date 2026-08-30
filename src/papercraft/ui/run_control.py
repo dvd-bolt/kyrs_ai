@@ -14,6 +14,15 @@ class RunRepository(Protocol):
 
     def save_run(self, run: GenerationRun) -> None: ...
 
+    def transition_run_status(
+        self,
+        run_id: str,
+        *,
+        status: RunStatus,
+        allowed_from: set[RunStatus],
+        finished_at: datetime | None = None,
+    ) -> GenerationRun: ...
+
     def append_event(self, event: RunEvent) -> int: ...
 
 
@@ -33,14 +42,24 @@ class RunController:
 
     def pause(self, run_id: str) -> GenerationRun:
         run = self.require(run_id)
-        if run.status not in {
+        allowed = {
             RunStatus.RUNNING,
             RunStatus.RETRYING,
             RunStatus.WAITING_INPUT,
-        }:
+        }
+        if run.status not in allowed:
             raise RunControlError(f"Запуск в состоянии {run.status.value} нельзя поставить на паузу")
-        run.status = RunStatus.PAUSED
-        self.repository.save_run(run)
+        try:
+            run = self.repository.transition_run_status(
+                run_id,
+                status=RunStatus.PAUSED,
+                allowed_from=allowed,
+            )
+        except RuntimeError:
+            current = self.require(run_id)
+            raise RunControlError(
+                f"Запуск в состоянии {current.status.value} нельзя поставить на паузу"
+            ) from None
         self.repository.append_event(
             RunEvent(
                 run_id=run.id,
@@ -56,9 +75,20 @@ class RunController:
             raise RunControlError("Завершённый запуск нельзя отменить")
         if run.status == RunStatus.CANCELLED:
             return run
-        run.status = RunStatus.CANCELLED
-        run.finished_at = datetime.now(UTC)
-        self.repository.save_run(run)
+        try:
+            run = self.repository.transition_run_status(
+                run_id,
+                status=RunStatus.CANCELLED,
+                allowed_from=set(RunStatus) - {RunStatus.SUCCEEDED, RunStatus.CANCELLED},
+                finished_at=datetime.now(UTC),
+            )
+        except RuntimeError:
+            current = self.require(run_id)
+            if current.status == RunStatus.CANCELLED:
+                return current
+            if current.status == RunStatus.SUCCEEDED:
+                raise RunControlError("Завершённый запуск нельзя отменить") from None
+            raise RunControlError(f"Запуск в состоянии {current.status.value} нельзя отменить") from None
         self.repository.append_event(
             RunEvent(
                 run_id=run.id,

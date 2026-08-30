@@ -69,6 +69,26 @@ class RetryPolicy(BaseModel):
     jitter_seconds: float = Field(default=0.5, ge=0, le=10)
 
 
+class PerformancePolicy(BaseModel):
+    """Bounded concurrency and cache settings for a generation run.
+
+    The limits are deliberately conservative.  They prevent a faster stage
+    scheduler from turning one project into an uncontrolled burst of provider
+    requests, while still allowing independent work to proceed in parallel.
+    """
+
+    max_concurrent_requests: int = Field(default=3, ge=1, le=16)
+    max_research_requests: int = Field(default=2, ge=1, le=16)
+    max_section_requests: int = Field(default=3, ge=1, le=16)
+    max_image_requests: int = Field(default=2, ge=1, le=16)
+    web_cache_ttl_hours: int = Field(default=168, ge=1, le=24 * 365)
+    adaptive_throttling: bool = True
+    recovery_successes: int = Field(default=8, ge=1, le=100)
+    # Keep the safe one-worker rollback path as the production default until
+    # live quota recovery and the golden-run gate have been completed.
+    parallel_generation_enabled: bool = False
+
+
 class TokenPrice(BaseModel):
     input_per_million: Decimal = Field(ge=0)
     output_per_million: Decimal = Field(ge=0)
@@ -107,6 +127,7 @@ class AppSettings(BaseModel):
     model_policy: ModelPolicy = Field(default_factory=ModelPolicy)
     thinking_policy: ThinkingPolicy = Field(default_factory=ThinkingPolicy)
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    performance_policy: PerformancePolicy = Field(default_factory=PerformancePolicy)
     pricing_policy: PricingPolicy = Field(default_factory=PricingPolicy)
     request_timeout_seconds: float = Field(default=180.0, ge=5, le=1800)
     minimum_free_space_mb: int = Field(default=1024, ge=128)

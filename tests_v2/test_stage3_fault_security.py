@@ -337,17 +337,24 @@ def test_word_failure_falls_back_to_libreoffice_without_silent_success(
     assert "simulated Word COM failure" in result.warnings[0]
 
 
-def test_all_office_failures_are_release_blocking(
+def test_default_beta_finalizer_does_not_fall_back_to_word_on_libreoffice_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docx = tmp_path / "document.docx"
     docx.write_bytes(b"PK\x03\x04fixture")
     finalizer = DocumentFinalizer()
 
+    attempts: list[str] = []
+
+    def word_must_not_run(*_args, **_kwargs):
+        attempts.append("word")
+        raise AssertionError("the LibreOffice beta path must not invoke Word")
+
     def fail(*_args, **_kwargs):
         raise FinalizationError("simulated finalizer failure")
 
-    monkeypatch.setattr(finalizer, "_finalize_with_word", fail)
+    monkeypatch.setattr(finalizer, "_finalize_with_word", word_must_not_run)
     monkeypatch.setattr(finalizer, "_convert_with_libreoffice", fail)
-    with pytest.raises(FinalizationUnavailableError, match=r"Word.*LibreOffice"):
+    with pytest.raises(FinalizationUnavailableError, match=r"LibreOffice"):
         finalizer.finalize(docx, pdf_path=tmp_path / "document.pdf")
+    assert attempts == []

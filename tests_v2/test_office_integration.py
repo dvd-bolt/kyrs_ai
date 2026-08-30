@@ -10,7 +10,7 @@ import pytest
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 from papercraft.domain import (
     AppendixBlock,
@@ -29,9 +29,52 @@ from papercraft.infrastructure.render import DocumentFinalizer, DocxRenderer, Re
 pytestmark = pytest.mark.office
 
 
+def test_mixed_page_layout_is_structurally_valid_without_live_office(tmp_path: Path) -> None:
+    manuscript = Manuscript(
+        project_id="office-layout-structure",
+        title="LibreOffice layout structure",
+        blocks=[
+            HeadingBlock(text="INTRODUCTION", level=1),
+            ParagraphBlock(text="Portrait content before a wide table."),
+            TableBlock(
+                spec=TableSpec(
+                    caption="Wide table",
+                    headers=[f"Column {index}" for index in range(1, 8)],
+                    rows=[[f"R{row}C{column}" for column in range(1, 8)] for row in range(1, 4)],
+                )
+            ),
+            HeadingBlock(text="CONCLUSION", level=1),
+            ParagraphBlock(text="Portrait content after the wide table."),
+        ],
+    )
+    docx = tmp_path / "layout-structure.docx"
+    DocxRenderer(RenderConfig()).render(manuscript, docx)
+
+    loaded = Document(docx)
+    assert len(loaded.sections) >= 3
+    assert loaded.sections[0].page_height > loaded.sections[0].page_width
+    landscape_sections = [section for section in loaded.sections if section.orientation == 1]
+    assert landscape_sections
+    assert all(section.page_width > section.page_height for section in landscape_sections)
+    assert loaded.sections[-1].page_height > loaded.sections[-1].page_width
+    assert all(section.header.is_linked_to_previous for section in loaded.sections[1:])
+    assert all(section.footer.is_linked_to_previous for section in loaded.sections[1:])
+
+    with zipfile.ZipFile(docx) as archive:
+        document_xml = archive.read("word/document.xml")
+        footer_parts = [
+            archive.read(name)
+            for name in archive.namelist()
+            if name.startswith("word/footer") and name.endswith(".xml")
+        ]
+    assert b"tblHeader" in document_xml
+    assert b"cantSplit" in document_xml
+    assert any(b"PAGE" in item for item in footer_parts)
+
+
 @pytest.mark.skipif(
     os.getenv("PAPERCRAFT_RUN_OFFICE_TESTS") != "1",
-    reason="set PAPERCRAFT_RUN_OFFICE_TESTS=1 to exercise installed Word/LibreOffice",
+    reason="set PAPERCRAFT_RUN_OFFICE_TESTS=1 to exercise installed LibreOffice",
 )
 def test_installed_office_updates_docx_and_exports_valid_pdf(tmp_path: Path) -> None:
     manuscript = Manuscript(
@@ -52,11 +95,12 @@ def test_installed_office_updates_docx_and_exports_valid_pdf(tmp_path: Path) -> 
     DocxRenderer(RenderConfig()).render(manuscript, docx)
 
     finalizer = DocumentFinalizer(timeout_seconds=120)
-    if not finalizer.word_available() and not finalizer.libreoffice_available():
-        pytest.skip("neither Word automation nor LibreOffice is available")
-    result = finalizer.finalize(docx, pdf_path=pdf, preferred="auto", require_pdf=True)
+    if not finalizer.libreoffice_available():
+        pytest.skip("LibreOffice is not available")
+    result = finalizer.finalize(docx, pdf_path=pdf, preferred="libreoffice", require_pdf=True)
 
-    assert result.engine in {"word", "libreoffice"}
+    assert result.engine == "libreoffice"
+    assert result.fields_updated
     assert result.pdf is not None
     assert result.pdf.valid_header
     assert result.pdf.size_bytes > 1_000
@@ -83,11 +127,96 @@ def _append_ref_field(path: Path, bookmark: str) -> None:
     document.save(path)
 
 
+def _assert_rendered_pdf_feature_matrix(pdf_path: Path, preview_root: Path) -> dict[str, object]:
+    """Check the actual LibreOffice PDF, then retain page PNGs for visual review.
+
+    OOXML checks above prove that the renderer requested the right fields and
+    sections.  This check deliberately inspects the *post-LibreOffice* PDF so
+    a regression in field updates, Cyrillic glyphs, table layout, or section
+    orientation cannot pass on the DOCX structure alone.
+    """
+
+    import pymupdf
+
+    preview_root.mkdir(parents=True, exist_ok=True)
+    document = pymupdf.open(pdf_path)
+    try:
+        assert len(document) >= 7
+        page_texts = [page.get_text() for page in document]
+        combined_text = "\n".join(page_texts)
+        for expected in (
+            "Тестовый университет",
+            "СОДЕРЖАНИЕ",
+            "ВВЕДЕНИЕ",
+            "ПРИЛОЖЕНИЕ А",
+            "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ",
+            "Таблица 1",
+            "Широкая таблица Office matrix",
+            "Колонка 8",
+            "R17C8",
+            "Рисунок 1",
+            "Контрольное изображение",
+            "√",
+            "(1)",
+        ):
+            assert expected in combined_text
+        assert "\ufffd" not in combined_text
+
+        toc_text = next(text for text in page_texts if "СОДЕРЖАНИЕ" in text)
+        assert "ВВЕДЕНИЕ" in toc_text and "ПРИЛОЖЕНИЕ А" in toc_text
+        table_page_index = next(
+            index for index, text in enumerate(page_texts) if "Широкая таблица Office matrix" in text
+        )
+        assert document[table_page_index].rect.width > document[table_page_index].rect.height
+
+        cyrillic_fonts: set[str] = set()
+        preview_paths: list[str] = []
+        for index, page in enumerate(document, start=1):
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        span_text = str(span.get("text", ""))
+                        if any("А" <= char <= "я" or char in "Ёё" for char in span_text):
+                            font_name = str(span.get("font", "")).strip()
+                            if font_name:
+                                cyrillic_fonts.add(font_name)
+
+            text_blocks = [block for block in page.get_text("blocks") if block[4].strip()]
+            assert text_blocks, f"PDF page {index} has no visible text blocks"
+            for x0, y0, x1, y1, *_ in text_blocks:
+                assert -1 <= x0 <= x1 <= page.rect.width + 1
+                assert -1 <= y0 <= y1 <= page.rect.height + 1
+
+            preview_path = preview_root / f"page-{index:04d}.png"
+            page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False).save(preview_path)
+            preview_paths.append(str(preview_path))
+            with Image.open(preview_path) as preview:
+                assert preview.width > 600 and preview.height > 600
+                assert (preview.width > preview.height) is (page.rect.width > page.rect.height)
+                assert ImageStat.Stat(preview.convert("L")).extrema[0][0] < 128
+
+            if index > 1:
+                footer_text = " ".join(
+                    block[4] for block in text_blocks if block[1] > page.rect.height * 0.85
+                )
+                assert str(index) in footer_text
+
+        assert cyrillic_fonts, "The rendered PDF has no named font span containing Cyrillic text"
+        return {
+            "pages": len(document),
+            "landscape_page": table_page_index + 1,
+            "cyrillic_fonts": sorted(cyrillic_fonts),
+            "page_previews": preview_paths,
+        }
+    finally:
+        document.close()
+
+
 @pytest.mark.skipif(
     os.getenv("PAPERCRAFT_RUN_OFFICE_TESTS") != "1",
-    reason="set PAPERCRAFT_RUN_OFFICE_TESTS=1 to exercise installed Word/LibreOffice",
+    reason="set PAPERCRAFT_RUN_OFFICE_TESTS=1 to exercise installed LibreOffice",
 )
-def test_real_office_feature_matrix(tmp_path: Path) -> None:
+def test_real_libreoffice_feature_matrix(tmp_path: Path) -> None:
     output_root = Path(os.getenv("PAPERCRAFT_OFFICE_OUTPUT_DIR", str(tmp_path))).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     image = output_root / "office-matrix-figure.png"
@@ -190,14 +319,8 @@ def test_real_office_feature_matrix(tmp_path: Path) -> None:
             "appendix": True,
         },
     }
-    if finalizer.word_available():
-        word_pdf = output_root / "office-feature-matrix-word.pdf"
-        word_result = finalizer.finalize(docx, pdf_path=word_pdf, preferred="word")
-        assert word_result.engine == "word"
-        matrix["microsoft_word"] = {"status": "passed", "pdf": str(word_pdf)}
-    else:
-        matrix["microsoft_word"] = {"status": "unavailable", "reason": "Word COM launch failed"}
-    assert finalizer.libreoffice_available()
+    if not finalizer.libreoffice_available():
+        pytest.skip("LibreOffice is not available")
     libreoffice_pdf = output_root / "office-feature-matrix-libreoffice.pdf"
     libreoffice_result = finalizer.finalize(
         docx,
@@ -206,24 +329,15 @@ def test_real_office_feature_matrix(tmp_path: Path) -> None:
     )
     assert libreoffice_result.engine == "libreoffice"
     assert libreoffice_result.pdf is not None and libreoffice_result.pdf.valid_header
-    import pymupdf
-
-    rendered_pdf = pymupdf.open(libreoffice_pdf)
-    try:
-        for page_number in (4, 5):
-            page = rendered_pdf[page_number - 1]
-            footer_text = " ".join(
-                block[4]
-                for block in page.get_text("blocks")
-                if block[1] > page.rect.height * 0.85
-            )
-            assert str(page_number) in footer_text
-    finally:
-        rendered_pdf.close()
+    visual_qa = _assert_rendered_pdf_feature_matrix(
+        libreoffice_pdf,
+        output_root / "office-matrix-pages",
+    )
     matrix["libreoffice"] = {
         "status": "passed",
         "pdf": str(libreoffice_pdf),
         "size_bytes": libreoffice_result.pdf.size_bytes,
+        "visual_qa": visual_qa,
     }
     (output_root / "office-matrix.json").write_text(
         json.dumps(matrix, ensure_ascii=False, indent=2),

@@ -37,7 +37,7 @@ def _connect(port: int) -> Any:
     raise RuntimeError("could not connect to the local LibreOffice UNO socket") from last_error
 
 
-def update_and_export(docx: Path, pdf: Path, port: int) -> None:
+def update_and_export(docx: Path, pdf: Path, updated_docx: Path, port: int) -> None:
     context = _connect(port)
     desktop = context.ServiceManager.createInstanceWithContext(
         "com.sun.star.frame.Desktop",
@@ -45,20 +45,21 @@ def update_and_export(docx: Path, pdf: Path, port: int) -> None:
     )
     source_url = uno.systemPathToFileUrl(str(docx.resolve()))
     update_mode = uno.getConstantByName("com.sun.star.document.UpdateDocMode.FULL_UPDATE")
-    document = desktop.loadComponentFromURL(
-        source_url,
-        "_blank",
-        0,
-        (
-            _property("Hidden", True),
-            _property("ReadOnly", True),
-            _property("UpdateDocMode", update_mode),
-            _property("MacroExecutionMode", 0),
-        ),
-    )
-    if document is None:
-        raise RuntimeError("LibreOffice could not open the DOCX")
+    document = None
     try:
+        document = desktop.loadComponentFromURL(
+            source_url,
+            "_blank",
+            0,
+            (
+                _property("Hidden", True),
+                _property("ReadOnly", True),
+                _property("UpdateDocMode", update_mode),
+                _property("MacroExecutionMode", 0),
+            ),
+        )
+        if document is None:
+            raise RuntimeError("LibreOffice could not open the DOCX")
         if hasattr(document, "updateLinks"):
             document.updateLinks()
         indexes = document.getDocumentIndexes()
@@ -72,13 +73,24 @@ def update_and_export(docx: Path, pdf: Path, port: int) -> None:
         if hasattr(document, "refresh"):
             document.refresh()
         pdf.parent.mkdir(parents=True, exist_ok=True)
+        updated_docx.parent.mkdir(parents=True, exist_ok=True)
+        document.storeToURL(
+            uno.systemPathToFileUrl(str(updated_docx.resolve())),
+            (
+                _property("FilterName", "Office Open XML Text"),
+                _property("Overwrite", True),
+            ),
+        )
         document.storeToURL(
             uno.systemPathToFileUrl(str(pdf.resolve())),
             (_property("FilterName", "writer_pdf_Export"), _property("Overwrite", True)),
         )
     finally:
-        document.close(True)
-        desktop.terminate()
+        try:
+            if document is not None:
+                document.close(True)
+        finally:
+            desktop.terminate()
 
 
 def main() -> None:
@@ -86,8 +98,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--docx", type=Path, required=True)
     parser.add_argument("--pdf", type=Path, required=True)
+    parser.add_argument("--updated-docx", type=Path, required=True)
     arguments = parser.parse_args()
-    update_and_export(arguments.docx, arguments.pdf, arguments.port)
+    update_and_export(arguments.docx, arguments.pdf, arguments.updated_docx, arguments.port)
 
 
 if __name__ == "__main__":

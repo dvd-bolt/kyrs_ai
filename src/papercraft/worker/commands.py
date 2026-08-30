@@ -13,6 +13,7 @@ class WorkerAction(StrEnum):
     EXECUTE = "execute"
     RETRY_FROM = "retry_from"
     REBUILD_SECTION = "rebuild_section"
+    REFRESH_RESEARCH = "refresh_research"
     CANCEL = "cancel"
 
 
@@ -23,6 +24,7 @@ class WorkerRequest:
     run_id: str | None = None
     retry_from: str | None = None
     rebuild_section_id: str | None = None
+    refresh_research: bool = False
     acknowledge_checkpoint: bool = False
     cancel: bool = False
 
@@ -32,9 +34,9 @@ class WorkerRequest:
         actions = sum(
             value is not None
             for value in (self.retry_from, self.rebuild_section_id)
-        ) + int(self.cancel)
+        ) + int(self.refresh_research) + int(self.cancel)
         if actions > 1:
-            raise ValueError("retry, section rebuild and cancel are mutually exclusive")
+            raise ValueError("retry, section rebuild, refresh research and cancel are mutually exclusive")
         if (actions or self.acknowledge_checkpoint) and not self.run_id:
             raise ValueError("an existing run_id is required for this worker command")
         if self.retry_from is not None and not self.retry_from.strip():
@@ -48,6 +50,8 @@ class WorkerRequest:
             return WorkerAction.RETRY_FROM
         if self.rebuild_section_id is not None:
             return WorkerAction.REBUILD_SECTION
+        if self.refresh_research:
+            return WorkerAction.REFRESH_RESEARCH
         if self.cancel:
             return WorkerAction.CANCEL
         return WorkerAction.EXECUTE
@@ -65,6 +69,8 @@ class WorkerRequest:
             result.extend(["--retry-from", self.retry_from])
         if self.rebuild_section_id is not None:
             result.extend(["--rebuild-section", self.rebuild_section_id])
+        if self.refresh_research:
+            result.append("--refresh-research")
         if self.acknowledge_checkpoint:
             result.append("--acknowledge-checkpoint")
         if self.cancel:

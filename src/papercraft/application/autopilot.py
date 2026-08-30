@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -23,9 +24,12 @@ from papercraft.domain import (
     StageRun,
     StageStatus,
 )
+from papercraft.infrastructure.gemini import GeminiUnavailableError
 from papercraft.infrastructure.persistence import AtomicArtifactStore, ProjectPaths, sha256_file
 
 from .ports import RepositoryPort
+from .run_state import durable_run_state_lock
+from .usage import CostLimitExceeded
 from .worker_control import (
     CancellationToken,
     RunCancelled,
@@ -85,6 +89,19 @@ class MissingStageHandler(RuntimeError):
     pass
 
 
+class ProviderCooldown(RuntimeError):
+    """Safe, resumable wrapper for a transient Gemini provider failure."""
+
+    waiting_input = True
+
+    def __init__(self, retry_after_seconds: int | None = None) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        message = "Gemini временно недоступен; повторите запуск позже"
+        if retry_after_seconds is not None:
+            message += f" (примерно через {retry_after_seconds} с)"
+        super().__init__(message)
+
+
 class AutopilotService:
     """Durable, idempotent orchestration for the PaperCraft pipeline.
 
@@ -113,16 +130,41 @@ class AutopilotService:
 
     def _input_hash(self) -> str:
         # Verified web sources are produced by the pipeline itself and must not
-        # invalidate the user's input hash during resume/retry.
+        # invalidate the user's input hash during resume/retry.  ``reference``
+        # is also a user-selectable upload role, so role alone is not enough
+        # to distinguish generated web material from a real project input.
         sources = [
             source
             for source in self.repository.list_sources(self.project.id)
-            if source.role.value != "reference" and not source.metadata.get("generated")
+            if not source.metadata.get("generated")
         ]
+        options = self.project.options.model_dump(mode="json")
+        # `quality_mode` remains readable for old projects, but all legacy
+        # values now execute the same maximum-quality pipeline. It must not
+        # create a false cache miss merely because an old JSON file says
+        # "balanced" or "economy".
+        options["quality_mode"] = "maximum"
         value = {
-            "project": self.project.model_dump(mode="json"),
-            "source_hashes": sorted(source.sha256 for source in sources),
-            "pipeline": "3",
+            # Do not include Project.updated_at/created_at: the desktop saves
+            # the assignment before every start and those bookkeeping times do
+            # not change a generation input.
+            "brief": self.project.brief.model_dump(mode="json"),
+            "options": options,
+            "project_schema_version": self.project.schema_version,
+            "sources": sorted(
+                (
+                    {
+                        "sha256": source.sha256,
+                        "role": source.role.value,
+                        "mime_type": source.mime_type,
+                    }
+                    for source in sources
+                ),
+                key=lambda item: (str(item["sha256"]), str(item["role"]), str(item["mime_type"])),
+            ),
+            "models": self.settings.model_policy.model_dump(mode="json"),
+            "thinking": self.settings.thinking_policy.model_dump(mode="json"),
+            "pipeline": "fast-generation-v2",
         }
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -137,6 +179,103 @@ class AutopilotService:
             )
         )
 
+    @staticmethod
+    def _retry_after_seconds(error: GeminiUnavailableError) -> int | None:
+        explicit = getattr(error, "retry_after_seconds", None)
+        if isinstance(explicit, (int, float)) and explicit >= 0:
+            return max(1, round(explicit))
+        match = re.search(r"(?i)retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", str(error))
+        return max(1, round(float(match.group(1)))) if match else None
+
+    def _provider_cooldown(
+        self,
+        stage: StageRun,
+        error: GeminiUnavailableError,
+    ) -> tuple[StageRun, ProviderCooldown]:
+        """Checkpoint any Gemini stage, including non-parallel provider calls.
+
+        The request coordinator is process-local; this durable deadline keeps
+        a resumed worker from immediately reissuing a 429 after its process
+        has been restarted.  Only safe timing/state fields are persisted.
+        """
+
+        retry_after_seconds = self._retry_after_seconds(error)
+        retry_at = (
+            datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
+            if retry_after_seconds is not None
+            else None
+        )
+        with durable_run_state_lock():
+            current = self.repository.get_stage(stage.id) or stage
+            current.checkpoint = {
+                **current.checkpoint,
+                "progress_message": "Gemini временно ограничил запросы",
+                "waiting_for_quota": True,
+                "retry_after_seconds": retry_after_seconds or 0,
+                "retry_at": retry_at.isoformat() if retry_at is not None else "",
+            }
+            self.repository.save_stage(current)
+        return current, ProviderCooldown(retry_after_seconds)
+
+    def _active_provider_cooldown(self, stage: StageRun) -> ProviderCooldown | None:
+        """Honor a durable retry deadline before *any* stage handler runs."""
+
+        checkpoint = stage.checkpoint
+        raw_retry_at = checkpoint.get("retry_at")
+        retry_at: datetime | None = None
+        if isinstance(raw_retry_at, str) and raw_retry_at:
+            try:
+                retry_at = datetime.fromisoformat(raw_retry_at.replace("Z", "+00:00"))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+            except ValueError:
+                retry_at = None
+        if retry_at is not None:
+            remaining = (retry_at - datetime.now(UTC)).total_seconds()
+            if remaining > 0:
+                return ProviderCooldown(max(1, round(remaining)))
+        if checkpoint.get("waiting_for_quota") or raw_retry_at:
+            # A user has explicitly resumed after a deadline (or after an
+            # outage without Retry-After). Clear stale UI state before the
+            # handler can emit fresh progress.
+            for key in ("waiting_for_quota", "retry_after_seconds", "retry_at", "retry_wait_ms"):
+                checkpoint.pop(key, None)
+            if checkpoint.get("progress_message") == "Gemini временно ограничил запросы":
+                checkpoint.pop("progress_message", None)
+            self.repository.save_stage(stage)
+        return None
+
+    def _cost_limit_error(self, run: GenerationRun) -> CostLimitExceeded | None:
+        maximum_cost = self.project.options.maximum_cost
+        if maximum_cost is not None and run.cost >= maximum_cost:
+            return CostLimitExceeded(
+                f"Estimated run cost {run.cost} {run.currency} has reached limit "
+                f"{maximum_cost} {run.currency}"
+            )
+        if not bool(run.metadata.get("cost_limit_exceeded")):
+            return None
+        if maximum_cost is None:
+            return CostLimitExceeded("Estimated run cost exceeded the configured limit")
+        return CostLimitExceeded(
+            f"Estimated run cost {run.cost} {run.currency} exceeds limit "
+            f"{maximum_cost} {run.currency}"
+        )
+
+    def _halt_after_committed_cost_limit(
+        self,
+        run: GenerationRun,
+        stage: StageRun,
+        error: CostLimitExceeded,
+    ) -> GenerationRun:
+        """Stop before another request while retaining the just-saved stage."""
+
+        run.status = RunStatus.FAILED
+        run.error = f"{stage.name}: {error}"
+        run.finished_at = datetime.now(UTC)
+        run = self.repository.save_run_preserving_control(run)
+        self._event(run, stage, "run_cost_limit_reached", str(error))
+        return run
+
     def create_run(self) -> GenerationRun:
         active = [
             run
@@ -148,7 +287,7 @@ class AutopilotService:
         run = GenerationRun(
             project_id=self.project.id,
             input_hash=self._input_hash(),
-            pipeline_version="3",
+            pipeline_version="fast-generation-v2",
             model_policy={
                 "models": self.settings.model_policy.model_dump(mode="json"),
                 "thinking": self.settings.thinking_policy.model_dump(mode="json"),
@@ -181,7 +320,10 @@ class AutopilotService:
             run.finished_at = None
             run.error = None
             run.metadata.pop("terminal_hook_done", None)
-            self.repository.save_run(run)
+            self.repository.save_run_preserving_control(
+                run,
+                replace_metadata_keys={"terminal_hook_done"},
+            )
             self._event(run, stage, "artifact_corruption_recovered", reason)
         elif run.status == RunStatus.CANCELLED:
             # A provider cleanup can fail after the last pipeline stage.  A
@@ -201,7 +343,12 @@ class AutopilotService:
         run.status = RunStatus.RUNNING
         run.started_at = run.started_at or now
         run.error = None
-        self.repository.save_run(run)
+        run = self.repository.save_run_preserving_control(run)
+        if run.status == RunStatus.CANCELLED:
+            self._terminal(run)
+            return run
+        if run.status == RunStatus.PAUSED:
+            return run
         self._event(run, None, "run_started", "Autopilot execution started")
 
         recovered = recover_stale_stages(self.repository, run)
@@ -219,16 +366,29 @@ class AutopilotService:
             if stage.status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}:
                 continue
             stage_name = PipelineStage(stage.name)
+            if cost_error := self._cost_limit_error(run):
+                return self._fail(run, stage, cost_error)
             handler = self.handlers.get(stage_name)
             if handler is None:
                 return self._fail(run, stage, MissingStageHandler(f"No handler for {stage.name}"))
 
+            if cooldown := self._active_provider_cooldown(stage):
+                return self._fail(run, stage, cooldown)
+
             run.current_stage = stage.name
+            run = self.repository.save_run_preserving_control(run)
+            if run.status == RunStatus.CANCELLED:
+                self._terminal(run)
+                return run
+            if run.status == RunStatus.PAUSED:
+                return run
             stage.status = StageStatus.RUNNING
             stage.started_at = stage.started_at or datetime.now(UTC)
             stage.heartbeat_at = datetime.now(UTC)
             stage.attempts += 1
-            self.repository.save_run(run)
+            stage.error = None
+            stage.failure_code = None
+            stage.failure_details = {}
             self.repository.save_stage(stage)
             self._event(run, stage, "stage_started", f"Started: {stage.name}")
             try:
@@ -244,35 +404,64 @@ class AutopilotService:
                         cancellation=CancellationToken(self.repository, run.id, stage.id),
                     )
                 )
-                run = self.repository.get_run(run.id) or run
-                if run.status == RunStatus.CANCELLED:
-                    raise RunCancelled("run was cancelled during stage execution")
-                for artifact in outcome.artifacts:
-                    self.repository.save_artifact(artifact)
-                    stage.output_artifact_ids.append(artifact.id)
-                stage.checkpoint = dict(outcome.checkpoint)
-                stage.output_hash = self._artifact_set_hash(outcome.artifacts)
-                stage.heartbeat_at = datetime.now(UTC)
-                stage.status = StageStatus.SKIPPED if outcome.skipped else StageStatus.SUCCEEDED
-                stage.finished_at = datetime.now(UTC)
-                stage.error = None
-                self.repository.save_stage(stage)
+                with durable_run_state_lock():
+                    run = self.repository.get_run(run.id) or run
+                    if run.status == RunStatus.CANCELLED:
+                        raise RunCancelled("run was cancelled during stage execution")
+                    # A parallel handler can already have checkpointed item
+                    # artifacts and cost updates.  Reload before the terminal
+                    # full-row write so it does not erase either field.
+                    stage = self.repository.get_stage(stage.id) or stage
+                    for artifact in outcome.artifacts:
+                        self.repository.save_artifact(artifact)
+                        if artifact.id not in stage.output_artifact_ids:
+                            stage.output_artifact_ids.append(artifact.id)
+                    stage.checkpoint = dict(outcome.checkpoint)
+                    stage.output_hash = self._artifact_set_hash(outcome.artifacts)
+                    stage.heartbeat_at = datetime.now(UTC)
+                    stage.status = StageStatus.SKIPPED if outcome.skipped else StageStatus.SUCCEEDED
+                    stage.finished_at = datetime.now(UTC)
+                    stage.error = None
+                    self.repository.save_stage(stage)
                 self._event(run, stage, "stage_completed", outcome.message or f"Completed: {stage.name}")
+                if run.status == RunStatus.PAUSED:
+                    return run
+                if cost_error := self._cost_limit_error(run):
+                    return self._halt_after_committed_cost_limit(run, stage, cost_error)
             except RunCancelled:
                 return self._interrupt(run, stage)
+            except GeminiUnavailableError as exc:
+                # Parallel stages translate this themselves to retain their
+                # completed-item checkpoint. This fallback covers every
+                # direct Gemini stage (requirements, planning, QA, review),
+                # so all transient provider failures become resumable.
+                stage, cooldown = self._provider_cooldown(stage, exc)
+                return self._fail(run, stage, cooldown)
             except Exception as exc:
+                latest = self.repository.get_run(run.id) or run
+                if cost_error := self._cost_limit_error(latest):
+                    return self._fail(latest, stage, cost_error)
                 return self._fail(run, stage, exc)
 
             if self._checkpoint_required(stage_name) and not self._checkpoint_acknowledged(run, stage_name):
                 run.status = RunStatus.WAITING_INPUT
-                self.repository.save_run(run)
+                run = self.repository.save_run_preserving_control(run)
+                if run.status == RunStatus.PAUSED:
+                    return run
+                if run.status == RunStatus.CANCELLED:
+                    self._terminal(run)
+                    return run
                 self._event(run, stage, "checkpoint_waiting", f"Approval required after {stage.name}")
                 return run
 
         run.status = RunStatus.SUCCEEDED
         run.current_stage = None
         run.finished_at = datetime.now(UTC)
-        self.repository.save_run(run)
+        run = self.repository.save_run_preserving_control(run)
+        if run.status in {RunStatus.PAUSED, RunStatus.CANCELLED}:
+            if run.status == RunStatus.CANCELLED:
+                self._terminal(run)
+            return run
         self._terminal(run)
         run = self.repository.get_run(run.id) or run
         if run.status == RunStatus.SUCCEEDED:
@@ -358,11 +547,18 @@ class AutopilotService:
         else:
             # A pause request is durable state, not a stage failure.
             latest.status = RunStatus.PAUSED
-            self.repository.save_run(latest)
+            latest = self.repository.save_run_preserving_control(latest)
+            if latest.status == RunStatus.CANCELLED:
+                self._event(latest, stage, "stage_cancelled", "Stage stopped at a durable checkpoint")
+                self._terminal(latest)
+                return latest
             self._event(latest, stage, "stage_paused", "Stage paused at a durable checkpoint")
         return self.repository.get_run(latest.id) or latest
 
     def _fail(self, run: GenerationRun, stage: StageRun, error: Exception) -> GenerationRun:
+        latest = self.repository.get_run(run.id) or run
+        if latest.status in {RunStatus.PAUSED, RunStatus.CANCELLED}:
+            return self._interrupt(latest, stage)
         stage.status = StageStatus.FAILED
         stage.finished_at = datetime.now(UTC)
         stage.error = str(error)
@@ -373,9 +569,16 @@ class AutopilotService:
         run.error = f"{stage.name}: {error}"
         run.finished_at = None if needs_input else datetime.now(UTC)
         self.repository.save_stage(stage)
-        self.repository.save_run(run)
+        run = self.repository.save_run_preserving_control(run)
+        if run.status in {RunStatus.PAUSED, RunStatus.CANCELLED}:
+            return self._interrupt(run, stage)
         self._event(run, stage, "stage_waiting_input" if needs_input else "stage_failed", str(error))
-        self._terminal(run)
+        # A failed run is intentionally resumable.  In particular, a 429 can
+        # occur after ingest has uploaded local source files, while the retry
+        # continues at a later stage.  Cleaning those files here would make a
+        # resumed requirements/plan call silently lose its inputs.  Terminal
+        # cleanup is therefore reserved for success and explicit cancellation;
+        # a user can cancel a failed run to discard retained remote files.
         return run
 
     def _terminal(self, run: GenerationRun) -> None:
@@ -393,7 +596,14 @@ class AutopilotService:
                 run.status = RunStatus.FAILED
                 run.finished_at = datetime.now(UTC)
                 run.error = f"terminal cleanup failed ({error_type})"
-            self.repository.save_run(run)
+            self.repository.save_run_preserving_control(
+                run,
+                replace_metadata_keys={
+                    "terminal_hook_done",
+                    "terminal_cleanup_pending",
+                    "terminal_cleanup_error_type",
+                },
+            )
             # Do not persist provider exception text: it can contain sensitive
             # request data.  The exception class is sufficient for retry/audit.
             self._event(run, None, "terminal_cleanup_failed", error_type)
@@ -401,7 +611,14 @@ class AutopilotService:
         run.metadata["terminal_hook_done"] = True
         run.metadata.pop("terminal_cleanup_pending", None)
         run.metadata.pop("terminal_cleanup_error_type", None)
-        self.repository.save_run(run)
+        self.repository.save_run_preserving_control(
+            run,
+            replace_metadata_keys={
+                "terminal_hook_done",
+                "terminal_cleanup_pending",
+                "terminal_cleanup_error_type",
+            },
+        )
 
     def _checkpoint_required(self, stage: PipelineStage) -> bool:
         options = self.project.options
@@ -437,7 +654,7 @@ class AutopilotService:
             acknowledged.append(stage.value)
         run.metadata["acknowledged_checkpoints"] = acknowledged
         run.status = RunStatus.RETRYING
-        self.repository.save_run(run)
+        run = self.repository.save_run_preserving_control(run)
         return self.execute(run.id)
 
     def pause(self, run_id: str) -> GenerationRun:
@@ -446,8 +663,11 @@ class AutopilotService:
             raise KeyError(run_id)
         if run.status not in {RunStatus.RUNNING, RunStatus.RETRYING, RunStatus.WAITING_INPUT}:
             raise RuntimeError(f"Cannot pause a {run.status} run")
-        run.status = RunStatus.PAUSED
-        self.repository.save_run(run)
+        run = self.repository.transition_run_status(
+            run_id,
+            status=RunStatus.PAUSED,
+            allowed_from={RunStatus.RUNNING, RunStatus.RETRYING, RunStatus.WAITING_INPUT},
+        )
         self._event(run, None, "run_paused", "Autopilot paused")
         return run
 
@@ -471,11 +691,21 @@ class AutopilotService:
             raise RuntimeError(
                 f"Checkpoint after {pending_checkpoint.value} must be explicitly acknowledged"
             )
-        run.status = RunStatus.RETRYING
+        # This is an explicit user-driven transition, so it must be a CAS
+        # rather than the worker-only preserving save (which deliberately
+        # refuses to turn PAUSED/CANCELLED back into RUNNING-like states).
+        run = self.repository.transition_run_status(
+            run_id,
+            status=RunStatus.RETRYING,
+            allowed_from={RunStatus.PAUSED, RunStatus.FAILED, RunStatus.WAITING_INPUT},
+        )
         run.finished_at = None
         run.metadata.pop("terminal_hook_done", None)
-        self.repository.save_run(run)
-        return self.execute(run_id)
+        run = self.repository.save_run_preserving_control(
+            run,
+            replace_metadata_keys={"terminal_hook_done"},
+        )
+        return self.execute(run.id)
 
     def cancel(self, run_id: str) -> GenerationRun:
         run = self.repository.get_run(run_id)
@@ -483,26 +713,67 @@ class AutopilotService:
             raise KeyError(run_id)
         if run.status == RunStatus.SUCCEEDED:
             raise RuntimeError("A completed run cannot be cancelled")
-        run.status = RunStatus.CANCELLED
-        run.finished_at = datetime.now(UTC)
-        self.repository.save_run(run)
+        run = self.repository.transition_run_status(
+            run_id,
+            status=RunStatus.CANCELLED,
+            allowed_from={
+                RunStatus.QUEUED,
+                RunStatus.RUNNING,
+                RunStatus.RETRYING,
+                RunStatus.PAUSED,
+                RunStatus.WAITING_INPUT,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            },
+            finished_at=datetime.now(UTC),
+        )
         self._event(run, None, "run_cancel_requested", "Cancellation requested")
         self._terminal(run)
         return run
 
     def retry_from(self, run_id: str, from_stage: PipelineStage) -> GenerationRun:
+        # Claim the retry and reset every dependent stage in one database
+        # transaction.  In particular, CANCELLED is deliberately excluded:
+        # cancelling in another process must never be overwritten by an old
+        # retry request that happens to arrive afterwards.
+        run = self.repository.prepare_retry(
+            run_id,
+            stage_names=self.dependency_graph.affected_by(from_stage.value),
+            input_hash=self._input_hash(),
+            reason="requested rebuild",
+            allowed_from={
+                RunStatus.QUEUED,
+                RunStatus.RUNNING,
+                RunStatus.RETRYING,
+                RunStatus.PAUSED,
+                RunStatus.WAITING_INPUT,
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+            },
+            maximum_cost=self.project.options.maximum_cost,
+        )
+        self._event(run, None, "run_invalidated", f"Rebuild requested from {from_stage.value}")
+        return self.execute(run.id)
+
+    def refresh_research(self, run_id: str) -> GenerationRun:
+        """Force a new web-evidence pass while preserving all other inputs."""
+
         run = self.repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        self._invalidate_from(run, from_stage)
-        run.input_hash = self._input_hash()
-        run.status = RunStatus.RETRYING
-        run.finished_at = None
-        run.error = None
-        run.metadata.pop("terminal_hook_done", None)
-        self.repository.save_run(run)
-        self._event(run, None, "run_invalidated", f"Rebuild requested from {from_stage.value}")
-        return self.execute(run_id)
+        # A source refresh deliberately starts at VERIFIED_RESEARCH so it can
+        # retain the existing claim plan.  It is therefore unsafe after an
+        # assignment, uploaded file, model, or other fingerprinted input has
+        # changed: retry_from would otherwise replace the run hash while
+        # leaving the old plan and claims in place.
+        if run.input_hash != self._input_hash():
+            raise RuntimeError(
+                "Project inputs changed; rebuild from an upstream stage before refreshing sources"
+            )
+        run.metadata["force_research_refresh"] = True
+        self.repository.save_run_preserving_control(run)
+        self._event(run, None, "research_refresh_requested", "Fresh source verification requested")
+        return self.retry_from(run_id, PipelineStage.VERIFIED_RESEARCH)
 
 
 class RunQuery:

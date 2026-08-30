@@ -5,6 +5,20 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      acceptance_suite:
+        description: "Opt-in integration suite; run Gemini suites in documented order"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - gemini-contract
+          - gemini-full
+          - golden-smoke
+          - golden-full
+          - background-lifecycle
+          - libreoffice
 
 permissions:
   contents: read
@@ -56,8 +70,26 @@ jobs:
           }
 
   live-gemini:
-    name: Live Gemini (manual)
-    if: github.event_name == 'workflow_dispatch'
+    name: Live Gemini structured contract (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'gemini-contract'
+    runs-on: ubuntu-latest
+    environment: live-gemini
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - run: uv run pytest "tests_v2/test_gemini_live.py::test_live_research_plan_structured_contract" -q
+        env:
+          PAPERCRAFT_RUN_GEMINI_TESTS: "1"
+          PAPERCRAFT_LIVE_TEST_MAX_COST_USD: ${{ vars.PAPERCRAFT_LIVE_TEST_MAX_COST_USD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  live-gemini-full:
+    name: Live Gemini full suite (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'gemini-full'
     runs-on: ubuntu-latest
     environment: live-gemini
     steps:
@@ -70,20 +102,82 @@ jobs:
       - run: uv run pytest tests_v2/test_gemini_live.py -q
         env:
           PAPERCRAFT_RUN_GEMINI_TESTS: "1"
+          PAPERCRAFT_LIVE_TEST_MAX_COST_USD: ${{ vars.PAPERCRAFT_LIVE_TEST_MAX_COST_USD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-  office-word:
-    name: Word COM (manual)
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
-    environment: office-word
+  live-background-lifecycle:
+    name: Live Gemini stored background cleanup (final manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'background-lifecycle'
+    runs-on: ubuntu-latest
+    environment: live-gemini
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: uv sync --extra desktop --extra office --extra dev
+      - run: uv sync --extra dev
+      - name: Cancel, delete, and verify a stored background interaction
+        run: uv run pytest "tests_v2/test_gemini_live.py::test_live_background_cancellation" -q
+        env:
+          PAPERCRAFT_RUN_GEMINI_TESTS: "1"
+          PAPERCRAFT_RUN_BACKGROUND_LIFECYCLE_TESTS: "1"
+          PAPERCRAFT_LIVE_TEST_MAX_COST_USD: ${{ vars.PAPERCRAFT_LIVE_TEST_MAX_COST_USD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  live-golden-smoke:
+    name: Live Gemini golden smoke (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'golden-smoke'
+    runs-on: ubuntu-latest
+    environment: live-gemini
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice for DOCX/PDF acceptance
+        run: sudo apt-get update && sudo apt-get install -y libreoffice-writer
+      - run: uv sync --extra desktop --extra office --extra visuals --extra dev
+      - run: uv run pytest "tests_v2/test_live_golden_e2e.py::test_live_golden_pipeline_twice[it_coursework-1]" -q
+        env:
+          PAPERCRAFT_RUN_GOLDEN_TESTS: "1"
+          PAPERCRAFT_GOLDEN_MAX_COST_USD: ${{ vars.PAPERCRAFT_GOLDEN_MAX_COST_USD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  live-golden-full:
+    name: Live Gemini golden acceptance (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'golden-full'
+    runs-on: ubuntu-latest
+    environment: live-gemini
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice for DOCX/PDF acceptance
+        run: sudo apt-get update && sudo apt-get install -y libreoffice-writer
+      - run: uv sync --extra desktop --extra office --extra visuals --extra dev
+      - run: uv run pytest tests_v2/test_live_golden_e2e.py -q
+        env:
+          PAPERCRAFT_RUN_GOLDEN_TESTS: "1"
+          PAPERCRAFT_GOLDEN_MAX_COST_USD: ${{ vars.PAPERCRAFT_GOLDEN_MAX_COST_USD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  office-libreoffice:
+    name: LibreOffice feature matrix (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_suite == 'libreoffice'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice
+        run: sudo apt-get update && sudo apt-get install -y libreoffice-writer
+      - run: uv sync --extra office --extra visuals --extra dev
       - run: uv run pytest tests_v2/test_office_integration.py -q
         env:
           PAPERCRAFT_RUN_OFFICE_TESTS: "1"

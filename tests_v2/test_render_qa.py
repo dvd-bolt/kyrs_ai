@@ -224,6 +224,7 @@ def _complete_manuscript(image_artifact_id: str) -> Manuscript:
             TableBlock(
                 spec=TableSpec(
                     caption="Core indicators",
+                    dataset_id="core-indicators",
                     headers=["Indicator", "Value"],
                     rows=[["Revenue", 125], ["Cost", 80]],
                 )
@@ -321,12 +322,28 @@ def test_qa_accepts_rendered_docx_and_complete_provenance(tmp_path: Path) -> Non
         origin=FactOrigin.VERIFIED_SOURCE,
         source_id="source-1",
     )
+    dataset = Dataset(
+        id="core-indicators",
+        project_id="p1",
+        name="Core indicators",
+        columns=[
+            DatasetColumn(name="indicator", data_type=DataType.STRING, nullable=False),
+            DatasetColumn(name="value", data_type=DataType.INTEGER, nullable=False),
+        ],
+        rows=[
+            {"indicator": "Revenue", "value": 125},
+            {"indicator": "Cost", "value": 80},
+        ],
+        origin=FactOrigin.VERIFIED_SOURCE,
+        source_ids=["source-1"],
+    )
     report = DeterministicQualityGate().run(
         QAGateContext(
             project_id="p1",
             run_id="run-2",
             manuscript=manuscript,
             facts=[fact],
+            datasets=[dataset],
             artifact_paths={"figure-1": image_path},
             docx_path=docx_path,
         )

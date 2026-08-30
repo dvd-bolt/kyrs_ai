@@ -160,7 +160,7 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
     assert all(item.deleted_at is not None for item in resources)
 
 
-def test_research_plan_failure_clears_previous_claims_without_partial_writes(tmp_path: Path) -> None:
+def test_research_plan_failure_preserves_previous_claims_without_partial_writes(tmp_path: Path) -> None:
     settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
     workspace = ProjectService(settings).create(
         ProjectBrief(
@@ -189,7 +189,8 @@ def test_research_plan_failure_clears_previous_claims_without_partial_writes(tmp
     run = runtime.service.execute(runtime.run.id)
 
     assert run.status == RunStatus.FAILED
-    assert workspace.repository.list_claims(workspace.project.id) == []
+    claims = workspace.repository.list_claims(workspace.project.id)
+    assert [claim.text for claim in claims] == ["Stale claim from an earlier failed attempt"]
     failed_stage = next(
         item
         for item in workspace.repository.list_stages(run.id)

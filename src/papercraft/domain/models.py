@@ -65,7 +65,10 @@ class AutopilotOptions(DomainModel):
     quality_mode: Literal["maximum", "balanced", "economy"] = "maximum"
     maximum_revision_cycles: int = Field(default=3, ge=1, le=10)
     allow_synthetic_data: bool = True
-    preferred_finalizer: Literal["auto", "word", "libreoffice"] = "auto"
+    # Legacy projects can still deserialize ``auto``/``word``.  The private
+    # beta pipeline deliberately normalises all new and existing runs to
+    # LibreOffice before finalization.
+    preferred_finalizer: Literal["auto", "word", "libreoffice"] = "libreoffice"
     generate_pdf: bool = True
     generate_qa_report: bool = True
 
@@ -302,6 +305,122 @@ class RequirementCoverage(DomainModel):
     status: Literal["SATISFIED", "NOT_APPLICABLE", "FAILED"]
     evidence: str = ""
     artifact_id: str | None = None
+
+
+class RequirementPdfPageMapping(DomainModel):
+    """Rendered PDF pages on which one manuscript block appears."""
+
+    block_id: str = Field(min_length=1)
+    pages: list[Annotated[int, Field(ge=1)]] = Field(min_length=1)
+
+    @field_validator("pages")
+    @classmethod
+    def normalize_pages(cls, value: list[int]) -> list[int]:
+        return sorted(set(value))
+
+
+class RequirementCoverageAssessment(DomainModel):
+    """Observed coverage for a requirement before its rule metadata is attached."""
+
+    status: Literal["covered", "partial", "missing"]
+    block_ids: list[str] = Field(default_factory=list)
+    pdf_page_mappings: list[RequirementPdfPageMapping] = Field(default_factory=list)
+    evidence_gaps: list[str] = Field(default_factory=list)
+    evidence_summary: str = ""
+    artifact_id: str | None = None
+    reason: str = ""
+
+    @field_validator("block_ids")
+    @classmethod
+    def validate_block_ids(cls, value: list[str]) -> list[str]:
+        if any(not item for item in value):
+            raise ValueError("block_ids must not contain empty values")
+        if len(value) != len(set(value)):
+            raise ValueError("block_ids must be unique")
+        return sorted(value)
+
+    @field_validator("pdf_page_mappings")
+    @classmethod
+    def validate_pdf_page_mappings(
+        cls, value: list[RequirementPdfPageMapping]
+    ) -> list[RequirementPdfPageMapping]:
+        block_ids = [item.block_id for item in value]
+        if len(block_ids) != len(set(block_ids)):
+            raise ValueError("pdf_page_mappings must contain at most one entry per block")
+        return sorted(value, key=lambda item: item.block_id)
+
+    @field_validator("evidence_gaps")
+    @classmethod
+    def validate_evidence_gaps(cls, value: list[str]) -> list[str]:
+        if any(not item for item in value):
+            raise ValueError("evidence_gaps must not contain empty values")
+        return sorted(set(value))
+
+    @model_validator(mode="after")
+    def validate_pdf_blocks(self) -> RequirementCoverageAssessment:
+        unknown = {item.block_id for item in self.pdf_page_mappings} - set(self.block_ids)
+        if unknown:
+            raise ValueError(
+                "pdf_page_mappings must refer to block_ids: " + ", ".join(sorted(unknown))
+            )
+        return self
+
+    @property
+    def has_coverage_location(self) -> bool:
+        """Whether the assessment points to a manuscript block or artifact."""
+
+        return bool(self.block_ids or self.artifact_id)
+
+
+class RequirementCoverageEntry(RequirementCoverageAssessment):
+    """Complete, traceable coverage state for one requirement rule."""
+
+    requirement_rule_id: str = Field(min_length=1)
+    requirement_key: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    # Default preserves stored reports created before mandatory coverage was
+    # made an export gate. New reports always copy this from RequirementRule.
+    mandatory: bool = False
+    criticality: Literal["critical", "standard"]
+    priority: RequirementPriority
+    provenance: list[RuleProvenance] = Field(default_factory=list)
+    source_locators: list[Locator] = Field(default_factory=list)
+
+
+class RequirementCoverageReport(DomainModel):
+    """A deterministic, typed coverage record for every rule in a requirement set."""
+
+    project_id: str = Field(min_length=1)
+    requirement_set_id: str = Field(min_length=1)
+    entries: list[RequirementCoverageEntry] = Field(default_factory=list)
+    schema_version: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_rule_entries(self) -> RequirementCoverageReport:
+        rule_ids = [entry.requirement_rule_id for entry in self.entries]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError("requirement coverage entries must be unique per rule")
+        return self
+
+    @property
+    def blocking_entries(self) -> tuple[RequirementCoverageEntry, ...]:
+        """Entries which must stop export until the gap is resolved."""
+
+        return tuple(
+            entry
+            for entry in self.entries
+            if (entry.criticality == "critical" and entry.status != "covered")
+            or (
+                entry.criticality == "critical"
+                and entry.status == "covered"
+                and not entry.has_coverage_location
+            )
+            or bool(entry.evidence_gaps)
+        )
+
+    @property
+    def has_blocking_gaps(self) -> bool:
+        return bool(self.blocking_entries)
 
 
 class TemplateSection(DomainModel):
@@ -633,6 +752,12 @@ class TableBlock(DomainModel):
     type: Literal["table"] = "table"
     id: str = Field(default_factory=new_id)
     spec: TableSpec
+    # Inline table values do not otherwise carry a path back to the FactLedger.
+    # A numeric table must either name a valid ``dataset_id`` or bind its
+    # values to these records, regardless of whether it was model- or
+    # user-authored.
+    numeric_fact_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class ChartBlock(DomainModel):
@@ -834,6 +959,7 @@ class QAReport(DomainModel):
     status: QAStatus = QAStatus.PASS
     issues: list[QAIssue] = Field(default_factory=list)
     metrics: list[Metric] = Field(default_factory=list)
+    requirement_coverage: RequirementCoverageReport | None = None
     created_at: datetime = Field(default_factory=utc_now)
     summary: str = ""
     metadata: dict[str, JsonValue] = Field(default_factory=dict)

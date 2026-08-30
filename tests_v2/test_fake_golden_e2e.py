@@ -9,8 +9,11 @@ import pytest
 
 from papercraft.application import (
     AutopilotService,
+    DocumentExportBlocked,
+    DocumentService,
     ProductionStageFactory,
     ProjectService,
+    ProjectWorkspace,
     SourceService,
 )
 from papercraft.config import AppSettings
@@ -19,8 +22,11 @@ from papercraft.domain import (
     AutopilotOptions,
     DomainProfile,
     ProjectBrief,
+    QASeverity,
+    RequirementPriority,
     RunStatus,
     SourceRole,
+    StageStatus,
     WorkType,
 )
 from papercraft.infrastructure.gemini import FakeGeminiGateway, GroundedResult
@@ -74,7 +80,44 @@ def test_fake_golden_pipeline(
     assert any(item.kind is ArtifactKind.PDF and Path(item.path).is_file() for item in artifacts)
     assert any(item.kind is ArtifactKind.QA_HTML and Path(item.path).is_file() for item in artifacts)
     assert workspace.repository.get_latest_manuscript(workspace.project.id) is not None
-    assert workspace.repository.get_latest_qa_report(run.id).status.value in {"pass", "warning"}  # type: ignore[union-attr]
+    report = workspace.repository.get_latest_qa_report(run.id)
+    assert report is not None
+    assert report.status.value in {"pass", "warning"}
+    documents = DocumentService(workspace.project.id, workspace.repository)
+    assert documents.export_block_reason(ArtifactKind.DOCX, run.id) is None
+    assert documents.export_block_reason(ArtifactKind.PDF, run.id) is None
+    assert documents.export(ArtifactKind.DOCX, tmp_path / "released.docx", run.id).is_file()
+    assert documents.export(ArtifactKind.PDF, tmp_path / "released.pdf", run.id).is_file()
+    # A later successful requirement extraction makes the existing release
+    # stale even before a subsequent run reaches planning or rendering.
+    requirements = workspace.repository.get_latest_requirement_set(workspace.project.id)
+    assert requirements is not None
+    workspace.repository.save_requirement_set(
+        requirements.model_copy(update={"id": "requirements-after-release"})
+    )
+    assert documents.export_block_reason(ArtifactKind.DOCX, run.id) is not None
+    assert documents.export_block_reason(ArtifactKind.PDF, run.id) is not None
+    with pytest.raises(DocumentExportBlocked, match="current requirements"):
+        documents.export(ArtifactKind.DOCX, tmp_path / "stale-requirements.docx", run.id)
+    with pytest.raises(DocumentExportBlocked, match="current requirements"):
+        documents.export(ArtifactKind.PDF, tmp_path / "stale-requirements.pdf", run.id)
+    # The deterministic profile scaffold is intentionally visible in the
+    # release report, even when this compact smoke blueprint omits some of
+    # its suggested sections. Profile-only gaps cannot quietly turn an
+    # otherwise evidence-backed project into an unexportable document.
+    assert report.requirement_coverage is not None
+    profile_entries = [
+        entry
+        for entry in report.requirement_coverage.entries
+        if entry.priority is RequirementPriority.PROFILE
+    ]
+    assert profile_entries
+    assert all(entry.criticality == "standard" for entry in profile_entries)
+    assert not [
+        issue
+        for issue in report.issues
+        if issue.category == "requirement_coverage" and issue.severity is QASeverity.BLOCKER
+    ]
     assert fake.deleted_files
     if profile is DomainProfile.ACCOUNTING:
         facts = workspace.repository.list_facts(workspace.project.id)
@@ -86,9 +129,215 @@ def test_fake_golden_pipeline(
         }
 
 
-def _fake_for(project_id: str, workspace: object, *, accounting: bool) -> FakeGeminiGateway:
+def test_formal_methodology_gap_blocks_final_package_and_persists_qa_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A formal uncovered rule must fail release without discarding its QA proof.
+
+    The document and PDF are intentionally produced before the final package
+    gate: coverage includes locations in those artifacts.  The assertion here
+    proves they cannot be treated as a released export once a methodology rule
+    remains unconfirmed, and that a restarted desktop can still show the
+    diagnostic report.
+    """
+
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(
+        ProjectBrief(
+            title="formal-coverage-gap",
+            topic="formal-coverage-gap",
+            prompt="Produce an evidence-backed work",
+            work_type=WorkType.COURSEWORK,
+            domain_profile=DomainProfile.IT,
+        ),
+        AutopilotOptions(
+            consent_to_remote_processing=True,
+            generate_pdf=True,
+            maximum_revision_cycles=2,
+        ),
+    )
+    source = tmp_path / "methodology.txt"
+    source.write_text("A formal appendix is required.", encoding="utf-8")
+    SourceService(workspace).import_files([source], SourceRole.METHODOLOGY)
+    monkeypatch.setattr("papercraft.infrastructure.render.DocumentFinalizer", _FakeLocalFinalizer)
+    fake = _fake_for(
+        workspace.project.id,
+        workspace,
+        accounting=False,
+        requirement_rules=[
+            {
+                "category": "custom",
+                "key": "methodology.required_appendix",
+                "statement": "The methodology requires an explicit appendix.",
+                "value": "appendix",
+                "mandatory": True,
+                "priority": "methodology",
+            }
+        ],
+    )
+    factory = ProductionStageFactory(fake, url_verifier=_VerifiedURL())
+    run = AutopilotService(
+        settings,
+        workspace.project,
+        workspace.repository,
+        workspace.paths,
+        factory.build(),
+        terminal_hook=factory.cleanup_remote_files,
+    ).start()
+
+    assert run.status is RunStatus.FAILED
+    assert run.error is not None and run.error.startswith("package:")
+    package_stage = next(
+        stage for stage in workspace.repository.list_stages(run.id) if stage.name == "package"
+    )
+    assert package_stage.status is StageStatus.FAILED
+
+    # The pre-package render exists for traceability, but the failed package
+    # means it is not a release.  QA artifacts are explicitly saved by the
+    # package handler before it raises, rather than being lost with StageOutcome.
+    artifacts = workspace.repository.list_artifacts(workspace.project.id, run_id=run.id)
+    assert {ArtifactKind.DOCX, ArtifactKind.PDF} <= {artifact.kind for artifact in artifacts}
+    qa_artifacts = [
+        artifact
+        for artifact in artifacts
+        if artifact.kind in {ArtifactKind.QA_JSON, ArtifactKind.QA_HTML}
+    ]
+    assert {artifact.kind for artifact in qa_artifacts} == {
+        ArtifactKind.QA_JSON,
+        ArtifactKind.QA_HTML,
+    }
+    assert all(Path(artifact.path).is_file() for artifact in qa_artifacts)
+
+    report = workspace.repository.get_latest_qa_report(run.id)
+    assert report is not None
+    assert report.status.value == "fail"
+    assert report.requirement_coverage is not None
+    entry = next(
+        item
+        for item in report.requirement_coverage.entries
+        if item.requirement_key == "methodology.required_appendix"
+    )
+    assert entry.priority is RequirementPriority.METHODOLOGY
+    assert entry.criticality == "critical"
+    assert entry.status == "partial"
+    blockers = [
+        issue
+        for issue in report.issues
+        if issue.category == "requirement_coverage"
+        and issue.requirement_rule_id == entry.requirement_rule_id
+    ]
+    assert len(blockers) == 1
+    assert blockers[0].severity is QASeverity.BLOCKER
+    assert blockers[0].metadata["coverage_status"] == "partial"
+    documents = DocumentService(workspace.project.id, workspace.repository)
+    assert documents.export_block_reason(ArtifactKind.DOCX, run.id) is not None
+    assert documents.export_block_reason(ArtifactKind.PDF, run.id) is not None
+    with pytest.raises(DocumentExportBlocked, match="Export is blocked"):
+        documents.export(ArtifactKind.DOCX, tmp_path / "blocked.docx", run.id)
+    with pytest.raises(DocumentExportBlocked, match="Export is blocked"):
+        documents.export(ArtifactKind.PDF, tmp_path / "blocked.pdf", run.id)
+    assert not (tmp_path / "blocked.docx").exists()
+    assert not (tmp_path / "blocked.pdf").exists()
+
+
+def test_formal_renderer_requirements_are_covered_by_the_final_docx_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical layout requirements must not false-block a real render."""
+
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(
+        ProjectBrief(
+            title="renderer-coverage",
+            topic="renderer-coverage",
+            prompt="Produce an evidence-backed work",
+            work_type=WorkType.COURSEWORK,
+            domain_profile=DomainProfile.IT,
+            title_page={"student": "Test Student", "city": "Moscow"},
+        ),
+        AutopilotOptions(
+            consent_to_remote_processing=True,
+            generate_pdf=True,
+            maximum_revision_cycles=2,
+        ),
+    )
+    source = tmp_path / "methodology.txt"
+    source.write_text("Use the mandatory document layout.", encoding="utf-8")
+    SourceService(workspace).import_files([source], SourceRole.METHODOLOGY)
+    monkeypatch.setattr("papercraft.infrastructure.render.DocumentFinalizer", _FakeLocalFinalizer)
+    fake = _fake_for(
+        workspace.project.id,
+        workspace,
+        accounting=False,
+        requirement_rules=[
+            {
+                "category": "title_page",
+                "key": "methodology.title_page",
+                "statement": "A title page is mandatory.",
+                "value": "required",
+                "mandatory": True,
+                "priority": "methodology",
+            },
+            {
+                "category": "typography",
+                "key": "methodology.font_name",
+                "statement": "Use Times New Roman.",
+                "value": "Times New Roman",
+                "mandatory": True,
+                "priority": "methodology",
+            },
+            {
+                "category": "page_layout",
+                "key": "methodology.margin_left_cm",
+                "statement": "Set the left margin to 3 cm.",
+                "value": 3.0,
+                "mandatory": True,
+                "priority": "methodology",
+            },
+            {
+                "category": "structure",
+                "key": "methodology.include_toc",
+                "statement": "Include a table of contents.",
+                "value": True,
+                "mandatory": True,
+                "priority": "methodology",
+            },
+        ],
+    )
+    factory = ProductionStageFactory(fake, url_verifier=_VerifiedURL())
+    run = AutopilotService(
+        settings,
+        workspace.project,
+        workspace.repository,
+        workspace.paths,
+        factory.build(),
+        terminal_hook=factory.cleanup_remote_files,
+    ).start()
+
+    assert run.status is RunStatus.SUCCEEDED, run.error
+    report = workspace.repository.get_latest_qa_report(run.id)
+    assert report is not None and report.requirement_coverage is not None
+    formal_entries = [
+        entry
+        for entry in report.requirement_coverage.entries
+        if entry.priority is RequirementPriority.METHODOLOGY
+    ]
+    assert len(formal_entries) == 4
+    assert all(entry.status == "covered" for entry in formal_entries)
+    assert all(entry.artifact_id for entry in formal_entries)
+
+
+def _fake_for(
+    project_id: str,
+    workspace: ProjectWorkspace,
+    *,
+    accounting: bool,
+    requirement_rules: list[dict[str, object]] | None = None,
+) -> FakeGeminiGateway:
     fake = FakeGeminiGateway()
-    fake.enqueue("generate_structured", {"rules": [], "conflicts": []})
+    fake.enqueue("generate_structured", {"rules": requirement_rules or [], "conflicts": []})
     fake.enqueue("generate_structured", {"claims": [{"text": "The process is reproducible", "search_query": "reproducibility source", "importance": "critical"}]})
     fake.enqueue("search_grounded", GroundedResult(text="The process is reproducible.", model="fake", annotations=[{"type": "url_citation", "url": "https://example.org/golden", "title": "Golden source"}]))
     fake.enqueue("generate_structured", {"claim_supported": True, "supported_urls": ["https://example.org/golden"], "confidence": 1, "rationale": "direct support", "evidence_quote": "The process is reproducible.", "locator_hint": "body"})
@@ -130,23 +379,24 @@ def _fake_for(project_id: str, workspace: object, *, accounting: bool) -> FakeGe
 
 
 class _FakeLocalFinalizer:
-    """Local PDF fixture: tests pipeline wiring, not Word/LibreOffice quality."""
+    """Local PDF fixture: tests the LibreOffice beta pipeline wiring."""
 
     def word_available(self) -> bool:
-        return True
+        return False
 
     def libreoffice_available(self) -> bool:
-        return False
+        return True
 
     def finalize(
         self,
         docx_path: str | Path,
         *,
         pdf_path: str | Path | None = None,
-        preferred: str = "auto",
+        preferred: str = "libreoffice",
         require_pdf: bool = True,
         allow_unfinalized: bool = False,
     ) -> FinalizationResult:
+        assert preferred == "libreoffice"
         docx = Path(docx_path)
         if not require_pdf:
             return FinalizationResult(docx, None, "none", False)

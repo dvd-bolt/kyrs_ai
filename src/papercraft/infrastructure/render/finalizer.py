@@ -1,13 +1,23 @@
-"""Finalize Word fields and produce PDF through installed desktop software."""
+"""Finalize DOCX fields and export PDFs through local Office software.
+
+LibreOffice is the beta finalizer. Microsoft Word compatibility helpers are
+kept only for non-beta migration callers; the application pipeline always
+requests LibreOffice explicitly. Process diagnostics deliberately avoid
+returning raw LibreOffice output because it can contain local paths and
+document data.
+"""
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import shutil
 import socket
 import subprocess
 import tempfile
 import time
+import zipfile
 from contextlib import suppress
 from dataclasses import dataclass
 from importlib import import_module
@@ -41,7 +51,14 @@ class FinalizationResult:
 
 
 class DocumentFinalizer:
-    """Use Word COM when possible and LibreOffice as a headless fallback."""
+    """Use LibreOffice by default; Word paths are explicit compatibility-only APIs."""
+
+    # LibreOffice can retain extension-registry handles briefly after the UNO
+    # listener exits on Windows. Keep the retry budget bounded but long enough
+    # to remove the per-run profile in ordinary desktop environments.
+    _PROFILE_CLEANUP_ATTEMPTS = 12
+    _PROFILE_CLEANUP_DELAY_SECONDS = 0.5
+    _PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -49,6 +66,8 @@ class DocumentFinalizer:
         libreoffice_path: str | os.PathLike[str] | None = None,
         timeout_seconds: float = 180,
     ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite positive value")
         self.libreoffice_path = Path(libreoffice_path).resolve() if libreoffice_path else None
         self.timeout_seconds = timeout_seconds
 
@@ -57,52 +76,155 @@ class DocumentFinalizer:
         docx_path: str | os.PathLike[str],
         *,
         pdf_path: str | os.PathLike[str] | None = None,
-        preferred: Literal["auto", "word", "libreoffice"] = "auto",
+        preferred: Literal["auto", "word", "libreoffice"] = "libreoffice",
         require_pdf: bool = True,
         allow_unfinalized: bool = False,
     ) -> FinalizationResult:
         docx = Path(docx_path).expanduser().resolve()
         if not docx.is_file() or docx.suffix.lower() != ".docx":
-            raise FinalizationError(f"DOCX does not exist: {docx}")
+            raise FinalizationError("A readable .docx input is required for Office finalization")
         pdf = (
             Path(pdf_path).expanduser().resolve()
-            if pdf_path
+            if pdf_path is not None
             else docx.with_suffix(".pdf")
         )
-        warnings: list[str] = []
 
-        if preferred in {"auto", "word"}:
+        if preferred == "libreoffice":
             try:
-                self._finalize_with_word(docx, pdf if require_pdf else None)
-                return FinalizationResult(
-                    docx,
-                    _pdf_result(pdf) if require_pdf else None,
-                    "word",
-                    True,
-                    tuple(warnings),
-                )
-            except FinalizationError as exc:
-                warnings.append(f"Microsoft Word finalization failed: {exc}")
+                return self._finalize_with_libreoffice_result(docx, pdf, require_pdf, ())
+            except FinalizationError as error:
+                warnings = [self._safe_failure_warning("LibreOffice", error)]
+                return self._unfinalized_or_raise(docx, warnings, require_pdf, allow_unfinalized)
 
-        if preferred in {"auto", "word", "libreoffice"}:
-            try:
-                fields_updated = self._convert_with_libreoffice(
-                    docx,
-                    pdf if require_pdf else None,
-                )
-                return FinalizationResult(
-                    docx,
-                    _pdf_result(pdf) if require_pdf else None,
-                    "libreoffice",
-                    fields_updated,
-                    tuple(warnings),
-                )
-            except FinalizationError as exc:
-                warnings.append(f"LibreOffice finalization failed: {exc}")
+        if preferred == "word":
+            return self._finalize_word_then_libreoffice(
+                docx,
+                pdf,
+                require_pdf=require_pdf,
+                allow_unfinalized=allow_unfinalized,
+            )
 
+        return self._finalize_libreoffice_then_word(
+            docx,
+            pdf,
+            require_pdf=require_pdf,
+            allow_unfinalized=allow_unfinalized,
+        )
+
+    def _finalize_libreoffice_then_word(
+        self,
+        docx: Path,
+        pdf: Path,
+        *,
+        require_pdf: bool,
+        allow_unfinalized: bool,
+    ) -> FinalizationResult:
+        try:
+            return self._finalize_with_libreoffice_result(docx, pdf, require_pdf, ())
+        except FinalizationError as libreoffice_error:
+            libreoffice_warning = self._safe_failure_warning("LibreOffice", libreoffice_error)
+
+        try:
+            return self._finalize_with_word_result(
+                docx,
+                pdf,
+                require_pdf,
+                (
+                    libreoffice_warning,
+                    "Microsoft Word was used as a compatibility fallback; "
+                    "this export is outside the LibreOffice beta gate.",
+                ),
+            )
+        except FinalizationError as word_error:
+            # Keep this order stable for existing callers while retaining the fact
+            # that LibreOffice was attempted first.
+            warnings = [
+                self._safe_failure_warning("Microsoft Word", word_error),
+                libreoffice_warning,
+            ]
+            return self._unfinalized_or_raise(docx, warnings, require_pdf, allow_unfinalized)
+
+    def _finalize_word_then_libreoffice(
+        self,
+        docx: Path,
+        pdf: Path,
+        *,
+        require_pdf: bool,
+        allow_unfinalized: bool,
+    ) -> FinalizationResult:
+        try:
+            return self._finalize_with_word_result(docx, pdf, require_pdf, ())
+        except FinalizationError as word_error:
+            warnings = [self._safe_failure_warning("Microsoft Word", word_error)]
+
+        try:
+            return self._finalize_with_libreoffice_result(docx, pdf, require_pdf, tuple(warnings))
+        except FinalizationError as libreoffice_error:
+            warnings.append(self._safe_failure_warning("LibreOffice", libreoffice_error))
+            return self._unfinalized_or_raise(docx, warnings, require_pdf, allow_unfinalized)
+
+    @staticmethod
+    def _unfinalized_or_raise(
+        docx: Path,
+        warnings: list[str],
+        require_pdf: bool,
+        allow_unfinalized: bool,
+    ) -> FinalizationResult:
         if allow_unfinalized and not require_pdf:
             return FinalizationResult(docx, None, "none", False, tuple(warnings))
-        raise FinalizationUnavailableError("; ".join(warnings) or "No Office finalizer is available")
+        raise FinalizationUnavailableError(
+            "; ".join(warnings) or "No Office finalizer is available"
+        )
+
+    def _finalize_with_libreoffice_result(
+        self,
+        docx: Path,
+        pdf: Path,
+        require_pdf: bool,
+        warnings: tuple[str, ...],
+    ) -> FinalizationResult:
+        fields_updated = self._convert_with_libreoffice(docx, pdf if require_pdf else None)
+        return FinalizationResult(
+            docx,
+            _pdf_result(pdf) if require_pdf else None,
+            "libreoffice",
+            fields_updated,
+            warnings,
+        )
+
+    def _finalize_with_word_result(
+        self,
+        docx: Path,
+        pdf: Path,
+        require_pdf: bool,
+        warnings: tuple[str, ...],
+    ) -> FinalizationResult:
+        self._finalize_with_word(docx, pdf if require_pdf else None)
+        return FinalizationResult(
+            docx,
+            _pdf_result(pdf) if require_pdf else None,
+            "word",
+            True,
+            warnings,
+        )
+
+    @staticmethod
+    def _safe_failure_warning(engine: str, error: FinalizationError) -> str:
+        """Return an actionable category without exposing process output or paths."""
+
+        detail = str(error).strip()
+        message = detail.casefold()
+        if isinstance(error, FinalizationUnavailableError) or "not found" in message:
+            category = "unavailable"
+        elif "timed out" in message:
+            category = "timed out"
+        elif "valid pdf" in message or "pdf was not produced" in message:
+            category = "did not produce a valid PDF"
+        else:
+            category = "failed"
+        if category == "failed" and re.fullmatch(r"[A-Za-z0-9 .,:;()_-]{1,160}", detail):
+            return f"{engine} finalization failed: {detail}"
+        return f"{engine} finalization {category}."
 
     @staticmethod
     def word_available() -> bool:
@@ -162,11 +284,16 @@ class DocumentFinalizer:
                     current = current.NextStoryRange
             document.Save()
             if pdf is not None:
-                pdf.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    pdf.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    raise FinalizationError("Could not create the PDF output directory") from exc
                 # wdExportFormatPDF = 17
                 document.ExportAsFixedFormat(str(pdf), 17, OpenAfterExport=False)
+        except FinalizationError:
+            raise
         except Exception as exc:
-            raise FinalizationError(str(exc)) from exc
+            raise FinalizationError("Microsoft Word finalization failed") from exc
         finally:
             if document is not None:
                 with suppress(Exception):
@@ -184,18 +311,27 @@ class DocumentFinalizer:
             raise FinalizationUnavailableError("LibreOffice executable was not found")
         if pdf is None:
             raise FinalizationUnavailableError(
-                "LibreOffice is used only for PDF conversion; no PDF was requested"
+                "LibreOffice field finalization requires PDF export in this beta"
             )
-        pdf.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="papercraft-lo-",
-            ignore_cleanup_errors=True,
-        ) as temporary_dir:
-            temporary = Path(temporary_dir)
-            profile = temporary / "profile"
-            profile.mkdir()
+        try:
+            pdf.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise FinalizationError("Could not create the PDF output directory") from exc
+
+        try:
+            temporary = Path(tempfile.mkdtemp(prefix="papercraft-lo-"))
+        except OSError as exc:
+            raise FinalizationError("Could not create an isolated LibreOffice profile") from exc
+        try:
+            try:
+                profile = temporary / "profile"
+                profile.mkdir()
+                environment = self._libreoffice_environment(profile)
+            except OSError as exc:
+                raise FinalizationError("Could not prepare the isolated LibreOffice profile") from exc
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             generated = temporary / f"{docx.stem}.pdf"
+            updated_docx = temporary / f"{docx.stem}.updated.docx"
             python = executable.parent / ("python.exe" if os.name == "nt" else "python")
             helper = Path(__file__).with_name("libreoffice_update.py")
             if python.is_file() and helper.is_file():
@@ -206,7 +342,9 @@ class DocumentFinalizer:
                     profile,
                     docx,
                     generated,
+                    updated_docx,
                     creationflags,
+                    environment,
                 )
                 fields_updated = True
             else:
@@ -217,14 +355,102 @@ class DocumentFinalizer:
                     temporary,
                     docx,
                     creationflags,
+                    environment,
                 )
-            if not generated.is_file():
-                raise FinalizationError("LibreOffice did not produce a PDF")
-            temporary_pdf = pdf.with_name(f".{pdf.name}.tmp")
-            shutil.copyfile(generated, temporary_pdf)
-            os.replace(temporary_pdf, pdf)
+            _pdf_result(generated)
+            self._copy_pdf_atomically(generated, pdf)
+            if fields_updated:
+                _docx_result(updated_docx)
+                self._copy_docx_atomically(updated_docx, docx)
+        finally:
+            self._cleanup_working_directory(temporary)
         _pdf_result(pdf)
         return fields_updated
+
+    @staticmethod
+    def _libreoffice_environment(profile: Path) -> dict[str, str]:
+        """Keep profile, caches, and temporary files inside one disposable directory."""
+
+        home = profile / "home"
+        config = profile / "config"
+        cache = profile / "cache"
+        data = profile / "data"
+        temporary = profile / "tmp"
+        for directory in (home, config, cache, data, temporary):
+            directory.mkdir(parents=True, exist_ok=True)
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(config),
+                "XDG_CACHE_HOME": str(cache),
+                "XDG_DATA_HOME": str(data),
+                "TEMP": str(temporary),
+                "TMP": str(temporary),
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _copy_pdf_atomically(source: Path, destination: Path) -> None:
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.stem}-",
+                suffix=".tmp",
+                dir=destination.parent,
+            )
+        except OSError as exc:
+            raise FinalizationError("Could not stage the LibreOffice PDF output") from exc
+        os.close(descriptor)
+        staged = Path(temporary_name)
+        try:
+            shutil.copyfile(source, staged)
+            _pdf_result(staged)
+            os.replace(staged, destination)
+        except FinalizationError:
+            raise
+        except OSError as exc:
+            raise FinalizationError("Could not place the LibreOffice PDF output") from exc
+        finally:
+            with suppress(OSError):
+                staged.unlink(missing_ok=True)
+
+    @staticmethod
+    def _copy_docx_atomically(source: Path, destination: Path) -> None:
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.stem}-",
+                suffix=".tmp",
+                dir=destination.parent,
+            )
+        except OSError as exc:
+            raise FinalizationError("Could not stage the LibreOffice DOCX output") from exc
+        os.close(descriptor)
+        staged = Path(temporary_name)
+        try:
+            shutil.copyfile(source, staged)
+            _docx_result(staged)
+            os.replace(staged, destination)
+        except FinalizationError:
+            raise
+        except OSError as exc:
+            raise FinalizationError("Could not place the LibreOffice DOCX output") from exc
+        finally:
+            with suppress(OSError):
+                staged.unlink(missing_ok=True)
+
+    @classmethod
+    def _cleanup_working_directory(cls, path: Path) -> None:
+        for attempt in range(cls._PROFILE_CLEANUP_ATTEMPTS):
+            try:
+                shutil.rmtree(path)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if attempt + 1 < cls._PROFILE_CLEANUP_ATTEMPTS:
+                    time.sleep(cls._PROFILE_CLEANUP_DELAY_SECONDS)
 
     def _convert_without_field_update(
         self,
@@ -233,6 +459,7 @@ class DocumentFinalizer:
         temporary: Path,
         docx: Path,
         creationflags: int,
+        environment: dict[str, str],
     ) -> None:
         try:
             completed = subprocess.run(
@@ -240,8 +467,9 @@ class DocumentFinalizer:
                     str(executable),
                     "--headless",
                     "--nologo",
-                    "--nolockcheck",
+                    "--norestore",
                     "--nodefault",
+                    "--nofirststartwizard",
                     f"-env:UserInstallation={profile.as_uri()}",
                     "--convert-to",
                     "pdf:writer_pdf_Export",
@@ -254,15 +482,21 @@ class DocumentFinalizer:
                 text=True,
                 timeout=self.timeout_seconds,
                 creationflags=creationflags,
+                env=environment,
             )
         except subprocess.TimeoutExpired as exc:
             raise FinalizationError(
                 f"LibreOffice timed out after {self.timeout_seconds:g} seconds"
             ) from exc
+        except OSError as exc:
+            raise FinalizationError("LibreOffice could not start the PDF conversion") from exc
         generated = temporary / f"{docx.stem}.pdf"
-        if completed.returncode != 0 or not generated.is_file():
-            detail = (completed.stderr or completed.stdout or "unknown error").strip()[-800:]
-            raise FinalizationError(detail)
+        if completed.returncode != 0:
+            raise FinalizationError(
+                f"LibreOffice PDF conversion failed (exit code {completed.returncode})"
+            )
+        if not generated.is_file():
+            raise FinalizationError("LibreOffice completed without producing a PDF")
 
     def _export_with_uno(
         self,
@@ -272,26 +506,39 @@ class DocumentFinalizer:
         profile: Path,
         docx: Path,
         generated: Path,
+        updated_docx: Path,
         creationflags: int,
+        environment: dict[str, str],
     ) -> None:
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            port = int(reservation.getsockname()[1])
-        listener = subprocess.Popen(
-            [
-                str(executable),
-                "--headless",
-                "--nologo",
-                "--norestore",
-                "--nodefault",
-                "--nofirststartwizard",
-                f"-env:UserInstallation={profile.as_uri()}",
-                f"--accept=socket,host=127.0.0.1,port={port};urp;StarOffice.ServiceManager",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        try:
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = int(reservation.getsockname()[1])
+        except OSError as exc:
+            raise FinalizationError("LibreOffice could not reserve a local update port") from exc
+        try:
+            listener = subprocess.Popen(
+                [
+                    str(executable),
+                    "--headless",
+                    "--nologo",
+                    "--norestore",
+                    "--nodefault",
+                    "--nofirststartwizard",
+                    f"-env:UserInstallation={profile.as_uri()}",
+                    "--accept="
+                    f"socket,host=127.0.0.1,port={port};urp;StarOffice.ServiceManager",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                env=environment,
+            )
+        except OSError as exc:
+            raise FinalizationError("LibreOffice could not start the field-update service") from exc
+
+        helper_environment = dict(environment)
+        helper_environment["PYTHONPATH"] = str(python.parent)
         try:
             completed = subprocess.run(
                 [
@@ -303,6 +550,8 @@ class DocumentFinalizer:
                     str(docx),
                     "--pdf",
                     str(generated),
+                    "--updated-docx",
+                    str(updated_docx),
                 ],
                 check=False,
                 capture_output=True,
@@ -310,37 +559,54 @@ class DocumentFinalizer:
                 timeout=self.timeout_seconds,
                 creationflags=creationflags,
                 cwd=python.parent,
-                env={**os.environ, "PYTHONPATH": str(python.parent)},
+                env=helper_environment,
             )
-            if completed.returncode != 0 or not generated.is_file():
-                detail = (completed.stderr or completed.stdout or "UNO export failed").strip()[-800:]
-                raise FinalizationError(detail)
+            if completed.returncode != 0:
+                raise FinalizationError(
+                    "LibreOffice field update and PDF export failed "
+                    f"(exit code {completed.returncode})"
+                )
+            if not generated.is_file():
+                raise FinalizationError("LibreOffice field update completed without producing a PDF")
         except subprocess.TimeoutExpired as exc:
             raise FinalizationError(
                 f"LibreOffice UNO export timed out after {self.timeout_seconds:g} seconds"
             ) from exc
+        except OSError as exc:
+            raise FinalizationError("LibreOffice could not start the field-update helper") from exc
         finally:
-            with suppress(OSError):
-                listener.terminate()
-            try:
-                listener.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                with suppress(OSError):
-                    listener.kill()
-                with suppress(OSError, subprocess.TimeoutExpired):
-                    listener.wait(timeout=10)
-            # LibreOffice may release its extension registry handles a moment
-            # after the UNO desktop reports termination on Windows.
-            time.sleep(1.0)
+            self._stop_process(listener)
+
+    @classmethod
+    def _stop_process(cls, process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        with suppress(OSError):
+            process.terminate()
+        try:
+            process.wait(timeout=cls._PROCESS_STOP_TIMEOUT_SECONDS)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        with suppress(OSError):
+            process.kill()
+        with suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=cls._PROCESS_STOP_TIMEOUT_SECONDS)
 
     def _find_libreoffice(self) -> Path | None:
-        if self.libreoffice_path and self.libreoffice_path.is_file():
+        if self.libreoffice_path is not None:
+            if not self.libreoffice_path.is_file():
+                return None
             if os.name == "nt" and self.libreoffice_path.suffix.casefold() == ".exe":
                 console = self.libreoffice_path.with_suffix(".com")
                 if console.is_file():
                     return console
             return self.libreoffice_path
-        for name in (("soffice.com", "soffice", "libreoffice") if os.name == "nt" else ("soffice", "libreoffice")):
+        names = ("soffice.com", "soffice", "libreoffice") if os.name == "nt" else (
+            "soffice",
+            "libreoffice",
+        )
+        for name in names:
             found = shutil.which(name)
             if found:
                 return Path(found).resolve()
@@ -361,9 +627,25 @@ class DocumentFinalizer:
 
 def _pdf_result(path: Path) -> PDFResult:
     if not path.is_file() or path.stat().st_size < 8:
-        raise FinalizationError(f"PDF was not produced: {path}")
-    with path.open("rb") as stream:
-        header = stream.read(5)
+        raise FinalizationError("PDF was not produced")
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(5)
+    except OSError as exc:
+        raise FinalizationError("PDF output could not be read") from exc
     if header != b"%PDF-":
-        raise FinalizationError(f"output does not have a valid PDF header: {path}")
+        raise FinalizationError("PDF output does not have a valid header")
     return PDFResult(path=path, size_bytes=path.stat().st_size, valid_header=True)
+
+
+def _docx_result(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size < 8:
+        raise FinalizationError("Updated DOCX was not produced")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if "word/document.xml" not in archive.namelist():
+                raise FinalizationError("Updated DOCX does not contain a document body")
+    except FinalizationError:
+        raise
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise FinalizationError("Updated DOCX is not a valid Office document") from exc

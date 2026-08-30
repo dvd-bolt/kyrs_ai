@@ -8,22 +8,27 @@ import mimetypes
 import random
 import re
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from math import ceil
 from pathlib import Path
+from threading import Condition, RLock
 from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from papercraft.config import AppSettings
+from papercraft.config import AppSettings, PerformancePolicy
 
+from .ports import validate_interaction_id
 from .secrets import CredentialSecretStore, SecretStore
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
@@ -31,6 +36,7 @@ SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 _MAX_PROVIDER_DIAGNOSTIC_CHARS = 2048
 _MAX_PROVIDER_FIELD_VIOLATIONS = 4
+_CANCELLATION_POLL_SECONDS = 0.1
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"(?i)(\bauthorization\b\s*[:=]\s*)(?:bearer\s+)?[^\s,;\"']+"),
@@ -62,6 +68,14 @@ class GeminiGatewayError(RuntimeError):
     """Base error raised at the provider boundary."""
 
 
+class GeminiRequestCancelled(GeminiGatewayError):
+    """A local lifecycle request stopped admission before a provider call."""
+
+
+class _GeminiCostLimitError(GeminiGatewayError):
+    """A local admission refusal, not a provider response to sanitize/retry."""
+
+
 class GeminiAuthenticationError(GeminiGatewayError):
     waiting_input = True
 
@@ -75,11 +89,27 @@ class GeminiSafetyError(GeminiGatewayError):
 
 
 class GeminiUnavailableError(GeminiGatewayError):
-    pass
+    """A transient provider failure with an optional safe retry hint."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GeminiStructuredOutputError(GeminiGatewayError):
     pass
+
+
+def _raise_if_cancelled(cancellation_requested: Callable[[], bool] | None) -> None:
+    """Abort local admission without turning a pause into a provider failure."""
+
+    if cancellation_requested is not None and cancellation_requested():
+        raise GeminiRequestCancelled("Gemini request admission was cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +117,417 @@ class _InteractionResponse:
     payload: Any
     request_id: str | None = None
     client_request_id: str | None = None
+    telemetry: _CallTelemetry | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CallTelemetry:
+    """Non-sensitive timing data for one logical provider operation."""
+
+    duration_ms: int
+    attempts: int
+    retry_wait_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestPermit:
+    """A request slot acquired from :class:`ProviderRequestCoordinator`."""
+
+    lane: str
+    throttle_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CooldownTicket:
+    """Identifies the specific cooldown that a retry has waited through."""
+
+    requested_deadline: float
+
+
+class ProviderRequestCoordinator:
+    """Thread-safe, adaptive admission control for Gemini provider calls.
+
+    A single coordinator is owned by a :class:`GeminiGateway` instance and
+    wraps every provider attempt.  It applies a global cap plus smaller lanes
+    for research/search and image requests.  A 429 temporarily opens a
+    cooldown window and reduces future admission to one active request.  Eight
+    successful calls then restore one slot at a time, avoiding an immediate
+    return to the request pattern that caused the throttle.
+
+    ``sleep`` is injectable so gateway retry tests can remain deterministic.
+    Returning from an injected sleep is treated as the requested interval
+    having elapsed; production uses :func:`time.sleep`.
+    """
+
+    def __init__(
+        self,
+        policy: PerformancePolicy,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_time: Callable[[], float] = time.time,
+        initial_adaptive_state: Mapping[str, Any] | None = None,
+        on_adaptive_state_change: Callable[[dict[str, int]], None] | None = None,
+    ) -> None:
+        self.policy = policy
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._wall_time = wall_time
+        self._condition = Condition(RLock())
+        self._active_total = 0
+        self._active_by_lane: dict[str, int] = {}
+        raw_limit = (
+            initial_adaptive_state.get("current_limit")
+            if initial_adaptive_state is not None
+            else None
+        )
+        raw_successes = (
+            initial_adaptive_state.get("successes_since_throttle")
+            if initial_adaptive_state is not None
+            else None
+        )
+        raw_generation = (
+            initial_adaptive_state.get("throttle_generation")
+            if initial_adaptive_state is not None
+            else None
+        )
+        raw_revision = (
+            initial_adaptive_state.get("revision")
+            if initial_adaptive_state is not None
+            else None
+        )
+        raw_cooldown_until_epoch_ms = (
+            initial_adaptive_state.get("cooldown_until_epoch_ms")
+            if initial_adaptive_state is not None
+            else None
+        )
+        try:
+            initial_limit = int(raw_limit) if raw_limit is not None else policy.max_concurrent_requests
+        except (TypeError, ValueError):
+            initial_limit = policy.max_concurrent_requests
+        try:
+            initial_successes = int(raw_successes) if raw_successes is not None else 0
+        except (TypeError, ValueError):
+            initial_successes = 0
+        try:
+            initial_generation = int(raw_generation) if raw_generation is not None else 0
+        except (TypeError, ValueError):
+            initial_generation = 0
+        try:
+            initial_revision = int(raw_revision) if raw_revision is not None else 0
+        except (TypeError, ValueError):
+            initial_revision = 0
+        self._current_limit = min(policy.max_concurrent_requests, max(1, initial_limit))
+        self._successes_since_throttle = (
+            max(0, initial_successes)
+            if self._current_limit < policy.max_concurrent_requests
+            else 0
+        )
+        self._adaptive_recovery_active = self._current_limit < policy.max_concurrent_requests
+        # A state revision makes persistence safe when callbacks from parallel
+        # workers arrive out of order. The throttle generation still guards
+        # recovery accounting for permits admitted before a 429.
+        self._throttle_generation = max(0, initial_generation)
+        self._adaptive_state_revision = max(0, initial_revision)
+        self._cooldown_until = 0.0
+        self._cooldown_until_epoch_ms = 0
+        self._restore_cooldown_locked(raw_cooldown_until_epoch_ms)
+        self._on_adaptive_state_change = on_adaptive_state_change
+
+    def _adaptive_state_locked(self) -> dict[str, int]:
+        state = {
+            "current_limit": self._current_limit,
+            "successes_since_throttle": self._successes_since_throttle,
+            "throttle_generation": self._throttle_generation,
+            "revision": self._adaptive_state_revision,
+        }
+        if self._cooldown_until > self._monotonic() and self._cooldown_until_epoch_ms > 0:
+            state["cooldown_until_epoch_ms"] = self._cooldown_until_epoch_ms
+        return state
+
+    def _wall_clock_epoch_ms(self) -> int:
+        """Return a conservative serializable wall-clock deadline basis."""
+
+        return ceil(self._wall_time() * 1000)
+
+    def _clear_cooldown_locked(self) -> None:
+        self._cooldown_until = 0.0
+        self._cooldown_until_epoch_ms = 0
+
+    def _restore_cooldown_locked(self, raw_deadline: Any) -> None:
+        """Recreate a monotonic cooldown from a persisted epoch deadline.
+
+        Monotonic clocks intentionally have no stable value across worker
+        processes.  Persisting the provider's deadline as wall-clock epoch
+        milliseconds lets a resumed worker retain the remaining 429 window
+        without trusting a previous process's monotonic value.
+        """
+
+        try:
+            deadline = int(raw_deadline) if raw_deadline is not None else 0
+        except (TypeError, ValueError):
+            deadline = 0
+        now_epoch_ms = self._wall_clock_epoch_ms()
+        if deadline <= now_epoch_ms:
+            self._clear_cooldown_locked()
+            return
+        self._cooldown_until_epoch_ms = deadline
+        self._cooldown_until = self._monotonic() + (deadline - now_epoch_ms) / 1000
+
+    def restore_adaptive_state(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        on_change: Callable[[dict[str, int]], None] | None = None,
+    ) -> None:
+        """Restore safe adaptive state after a worker process is restarted."""
+
+        raw_limit = state.get("current_limit") if state is not None else None
+        raw_successes = state.get("successes_since_throttle") if state is not None else None
+        raw_generation = state.get("throttle_generation") if state is not None else None
+        raw_revision = state.get("revision") if state is not None else None
+        raw_cooldown_until_epoch_ms = (
+            state.get("cooldown_until_epoch_ms") if state is not None else None
+        )
+        try:
+            limit = int(raw_limit) if raw_limit is not None else self.policy.max_concurrent_requests
+        except (TypeError, ValueError):
+            limit = self.policy.max_concurrent_requests
+        try:
+            successes = int(raw_successes) if raw_successes is not None else 0
+        except (TypeError, ValueError):
+            successes = 0
+        try:
+            generation = int(raw_generation) if raw_generation is not None else 0
+        except (TypeError, ValueError):
+            generation = 0
+        try:
+            revision = int(raw_revision) if raw_revision is not None else 0
+        except (TypeError, ValueError):
+            revision = 0
+        with self._condition:
+            self._current_limit = min(self.policy.max_concurrent_requests, max(1, limit))
+            self._successes_since_throttle = (
+                max(0, successes)
+                if self._current_limit < self.policy.max_concurrent_requests
+                else 0
+            )
+            self._adaptive_recovery_active = (
+                self._current_limit < self.policy.max_concurrent_requests
+            )
+            self._throttle_generation = max(0, generation)
+            self._adaptive_state_revision = max(0, revision)
+            self._restore_cooldown_locked(raw_cooldown_until_epoch_ms)
+            self._on_adaptive_state_change = on_change
+            self._condition.notify_all()
+
+    def _publish_adaptive_state(self, state: dict[str, int] | None) -> None:
+        if state is not None and self._on_adaptive_state_change is not None:
+            self._on_adaptive_state_change(state)
+
+    @property
+    def current_limit(self) -> int:
+        with self._condition:
+            return self._current_limit
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return safe scheduling diagnostics without request content."""
+
+        with self._condition:
+            remaining = max(0.0, self._cooldown_until - self._monotonic())
+            return {
+                "active_requests": self._active_total,
+                "active_by_lane": dict(self._active_by_lane),
+                "current_limit": self._current_limit,
+                "maximum_limit": self.policy.max_concurrent_requests,
+                "cooldown_remaining_ms": round(remaining * 1000),
+                "successes_since_throttle": self._successes_since_throttle,
+                "throttle_generation": self._throttle_generation,
+                "adaptive_state_revision": self._adaptive_state_revision,
+            }
+
+    def _lane_limit(self, lane: str) -> int:
+        if lane == "research":
+            return self.policy.max_research_requests
+        if lane == "image":
+            return self.policy.max_image_requests
+        return self.policy.max_concurrent_requests
+
+    def _can_acquire_locked(self, lane: str) -> bool:
+        return (
+            self._active_total < self._current_limit
+            and self._active_by_lane.get(lane, 0) < self._lane_limit(lane)
+        )
+
+    def acquire(
+        self,
+        lane: str = "default",
+        *,
+        cancellation_requested: Callable[[], bool] | None = None,
+    ) -> ProviderRequestPermit:
+        """Block until the caller may start one provider attempt.
+
+        When a lifecycle cancellation probe is supplied, contention and
+        cooldown waits are sliced into short intervals.  This prevents a
+        worker queued behind another request from waking later and issuing a
+        newly paid provider call after its run was paused or cancelled.
+        """
+
+        while True:
+            _raise_if_cancelled(cancellation_requested)
+            wait_seconds = 0.0
+            observed_deadline = 0.0
+            with self._condition:
+                # Re-check while holding the same lock used to grant a
+                # permit.  A cancellation observed here wins over admission.
+                _raise_if_cancelled(cancellation_requested)
+                now = self._monotonic()
+                if self._cooldown_until <= now:
+                    self._clear_cooldown_locked()
+                if self._cooldown_until > now:
+                    wait_seconds = self._cooldown_until - now
+                    observed_deadline = self._cooldown_until
+                elif self._can_acquire_locked(lane):
+                    self._active_total += 1
+                    self._active_by_lane[lane] = self._active_by_lane.get(lane, 0) + 1
+                    return ProviderRequestPermit(
+                        lane=lane,
+                        throttle_generation=self._throttle_generation,
+                    )
+                else:
+                    self._condition.wait(
+                        timeout=(
+                            _CANCELLATION_POLL_SECONDS
+                            if cancellation_requested is not None
+                            else None
+                        )
+                    )
+                    continue
+
+            # Do not sleep while holding the lock: other in-flight attempts
+            # must be able to release their permits or report a new 429.
+            if cancellation_requested is None:
+                self._sleep(wait_seconds)
+            else:
+                remaining = wait_seconds
+                while remaining > 0:
+                    _raise_if_cancelled(cancellation_requested)
+                    interval = min(_CANCELLATION_POLL_SECONDS, remaining)
+                    self._sleep(interval)
+                    remaining -= interval
+                _raise_if_cancelled(cancellation_requested)
+            with self._condition:
+                # In tests the injected sleep may deliberately not advance a
+                # real clock.  Treat its return as the requested wait having
+                # completed, but never erase a newer/longer cooldown.
+                if self._cooldown_until <= observed_deadline:
+                    self._clear_cooldown_locked()
+                    self._condition.notify_all()
+
+    def release(self, permit: ProviderRequestPermit) -> None:
+        with self._condition:
+            active_for_lane = self._active_by_lane.get(permit.lane, 0)
+            if active_for_lane <= 0 or self._active_total <= 0:
+                raise RuntimeError("Provider request coordinator released an unknown permit")
+            if active_for_lane == 1:
+                self._active_by_lane.pop(permit.lane, None)
+            else:
+                self._active_by_lane[permit.lane] = active_for_lane - 1
+            self._active_total -= 1
+            self._condition.notify_all()
+
+    @contextmanager
+    def request(
+        self,
+        lane: str = "default",
+        *,
+        cancellation_requested: Callable[[], bool] | None = None,
+    ) -> Iterator[ProviderRequestPermit]:
+        permit = self.acquire(lane, cancellation_requested=cancellation_requested)
+        try:
+            yield permit
+        finally:
+            self.release(permit)
+
+    def throttled(self, retry_after_seconds: float) -> _CooldownTicket:
+        """Publish a 429 cooldown before the failed call is retried."""
+
+        cooldown_seconds = max(0.0, retry_after_seconds)
+        requested_deadline = self._monotonic() + cooldown_seconds
+        requested_epoch_ms = self._wall_clock_epoch_ms() + ceil(cooldown_seconds * 1000)
+        state: dict[str, int] | None = None
+        with self._condition:
+            if requested_deadline > self._cooldown_until:
+                self._cooldown_until = requested_deadline
+                self._cooldown_until_epoch_ms = max(
+                    self._cooldown_until_epoch_ms,
+                    requested_epoch_ms,
+                )
+                self._throttle_generation += 1
+            self._successes_since_throttle = 0
+            if self.policy.adaptive_throttling:
+                self._current_limit = 1
+                self._adaptive_recovery_active = True
+            self._adaptive_state_revision += 1
+            self._condition.notify_all()
+            state = self._adaptive_state_locked()
+        self._publish_adaptive_state(state)
+        return _CooldownTicket(requested_deadline=requested_deadline)
+
+    def wait_for_retry(
+        self,
+        ticket: _CooldownTicket,
+        delay_seconds: float,
+        *,
+        cancellation_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        """Wait once for the throttled call and unblock matching cooldowns.
+
+        Retry waits use the same bounded cancellation behaviour as first-time
+        admission, so a paused run cannot wake up and issue a retry later.
+        """
+
+        if cancellation_requested is None:
+            self._sleep(delay_seconds)
+        else:
+            remaining = max(0.0, delay_seconds)
+            while remaining > 0:
+                _raise_if_cancelled(cancellation_requested)
+                interval = min(_CANCELLATION_POLL_SECONDS, remaining)
+                self._sleep(interval)
+                remaining -= interval
+            _raise_if_cancelled(cancellation_requested)
+        with self._condition:
+            # A different request may have extended the cooldown while this
+            # caller slept.  Only this caller's own (or a shorter) deadline
+            # may be cleared here.
+            if ticket.requested_deadline >= self._cooldown_until:
+                self._clear_cooldown_locked()
+                self._condition.notify_all()
+
+    def succeeded(self, permit: ProviderRequestPermit) -> None:
+        """Record a successful provider attempt and gradually restore slots."""
+
+        state: dict[str, int] | None = None
+        with self._condition:
+            # Calls admitted before a later 429 do not count toward recovery.
+            if permit.throttle_generation != self._throttle_generation:
+                return
+            self._successes_since_throttle += 1
+            if (
+                self.policy.adaptive_throttling
+                and self._current_limit < self.policy.max_concurrent_requests
+                and self._successes_since_throttle >= self.policy.recovery_successes
+            ):
+                self._current_limit += 1
+                self._successes_since_throttle = 0
+                self._condition.notify_all()
+            if self._adaptive_recovery_active:
+                self._adaptive_state_revision += 1
+                state = self._adaptive_state_locked()
+                if self._current_limit >= self.policy.max_concurrent_requests:
+                    self._adaptive_recovery_active = False
+        self._publish_adaptive_state(state)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,11 +572,25 @@ class GeminiGateway:
         client: Any | None = None,
         usage_sink: Callable[[UsageRecord], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        request_coordinator: ProviderRequestCoordinator | None = None,
     ) -> None:
         self.settings = settings
         self.secret_store = secret_store or CredentialSecretStore()
         self.usage_sink = usage_sink
         self._sleep = sleep
+        self.request_coordinator = request_coordinator or ProviderRequestCoordinator(
+            settings.performance_policy,
+            sleep=sleep,
+        )
+        self._usage_lock = RLock()
+        self._work_item_id: ContextVar[str] = ContextVar(
+            "papercraft_gemini_work_item_id",
+            default="",
+        )
+        self._cancellation_requested: ContextVar[Callable[[], bool] | None] = ContextVar(
+            "papercraft_gemini_cancellation_requested",
+            default=None,
+        )
 
         key = (
             settings.gemini_api_key.get_secret_value()
@@ -153,10 +608,9 @@ class GeminiGateway:
 
                 # The application owns HTTP retry classification, bounded
                 # attempts, provider Retry-After handling and jitter. Override
-                # the SDK's retryable HTTP codes with an unused sentinel so a
-                # single logical 429/5xx attempt cannot fan out into enough
-                # requests to keep a quota window permanently hot. The SDK may
-                # still make its one documented transport recovery attempt.
+                # the SDK's retryable HTTP codes with an unused sentinel.
+                # ``attempts=1`` means no SDK retries, so one logical call
+                # cannot fan out into duplicate paid POST requests.
                 client = genai.Client(
                     api_key=key,
                     http_options=types.HttpOptions(
@@ -167,7 +621,13 @@ class GeminiGateway:
                     ),
                 )
             except Exception as exc:  # pragma: no cover - SDK environment dependent
-                raise GeminiAuthenticationError(f"Unable to initialise Gemini: {exc}") from exc
+                # SDK initialisation errors can include a serialized request or
+                # credential/header details.  Keep the durable/UI-facing error
+                # classification-only; the original exception remains chained
+                # for a local debugger without being persisted by the runner.
+                raise GeminiAuthenticationError(
+                    f"Unable to initialise Gemini client ({type(exc).__name__})"
+                ) from exc
         self.client = client
 
     def _model(self, role: str) -> str:
@@ -190,6 +650,12 @@ class GeminiGateway:
         return value
 
     @staticmethod
+    def _lane_for_role(role: str) -> str:
+        """Map provider roles to the narrow lanes enforced by the coordinator."""
+
+        return "research" if role == "research" else "default"
+
+    @staticmethod
     def _status_code(exc: Exception) -> int | None:
         for attribute in ("status_code", "code"):
             value = getattr(exc, attribute, None)
@@ -210,11 +676,11 @@ class GeminiGateway:
 
     @staticmethod
     def _is_transport_error(exc: Exception) -> bool:
-        """Return whether an exception represents a request that is safe to retry.
+        """Return whether an exception is an ambiguous transport failure.
 
-        Arbitrary exceptions used to be retried as though they were network
-        failures.  That can duplicate paid POST requests when the defect is a
-        local ``TypeError``/``ValueError`` and can hide SDK contract changes.
+        Transport failures must be surfaced as unavailable, not retried: the
+        provider might have accepted the paid POST before its response was
+        lost.  Keep local programming errors out of that classification too.
         """
 
         return isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError))
@@ -475,47 +941,169 @@ class GeminiGateway:
         function: Callable[[], Any],
         *,
         not_found_ok: bool = False,
+        enforce_cost_limit: bool = True,
+        honor_cancellation: bool = True,
         error_context: dict[str, Any] | None = None,
+        lane: str = "default",
+        max_attempts: int | None = None,
     ) -> Any:
         retry = self.settings.retry_policy
+        attempt_limit = max_attempts if max_attempts is not None else retry.max_attempts
+        if attempt_limit < 1:
+            raise ValueError("max_attempts must be at least 1")
         last_error: Exception | None = None
-        for attempt in range(1, retry.max_attempts + 1):
+        last_retry_after_seconds: float | None = None
+        started_at = time.monotonic()
+        retry_wait_seconds = 0.0
+        # A cancellation scope stops paid work before it can be admitted.
+        # Idempotent remote cleanup/lifecycle calls are the exception: they
+        # often run *because* the scope was cancelled and must still reach
+        # Gemini to avoid retaining remote data.
+        cancellation_requested = (
+            self._cancellation_requested.get() if honor_cancellation else None
+        )
+        for attempt in range(1, attempt_limit + 1):
+            throttle_ticket: _CooldownTicket | None = None
+            throttle_delay: float | None = None
             try:
-                return function()
+                _raise_if_cancelled(cancellation_requested)
+                request = (
+                    self.request_coordinator.request(lane)
+                    if cancellation_requested is None
+                    else self.request_coordinator.request(
+                        lane,
+                        cancellation_requested=cancellation_requested,
+                    )
+                )
+                with request as permit:
+                    # A queued worker can be cancelled after the coordinator
+                    # wakes it but before this thread reaches its provider
+                    # call.  Preserve any already-returned response, but do
+                    # not create a new billable request in that narrow gap.
+                    _raise_if_cancelled(cancellation_requested)
+                    # Check *after* admission on every paid attempt. A request
+                    # can spend time queued behind another worker (or sleeping
+                    # for a retry) while that worker crosses the durable cost
+                    # cap. It must then give its permit back without issuing a
+                    # new paid provider call. Idempotent remote cleanup and
+                    # stored-interaction lifecycle calls deliberately bypass
+                    # this gate: blocking them would strand provider data after
+                    # a run reaches its cap.
+                    limit_probe = getattr(self.usage_sink, "limit_reached", None)
+                    if enforce_cost_limit and callable(limit_probe) and bool(limit_probe()):
+                        raise _GeminiCostLimitError(
+                            "Gemini request skipped because the configured cost limit was reached"
+                        )
+                    try:
+                        response = function()
+                    except Exception as exc:
+                        # Publish the 429 while this permit is still held.
+                        # Releasing first would leave a small window in which
+                        # another waiting worker could start a new request.
+                        if self._status_code(exc) == 429:
+                            throttle_delay = min(
+                                retry.maximum_delay_seconds,
+                                retry.base_delay_seconds * (2 ** (attempt - 1)),
+                            ) + random.uniform(0, retry.jitter_seconds)
+                            retry_after = self._retry_after_seconds(exc)
+                            if retry_after is not None:
+                                # Retry-After is a provider instruction, not
+                                # an ordinary exponential-backoff preference.
+                                # Capping it at our normal retry maximum
+                                # causes a new paid request before the quota
+                                # window has reopened.
+                                last_retry_after_seconds = retry_after
+                                throttle_delay = max(
+                                    throttle_delay,
+                                    retry_after,
+                                )
+                            throttle_ticket = self.request_coordinator.throttled(throttle_delay)
+                        raise
+                self.request_coordinator.succeeded(permit)
+                if isinstance(response, _InteractionResponse):
+                    return replace(
+                        response,
+                        telemetry=_CallTelemetry(
+                            duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
+                            attempts=attempt,
+                            retry_wait_ms=max(0, round(retry_wait_seconds * 1000)),
+                        ),
+                    )
+                return response
+            except (_GeminiCostLimitError, GeminiRequestCancelled):
+                raise
             except Exception as exc:
                 last_error = exc
                 status = self._status_code(exc)
                 if status == 404 and not_found_ok:
                     return None
                 if status in {400, 401, 403, 404}:
+                    diagnostic = self._safe_provider_error_summary(exc, status=status)
                     if status in {401, 403}:
-                        raise GeminiAuthenticationError(f"{operation} was rejected: {exc}") from exc
+                        raise GeminiAuthenticationError(
+                            f"{operation} was rejected: {diagnostic}"
+                        ) from exc
                     if status == 404:
                         raise GeminiConfigurationError(
-                            f"{operation} references an unavailable model or endpoint: {exc}"
+                            f"{operation} references an unavailable model or endpoint: {diagnostic}"
                         ) from exc
-                    diagnostic = self._safe_provider_error_summary(exc, status=status)
                     if error_context is not None:
                         context = self._canonical_json_bytes(error_context).decode("utf-8")
                         diagnostic = f"{diagnostic}; structured_request_metadata={context}"
                     raise GeminiGatewayError(f"{operation} is invalid: {diagnostic}") from exc
-                retryable = status in {408, 409, 429, 500, 502, 503, 504} or (
-                    status is None and self._is_transport_error(exc)
-                )
-                if not retryable:
-                    raise GeminiGatewayError(f"{operation} failed: {exc}") from exc
-                if not retryable or attempt >= retry.max_attempts:
+                # Interactions are paid POST requests.  A 429 confirms that
+                # Gemini rejected the attempt before it could run, so the
+                # bounded retry below is safe.  Timeouts, transport errors,
+                # 408/409, and 5xx responses are ambiguous: Gemini may have
+                # accepted and billed them despite the missing response.  Do
+                # not silently duplicate those operations; surface a
+                # resumable provider failure instead.
+                if status != 429:
+                    diagnostic = self._safe_provider_error_summary(exc, status=status)
+                    if status in {408, 409, 500, 502, 503, 504} or (
+                        status is None and self._is_transport_error(exc)
+                    ):
+                        raise GeminiUnavailableError(
+                            f"{operation} could not be safely retried: {diagnostic}"
+                        ) from exc
+                    raise GeminiGatewayError(f"{operation} failed: {diagnostic}") from exc
+                delay = throttle_delay
+                if delay is None:
+                    delay = min(
+                        retry.maximum_delay_seconds,
+                        retry.base_delay_seconds * (2 ** (attempt - 1)),
+                    ) + random.uniform(0, retry.jitter_seconds)
+                if attempt >= attempt_limit:
                     break
-                delay = min(
-                    retry.maximum_delay_seconds,
-                    retry.base_delay_seconds * (2 ** (attempt - 1)),
-                ) + random.uniform(0, retry.jitter_seconds)
-                retry_after = self._retry_after_seconds(exc) if status == 429 else None
-                if retry_after is not None:
-                    delay = max(delay, min(retry.maximum_delay_seconds, retry_after))
-                self._sleep(delay)
+                retry_wait_seconds += delay
+                if throttle_ticket is not None:
+                    self.request_coordinator.wait_for_retry(
+                        throttle_ticket,
+                        delay,
+                        cancellation_requested=cancellation_requested,
+                    )
+                else:
+                    if cancellation_requested is None:
+                        self._sleep(delay)
+                    else:
+                        remaining = max(0.0, delay)
+                        while remaining > 0:
+                            _raise_if_cancelled(cancellation_requested)
+                            interval = min(_CANCELLATION_POLL_SECONDS, remaining)
+                            self._sleep(interval)
+                            remaining -= interval
+                        _raise_if_cancelled(cancellation_requested)
+        diagnostic = (
+            self._safe_provider_error_summary(
+                last_error,
+                status=self._status_code(last_error),
+            )
+            if last_error is not None
+            else '{"exception_type":"Unknown","message":"No provider error was captured.","status_code":null}'
+        )
         raise GeminiUnavailableError(
-            f"{operation} failed after {retry.max_attempts} attempts: {last_error}"
+            f"{operation} failed after {attempt_limit} attempts: {diagnostic}",
+            retry_after_seconds=last_retry_after_seconds,
         ) from last_error
 
     def _create_interaction(self, **body: Any) -> _InteractionResponse:
@@ -576,7 +1164,14 @@ class GeminiGateway:
     def _payload(response: Any) -> Any:
         return response.payload if isinstance(response, _InteractionResponse) else response
 
-    def _usage(self, response: Any, operation: str, model: str) -> UsageRecord:
+    def _usage(
+        self,
+        response: Any,
+        operation: str,
+        model: str,
+        *,
+        conservative_input_tokens: int = 0,
+    ) -> UsageRecord:
         payload = self._payload(response)
         provider_request_id = (
             response.request_id if isinstance(response, _InteractionResponse) else None
@@ -584,21 +1179,44 @@ class GeminiGateway:
         client_request_id = (
             response.client_request_id if isinstance(response, _InteractionResponse) else None
         )
+        telemetry = response.telemetry if isinstance(response, _InteractionResponse) else None
         request_id = provider_request_id or ""
-        usage = getattr(payload, "usage", None)
-        input_tokens = int(
+        usage = getattr(payload, "usage", None) or getattr(payload, "usage_metadata", None)
+        reported_input_tokens = int(
             getattr(usage, "total_input_tokens", None)
             or getattr(usage, "input_tokens", 0)
+            or getattr(usage, "prompt_token_count", 0)
             or 0
         )
+        # The Embed Content response does not consistently expose token usage
+        # across API surfaces. Its input is nevertheless billable. A UTF-8
+        # byte count is a deliberately conservative upper-bound estimate that
+        # lets the durable/live budget stop later embedding calls even when
+        # the provider omits usage metadata. Never persist the text itself.
+        fallback_input_tokens = max(0, int(conservative_input_tokens))
+        input_tokens = max(reported_input_tokens, fallback_input_tokens)
         output_tokens = int(
             getattr(usage, "total_output_tokens", None)
             or getattr(usage, "output_tokens", 0)
+            or getattr(usage, "response_token_count", 0)
             or 0
         )
-        thought_tokens = int(getattr(usage, "total_thought_tokens", 0) or 0)
-        tool_use_tokens = int(getattr(usage, "total_tool_use_tokens", 0) or 0)
-        total_tokens = int(getattr(usage, "total_tokens", 0) or input_tokens + output_tokens)
+        thought_tokens = int(
+            getattr(usage, "total_thought_tokens", 0)
+            or getattr(usage, "thoughts_token_count", 0)
+            or 0
+        )
+        tool_use_tokens = int(
+            getattr(usage, "total_tool_use_tokens", 0)
+            or getattr(usage, "tool_use_prompt_token_count", 0)
+            or 0
+        )
+        total_tokens = int(
+            getattr(usage, "total_tokens", 0)
+            or getattr(usage, "total_token_count", 0)
+            or input_tokens + output_tokens
+        )
+        total_tokens = max(total_tokens, input_tokens + output_tokens)
         price = self.settings.pricing_policy.models.get(model)
         estimated = Decimal("0")
         if price is not None:
@@ -636,6 +1254,13 @@ class GeminiGateway:
             metadata={
                 "thought_tokens": thought_tokens,
                 "tool_use_tokens": tool_use_tokens,
+                "input_tokens_source": (
+                    "conservative_estimate"
+                    if fallback_input_tokens > reported_input_tokens
+                    else "provider"
+                    if reported_input_tokens > 0
+                    else "unavailable"
+                ),
                 "search_queries": search_queries,
                 "pricing_missing": price is None,
                 "interaction_id": str(getattr(payload, "id", "") or ""),
@@ -644,12 +1269,60 @@ class GeminiGateway:
                 "provider_request_id": provider_request_id or "",
                 "client_request_id": client_request_id or "",
                 "status": str(getattr(payload, "status", "") or ""),
+                "duration_ms": telemetry.duration_ms if telemetry is not None else 0,
+                "attempts": telemetry.attempts if telemetry is not None else 1,
+                "retry_wait_ms": telemetry.retry_wait_ms if telemetry is not None else 0,
+                "work_item_id": self._work_item_id.get(),
             },
         )
 
-    def _record(self, response: Any, operation: str, model: str) -> None:
+    @contextmanager
+    def work_item_scope(self, work_item_id: str) -> Iterator[None]:
+        """Attach a stable stage item ID to safe usage telemetry in this thread."""
+
+        token = self._work_item_id.set(work_item_id)
+        try:
+            yield
+        finally:
+            self._work_item_id.reset(token)
+
+    @contextmanager
+    def cancellation_scope(self, cancellation_requested: Callable[[], bool]) -> Iterator[None]:
+        """Bind a stage worker's cooperative lifecycle probe to this thread.
+
+        The scope is deliberately opt-in and thread-local.  Direct provider
+        calls preserve their existing behaviour, while parallel stage workers
+        can cancel a queued admission without affecting another run or an
+        already-billable request in a different worker.
+        """
+
+        token = self._cancellation_requested.set(cancellation_requested)
+        try:
+            yield
+        finally:
+            self._cancellation_requested.reset(token)
+
+    def _record(
+        self,
+        response: Any,
+        operation: str,
+        model: str,
+        *,
+        conservative_input_tokens: int = 0,
+    ) -> None:
         if self.usage_sink is not None:
-            self.usage_sink(self._usage(response, operation, model))
+            # Parallel stage workers can complete together.  Serialising the
+            # sink keeps repository-backed cost tracking deterministic without
+            # exposing caller prompts or response bodies in telemetry.
+            with self._usage_lock:
+                self.usage_sink(
+                    self._usage(
+                        response,
+                        operation,
+                        model,
+                        conservative_input_tokens=conservative_input_tokens,
+                    )
+                )
 
     def _require_usable_response(self, response: Any, *, operation: str) -> Any:
         payload = self._payload(response)
@@ -662,7 +1335,7 @@ class GeminiGateway:
             raise GeminiGatewayError(f"{operation} returned provider status {status}")
         return payload
 
-    def health_check(self) -> None:
+    def health_check(self, *, fail_fast: bool = False) -> None:
         """Validate credentials and the pinned Gemini 3.7 production model."""
 
         role = "requirements"
@@ -677,7 +1350,11 @@ class GeminiGateway:
                 timeout=self.settings.request_timeout_seconds,
             )
 
-        response = self._call("Gemini health check", invoke)
+        response = self._call(
+            "Gemini health check",
+            invoke,
+            max_attempts=1 if fail_fast else None,
+        )
         self._record(response, "health_check", model)
         payload = self._require_usable_response(response, operation="Gemini health check")
         text = str(getattr(payload, "output_text", "") or "").strip()
@@ -705,7 +1382,11 @@ class GeminiGateway:
                 body["system_instruction"] = system_instruction
             return self._create_interaction(**body)
 
-        response = self._call(f"text generation ({role})", invoke)
+        response = self._call(
+            f"text generation ({role})",
+            invoke,
+            lane=self._lane_for_role(role),
+        )
         self._record(response, "generate_text", model)
         payload = self._require_usable_response(response, operation=f"text generation ({role})")
         output = str(getattr(payload, "output_text", "") or "").strip()
@@ -783,6 +1464,7 @@ class GeminiGateway:
                 f"structured generation ({role})",
                 invoke,
                 error_context=request_metadata,
+                lane=self._lane_for_role(role),
             )
             # Every completed provider response is billable, including an
             # invalid JSON response that needs a schema-repair interaction.
@@ -820,8 +1502,11 @@ class GeminiGateway:
                     ]
                 continue
             return parsed
+        # A pydantic validation error may include values copied from the model
+        # response.  It is useful only for the in-process repair prompt above,
+        # not for a durable stage/run event.
         raise GeminiStructuredOutputError(
-            f"Gemini response failed schema validation after three attempts: {last_error}"
+            "Gemini response failed schema validation after three attempts"
         ) from last_error
 
     def search_grounded(
@@ -846,7 +1531,7 @@ class GeminiGateway:
                 body["system_instruction"] = system_instruction
             return self._create_interaction(**body)
 
-        response = self._call("grounded Google Search", invoke)
+        response = self._call("grounded Google Search", invoke, lane="research")
         self._record(response, "search_grounded", model)
         payload = self._require_usable_response(response, operation="grounded Google Search")
         raw_steps: list[dict[str, Any]] = []
@@ -907,6 +1592,8 @@ class GeminiGateway:
             "Gemini file deletion",
             lambda: self.client.files.delete(name=name),
             not_found_ok=True,
+            enforce_cost_limit=False,
+            honor_cancellation=False,
         )
 
     def generate_image(self, *, prompt: str, destination: Path) -> Path:
@@ -925,7 +1612,7 @@ class GeminiGateway:
                 timeout=self.settings.request_timeout_seconds,
             )
 
-        response = self._call("Gemini image generation", invoke)
+        response = self._call("Gemini image generation", invoke, lane="image")
         self._record(response, "generate_image", model)
         payload_response = self._require_usable_response(
             response, operation="Gemini image generation"
@@ -992,6 +1679,12 @@ class GeminiGateway:
                 "Gemini embeddings",
                 invoke_embedding,
             )
+            self._record(
+                response,
+                "embed_texts",
+                model,
+                conservative_input_tokens=len(text.encode("utf-8")),
+            )
             embeddings = list(getattr(response, "embeddings", None) or [])
             if len(embeddings) != 1:
                 raise GeminiGatewayError("Gemini returned the wrong number of embedding vectors")
@@ -1017,7 +1710,11 @@ class GeminiGateway:
                 timeout=self.settings.request_timeout_seconds,
             )
 
-        response = self._call(f"background generation ({role})", invoke)
+        response = self._call(
+            f"background generation ({role})",
+            invoke,
+            lane=self._lane_for_role(role),
+        )
         self._record(response, "start_background_text", model)
         payload = self._require_usable_response(
             response, operation=f"background generation ({role})"
@@ -1025,11 +1722,10 @@ class GeminiGateway:
         interaction_id = str(getattr(payload, "id", "") or "")
         if not interaction_id:
             raise GeminiGatewayError("Gemini background request returned no interaction ID")
-        return interaction_id
+        return validate_interaction_id(interaction_id)
 
     def cancel_interaction(self, interaction_id: str) -> str:
-        if re.fullmatch(r"[A-Za-z0-9._~-]+", interaction_id) is None:
-            raise ValueError("Unexpected Gemini interaction ID")
+        interaction_id = validate_interaction_id(interaction_id)
         response = self._call(
             "Gemini interaction cancellation",
             lambda: self.client.interactions.cancel(
@@ -1037,8 +1733,54 @@ class GeminiGateway:
                 extra_headers={"Api-Revision": "2026-05-20"},
                 timeout=self.settings.request_timeout_seconds,
             ),
+            enforce_cost_limit=False,
+            honor_cancellation=False,
         )
         status = str(getattr(response, "status", "") or "").casefold()
         if not status:
             raise GeminiGatewayError("Gemini cancellation returned no status")
         return status
+
+    def get_interaction_status(self, interaction_id: str) -> str | None:
+        """Return the normalized background status, or ``None`` after a safe 404.
+
+        A deleted interaction is deliberately indistinguishable from any other
+        not-found response.  Neither the provider error text nor the ID is
+        copied into diagnostics.
+        """
+
+        interaction_id = validate_interaction_id(interaction_id)
+        response = self._call(
+            "Gemini interaction lookup",
+            lambda: self.client.interactions.get(
+                id=interaction_id,
+                extra_headers={"Api-Revision": "2026-05-20"},
+                timeout=self.settings.request_timeout_seconds,
+            ),
+            not_found_ok=True,
+            enforce_cost_limit=False,
+            honor_cancellation=False,
+        )
+        if response is None:
+            return None
+        payload = self._payload(response)
+        status = str(getattr(payload, "status", "") or "").casefold()
+        if not status:
+            raise GeminiGatewayError("Gemini interaction lookup returned no status")
+        return status
+
+    def delete_interaction(self, interaction_id: str) -> None:
+        """Delete a stored background interaction; a prior deletion is success."""
+
+        interaction_id = validate_interaction_id(interaction_id)
+        self._call(
+            "Gemini interaction deletion",
+            lambda: self.client.interactions.delete(
+                id=interaction_id,
+                extra_headers={"Api-Revision": "2026-05-20"},
+                timeout=self.settings.request_timeout_seconds,
+            ),
+            not_found_ok=True,
+            enforce_cost_limit=False,
+            honor_cancellation=False,
+        )

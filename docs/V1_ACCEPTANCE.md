@@ -1,5 +1,10 @@
 # V1 acceptance checklist
 
+> **Historical public-release checklist.** The active private beta is
+> LibreOffice-only; its authoritative scope and checks are in
+> [`BETA_ACCEPTANCE_MATRIX.md`](BETA_ACCEPTANCE_MATRIX.md). This checklist's
+> Microsoft Word item does not block the private beta.
+
 Текущий результат этапа 3: **RELEASE BLOCKED**. Release commit нельзя создавать, пока
 обязательные live-пункты ниже не завершены без `CRITICAL`/`BLOCKER`.
 
