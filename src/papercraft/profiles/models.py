@@ -19,8 +19,8 @@ class ProfilePolicy(BaseModel):
     voice: str
     required_artifacts: list[str] = Field(default_factory=list)
     source_priorities: list[str] = Field(default_factory=list)
-    allow_synthetic_data: bool = True
-    synthetic_data_disclosure: Literal["internal_only", "document_and_internal"] = "internal_only"
+    allow_synthetic_data: bool = False
+    synthetic_data_disclosure: Literal["document_and_internal"] = "document_and_internal"
     require_real_organisation_facts: bool = False
     minimum_sources: int = Field(default=10, ge=0, le=200)
     section_tolerance_fraction: float = Field(default=0.10, ge=0, le=0.5)
@@ -178,23 +178,30 @@ def default_profile_registry() -> ProfileRegistry:
             display_name="Научная статья",
             work_type="scientific_article",
             domain_tags=["general"],
-            description="Статья по IMRaD либо структуре из требований журнала.",
+            description="Студенческая научная статья по ГОСТ Р 7.0.7-2021 и регламенту научки.md.",
             sections=[
-                _section("abstract", "АННОТАЦИЯ", 180, "Кратко изложить цель, метод, результат и вывод"),
-                _section("introduction", "ВВЕДЕНИЕ", 700, "Описать проблему и научный пробел"),
-                _section("methods", "МАТЕРИАЛЫ И МЕТОДЫ", 1000, "Описать воспроизводимую методику"),
-                _section("results", "РЕЗУЛЬТАТЫ", 1500, "Представить результаты без дублирования таблиц"),
-                _section("discussion", "ОБСУЖДЕНИЕ", 1300, "Сопоставить результаты с литературой"),
-                _section("conclusion", "ЗАКЛЮЧЕНИЕ", 500, "Сформулировать ограничения и выводы"),
-                _section("bibliography", "СПИСОК ЛИТЕРАТУРЫ", 100, "Перечислить цитируемые источники"),
+                _section("abstract", "АННОТАЦИЯ", 150, "Кратко изложить цель, метод, результат и вывод (рус/англ)"),
+                _section("introduction", "ВВЕДЕНИЕ", 300, "Описать актуальность, цель, объект и научную проблему"),
+                _section("theory", "ТЕОРЕТИЧЕСКИЕ ОСНОВЫ", 500, "Рассмотреть теоретические подходы и научный контекст"),
+                _section("practical", "ПРАКТИЧЕСКАЯ ЧАСТЬ И РАСЧЕТЫ", 700, "Представить эмпирический анализ, расчеты, таблицы и графики"),
+                _section("conclusion", "ЗАКЛЮЧЕНИЕ", 450, "Сформулировать итоги, научную новизну и выводы"),
+                _section("bibliography", "СПИСОК ЛИТЕРАТУРЫ", 100, "Перечислить цитируемые источники по ГОСТ"),
             ],
             policy=ProfilePolicy(
-                voice="concise evidence-led scientific Russian",
+                voice="student researcher impersonal Russian with natural rhythm and no AI cliches",
                 required_artifacts=["evidence table"],
                 source_priorities=common_sources,
-                minimum_sources=15,
+                minimum_sources=8,
             ),
-            prompt_rules=["Without empirical data, explicitly choose a review design internally", "Do not fabricate experiments"],
+            prompt_rules=[
+                "Apply ГОСТ Р 7.0.7-2021, ГОСТ Р 7.0.99-2018, ГОСТ Р 7.0.5-2008 as the base",
+                "Persona: студент — автор научной статьи. Писать только в безличной форме («было рассмотрено», «проанализировано», «показано»). Запрещено использовать местоимения «я» и «мы».",
+                "Запрещено слово «Таким образом» — заменять на «в итоге», «вследствие этого», «это позволяет», «в результате».",
+                "Запрещены клише: «важно отметить», «следует подчеркнуть», «в современном мире», «безусловно», «в заключение», «с одной стороны... с другой стороны».",
+                "Burstiness & Perplexity: чередовать длинные сложные предложения (20-30 слов) с короткими рублеными (3-5 слов). Избегать шаблонных микро-выводов в конце каждого абзаца. Подавать материал связным нарративом.",
+                "Include author details, UDC, Russian and English title, abstract (120-180 words) and keywords (5-8 words).",
+                "Include practical empirical numbers, calculations, tables and charts. Synthetic demo data must be disclosed.",
+            ],
         ),
         WorkProfile(
             id="practice_report",

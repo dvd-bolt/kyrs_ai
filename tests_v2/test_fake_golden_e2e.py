@@ -65,7 +65,12 @@ def test_fake_golden_pipeline(
     settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
     workspace = ProjectService(settings).create(
         ProjectBrief(title=golden, topic=golden, prompt="Produce an evidence-backed work", work_type=work_type, domain_profile=profile),
-        AutopilotOptions(consent_to_remote_processing=True, generate_pdf=True, maximum_revision_cycles=2),
+            AutopilotOptions(
+                consent_to_remote_processing=True,
+                generate_pdf=True,
+                maximum_revision_cycles=2,
+                allow_synthetic_data=True,
+            ),
     )
     source = tmp_path / "methodology.txt"
     source.write_text("Work requires an introduction and a conclusion.", encoding="utf-8")
@@ -155,6 +160,7 @@ def test_formal_methodology_gap_blocks_final_package_and_persists_qa_diagnostics
             consent_to_remote_processing=True,
             generate_pdf=True,
             maximum_revision_cycles=2,
+            allow_synthetic_data=True,
         ),
     )
     source = tmp_path / "methodology.txt"
@@ -261,6 +267,7 @@ def test_formal_renderer_requirements_are_covered_by_the_final_docx_contract(
             consent_to_remote_processing=True,
             generate_pdf=True,
             maximum_revision_cycles=2,
+            allow_synthetic_data=True,
         ),
     )
     source = tmp_path / "methodology.txt"
@@ -368,7 +375,7 @@ def _fake_for(
         claim = repository.list_claims(project_id)[0]
         entry = repository.list_bibliography(project_id)[0]
         section = repository.get_latest_blueprint(project_id).outline.sections[0]
-        return {"section_id": section.id, "blocks": [{"type": "paragraph", "text": " ".join(["The process is reproducible through deterministic evidence."] * 12), "claim_ids": [claim.id], "bibliography_entry_ids": [entry.id]}], "conclusion": "The process is reproducible.", "word_count": 96}
+        return {"section_id": section.id, "blocks": [{"type": "paragraph", "text": " ".join(["The process is reproducible through deterministic evidence."] * 15), "claim_ids": [claim.id], "bibliography_entry_ids": [entry.id]}], "conclusion": "The process is reproducible.", "word_count": 105}
 
     fake.enqueue("generate_structured", section_response)
     fake.enqueue("generate_structured", {"accepted": True})

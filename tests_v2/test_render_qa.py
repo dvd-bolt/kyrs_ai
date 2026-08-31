@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import zipfile
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -169,6 +169,12 @@ def test_chart_renderer_uses_declarative_spec(tmp_path: Path) -> None:
         rows=[{"year": 2023, "value": 10}, {"year": 2024, "value": 15}],
         origin=FactOrigin.VERIFIED_SOURCE,
         source_ids=["source-1"],
+        repository="zenodo",
+        stable_id="10.5281/zenodo.12345",
+        version="1.0",
+        license="CC-BY-4.0",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        snapshot_sha256="a" * 64,
     )
     spec = ChartSpec(
         chart_type=ChartType.BAR,
@@ -336,6 +342,12 @@ def test_qa_accepts_rendered_docx_and_complete_provenance(tmp_path: Path) -> Non
         ],
         origin=FactOrigin.VERIFIED_SOURCE,
         source_ids=["source-1"],
+        repository="zenodo",
+        stable_id="10.5281/zenodo.12345",
+        version="1.0",
+        license="CC-BY-4.0",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        snapshot_sha256="a" * 64,
     )
     report = DeterministicQualityGate().run(
         QAGateContext(

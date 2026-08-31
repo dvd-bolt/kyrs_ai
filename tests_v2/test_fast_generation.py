@@ -83,14 +83,14 @@ def test_sections_run_in_parallel_respect_dependencies_and_reuse_cache(tmp_path:
     settings.performance_policy.parallel_generation_enabled = True
     workspace = ProjectService(settings).create(ProjectBrief(topic="Parallel work"))
     sections = [
-        SectionSpec(id="intro", title="Introduction", order=0, target_words=100),
-        SectionSpec(id="method", title="Method", order=1, target_words=100),
-        SectionSpec(id="results", title="Results", order=2, target_words=100),
+        SectionSpec(id="intro", title="Introduction", order=0, target_words=5),
+        SectionSpec(id="method", title="Method", order=1, target_words=5),
+        SectionSpec(id="results", title="Results", order=2, target_words=5),
         SectionSpec(
             id="conclusion",
             title="Conclusion",
             order=3,
-            target_words=100,
+            target_words=5,
             depends_on=["intro"],
         ),
     ]
@@ -159,7 +159,7 @@ def test_sections_run_in_parallel_respect_dependencies_and_reuse_cache(tmp_path:
                 }
             ],
             "conclusion": f"Conclusion for {section['id']}",
-            "word_count": 100,
+            "word_count": 5,
         }
 
     for _ in range(12):
@@ -184,8 +184,8 @@ def test_sections_run_in_parallel_respect_dependencies_and_reuse_cache(tmp_path:
     assert cached_context.stage.checkpoint["cache_hits"] == 4
 
 
-def test_citation_audit_failure_preserves_previous_citations_and_manuscript(tmp_path: Path) -> None:
-    """Validation happens before the derived citation graph is published."""
+def test_citation_audit_removes_text_bound_to_unsupported_claim(tmp_path: Path) -> None:
+    """Unsupported claim text is removed with its binding, not merely unlinked."""
 
     settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
     workspace = ProjectService(settings).create(ProjectBrief(topic="Atomic citations"))
@@ -252,16 +252,14 @@ def test_citation_audit_failure_preserves_previous_citations_and_manuscript(tmp_
     )
     workspace.repository.save_manuscript(manuscript)
 
-    with pytest.raises(StageExecutionError, match="unsupported claim"):
-        ProductionStageFactory(FakeGeminiGateway()).citation_audit(_context(workspace, settings))
+    outcome = ProductionStageFactory(FakeGeminiGateway()).citation_audit(_context(workspace, settings))
+    assert outcome.message == "Every retained citation linked to verified evidence"
 
-    assert workspace.repository.list_citations(workspace.project.id) == [previous]
     persisted = workspace.repository.get_latest_manuscript(workspace.project.id)
     assert persisted is not None
     assert persisted.bibliography == [bibliography]
-    first = next(block for block in persisted.blocks if block.id == "supported-paragraph")
-    assert isinstance(first, ParagraphBlock)
-    assert first.citation_ids == [previous.id]
+    assert all(block.id != "unsupported-paragraph" for block in persisted.blocks)
+    assert outcome.checkpoint["removed_unsupported_paragraphs"] == ["unsupported-paragraph"]
 
 
 def test_fast_preflight_waits_for_quota_without_repeated_health_requests(tmp_path: Path) -> None:
@@ -379,7 +377,7 @@ def test_paid_section_response_is_checkpointed_after_cancel_and_resumed_without_
             "section_id": section.id,
             "blocks": [{"type": "paragraph", "text": "Saved paid response."}],
             "conclusion": "Saved conclusion",
-            "word_count": 0,
+            "word_count": 3,
         }
 
     first_gateway.enqueue("generate_structured", paid_writer)
@@ -781,3 +779,145 @@ def test_research_claim_fingerprint_includes_critic_configuration(tmp_path: Path
     settings.thinking_policy.critic = "low"
 
     assert factory._claim_fingerprint(context, claim) != initial
+
+
+def test_draft_blocks_rejects_unknown_dataset() -> None:
+    from papercraft.application.schemas import DraftChart, DraftParagraph, SectionDraft
+    from papercraft.application.stages import StageExecutionError, _draft_blocks
+
+    draft = SectionDraft(
+        section_id="sec1",
+        blocks=[
+            DraftParagraph(text="Some text", bibliography_entry_ids=["unknown_ref"]),
+            DraftChart(
+                chart_type="bar",
+                title="Unknown Chart",
+                dataset_id="nonexistent_dataset",
+                x_column="x",
+                y_columns=["y"],
+            ),
+        ],
+        word_count=50,
+    )
+    with pytest.raises(StageExecutionError, match="unavailable or empty dataset"):
+        _draft_blocks(draft, bibliography=[], datasets=[])
+
+
+def test_generate_visuals_rejects_unknown_dataset(tmp_path: Path) -> None:
+    from papercraft.domain import ChartBlock, ChartSpec, ChartType, Manuscript
+
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(ProjectBrief(topic="Chart fallback"))
+    context = _context(workspace, settings)
+    chart_block = ChartBlock(
+        spec=ChartSpec(
+            chart_type=ChartType.BAR,
+            title="Fallback Chart",
+            dataset_id="unknown_dataset_main",
+            x_column="x",
+            y_columns=["y"],
+        )
+    )
+    manuscript = Manuscript(
+        project_id=workspace.project.id,
+        title="Test",
+        blocks=[chart_block],
+    )
+    workspace.repository.save_manuscript(manuscript)
+
+    factory = ProductionStageFactory(FakeGeminiGateway())
+    with pytest.raises(StageExecutionError, match="unknown dataset"):
+        factory.generate_visuals(context)
+
+
+def test_draft_blocks_preserves_unsupported_claim_binding_for_qa() -> None:
+    from papercraft.application.schemas import DraftParagraph, SectionDraft
+    from papercraft.application.stages import _draft_blocks
+
+    supported = Claim(project_id="p1", text="Supported", status=ClaimStatus.SUPPORTED)
+    unsupported = Claim(project_id="p1", text="Unsupported", status=ClaimStatus.UNSUPPORTED)
+
+    draft = SectionDraft(
+        section_id="sec1",
+        blocks=[
+            DraftParagraph(text="Some text", claim_ids=[supported.id, unsupported.id]),
+        ],
+        word_count=50,
+    )
+    blocks = _draft_blocks(draft, bibliography=[], datasets=[], claims=[supported, unsupported])
+    assert len(blocks) == 1
+    assert blocks[0].metadata.get("claim_ids") == [supported.id, unsupported.id]
+
+
+def test_deterministic_manuscript_issues_ignores_uncited_unsupported_claims() -> None:
+    from papercraft.application.stages import _deterministic_manuscript_issues
+    from papercraft.domain import HeadingBlock
+
+    manuscript = Manuscript(
+        project_id="p1",
+        title="Title",
+        blocks=[
+            HeadingBlock(text="Heading 1", level=1),
+            ParagraphBlock(text="Normal paragraph text without unsupported claims.", metadata={"claim_ids": []}),
+        ],
+    )
+    unsupported_claim = Claim(project_id="p1", text="Uncited unsupported", status=ClaimStatus.UNSUPPORTED, checkable=True)
+    issues = _deterministic_manuscript_issues(manuscript, [unsupported_claim], [])
+    assert not any("unsupported" in issue for issue in issues)
+
+
+def test_consistency_qa_auto_repairs_placeholder_sections(tmp_path: Path) -> None:
+    from papercraft.domain import HeadingBlock
+
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(ProjectBrief(topic="Repair test"))
+    section = SectionSpec(id="sec-1", title="Обсуждение", order=0, target_words=100)
+    blueprint = ProjectBlueprint(
+        project_id=workspace.project.id,
+        topic="Repair test",
+        goal="Test",
+        tasks=["Run"],
+        outline=Outline(sections=[section]),
+    )
+    workspace.repository.save_blueprint(blueprint)
+    manuscript = Manuscript(
+        project_id=workspace.project.id,
+        title="Repair Manuscript",
+        blocks=[
+            HeadingBlock(id="h1", text="Обсуждение", level=1, section_id="sec-1"),
+            ParagraphBlock(id="p1", text="Текст раздела.", metadata={"claim_ids": []}),
+        ],
+    )
+    workspace.repository.save_manuscript(manuscript)
+
+    fake = FakeGeminiGateway()
+    fake.enqueue(
+        "generate_structured",
+        {
+            "section_id": "sec-1",
+            "blocks": [{"type": "paragraph", "text": "This is real substantive text for the repaired section."}],
+            "conclusion": "Conclusion",
+            "word_count": 100,
+        },
+    )
+    fake.enqueue(
+        "generate_structured",
+        {
+            "accepted": True,
+            "blocker_issues": [],
+            "factual_issues": [],
+            "consistency_issues": [],
+            "style_issues": [],
+            "repair_instructions": [],
+        },
+    )
+
+    context = _context(workspace, settings)
+    outcome = ProductionStageFactory(fake).consistency_qa(context)
+    assert outcome.message == "Global manuscript review passed"
+
+    updated = workspace.repository.get_latest_manuscript(workspace.project.id)
+    assert updated is not None
+    paras = [b for b in updated.blocks if isinstance(b, ParagraphBlock)]
+    assert len(paras) == 1
+    assert "real substantive text" in paras[0].text

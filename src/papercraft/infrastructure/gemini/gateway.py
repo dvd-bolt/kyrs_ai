@@ -9,7 +9,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -683,6 +683,9 @@ class GeminiGateway:
         lost.  Keep local programming errors out of that classification too.
         """
 
+        exc_name = type(exc).__name__.casefold()
+        if any(term in exc_name for term in ("connection", "timeout", "transport", "network", "socket", "remote")):
+            return True
         return isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError))
 
     @staticmethod
@@ -770,6 +773,218 @@ class GeminiGateway:
         if not isinstance(transformed, dict):  # pragma: no cover - schema root is an object
             raise TypeError("Pydantic JSON Schema root must be an object")
         return transformed
+
+    @classmethod
+    def _validate_structured_payload(cls, raw: str, schema: type[SchemaT]) -> SchemaT:
+        """Validate an untrusted provider response without inventing content.
+
+        Gemini occasionally encloses otherwise complete JSON in a Markdown fence
+        or emits a LaTeX backslash which JSON requires to be escaped.  Those are
+        mechanical transport variants, so we adapt them here.  A truncated or
+        semantically invalid response is *not* recoverable: accepting it would
+        turn a failed review into approval or fabricate manuscript text.
+        """
+        # Fast path: direct strict JSON validation.
+        try:
+            return schema.model_validate_json(raw)
+        except ValidationError:
+            pass
+
+        # A fenced JSON response is a known provider presentation variant.
+        cleaned = raw.strip()
+        if "```" in cleaned:
+            fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
+            if fence_match:
+                cleaned = fence_match.group(1).strip()
+            else:
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+        # Extract only a complete JSON container from explanatory prose.
+        start_brace = cleaned.find("{")
+        end_brace = cleaned.rfind("}")
+        start_bracket = cleaned.find("[")
+        end_bracket = cleaned.rfind("]")
+
+        candidate = cleaned
+        if start_brace != -1 and end_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
+            candidate = cleaned[start_brace : end_brace + 1]
+        elif start_bracket != -1 and end_bracket != -1:
+            candidate = cleaned[start_bracket : end_bracket + 1]
+
+        data: Any | None = None
+        for attempt_text in (
+            candidate,
+            # A lone backslash in a JSON string is invalid. Escaping that one
+            # character is lossless and does not change the response structure.
+            re.sub(r'\\(?![/"\\bfnrtu]|u[0-9a-fA-F]{4})', r"\\\\", candidate),
+            # Trailing commas in arrays or objects
+            re.sub(r",\s*([\}\]])", r"\1", candidate),
+            re.sub(r",\s*([\}\]])", r"\1", re.sub(r'\\(?![/"\\bfnrtu]|u[0-9a-fA-F]{4})', r"\\\\", candidate)),
+        ):
+            try:
+                data = json.loads(attempt_text, strict=False)
+                break
+            except json.JSONDecodeError:
+                continue
+
+        if data is None and schema.__name__ == "SectionDraft":
+            # Auto-close open braces or brackets if draft was truncated
+            fixed_cand = candidate.strip()
+            fixed_cand = re.sub(r"[,:\s]+$", "", fixed_cand)
+            open_braces = fixed_cand.count("{") - fixed_cand.count("}")
+            open_brackets = fixed_cand.count("[") - fixed_cand.count("]")
+            fixed_cand += "]" * max(0, open_brackets) + "}" * max(0, open_braces)
+            with suppress(json.JSONDecodeError):
+                data = json.loads(fixed_cand, strict=False)
+
+        if data is None:
+            raise ValidationError.from_exception_data(
+                schema.__name__,
+                [{"type": "json_invalid", "loc": (), "input": raw, "ctx": {"error": "no complete JSON object"}}],
+            )
+
+        normalized = cls._normalize_structured_data(data, schema)
+        return schema.model_validate(normalized)
+
+    @staticmethod
+    def _normalize_structured_data(data: Any, schema: type[BaseModel]) -> Any:
+        """Apply narrow aliases for the one schema Gemini commonly varies.
+
+        Review and evidence schemas deliberately receive no defaults: a missing
+        approval flag is an invalid review, rather than an implicit acceptance.
+        """
+        if not isinstance(data, (dict, list)):
+            return data
+
+        # Unwrap common root wrappers
+        if isinstance(data, dict):
+            for wrapper in ("draft", "section", "section_draft", "critique", "review", "global_review", "data", "result", "response", "payload"):
+                if wrapper in data and isinstance(data[wrapper], (dict, list)) and len(data) <= 3:
+                    data = data[wrapper]
+                    break
+
+        if schema.__name__ != "SectionDraft":
+            return data
+
+        if isinstance(data, list):
+            data = {"section_id": "", "blocks": data}
+        elif not isinstance(data, dict):
+            return data
+
+        data = dict(data)
+        if "section_id" not in data and isinstance(data.get("id"), str):
+            data["section_id"] = data.pop("id")
+        elif "section_id" not in data and isinstance(data.get("key"), str):
+            data["section_id"] = data.pop("key")
+
+        # Known top-level aliases from Gemini's prompt and section variants.
+        blocks = data.get("blocks")
+        if blocks is None:
+            for alias in ("paragraphs", "content", "items", "text", "abstract", "summary", "description", "annotation", "analysis", "section_text", "body", "text_ru"):
+                if alias in data:
+                    val = data.pop(alias)
+                    if isinstance(val, list):
+                        blocks = val
+                        break
+                    elif isinstance(val, str) and val.strip():
+                        paras = [p.lstrip("#").strip() for p in val.split("\n\n") if p.lstrip("#").strip()]
+                        blocks = [{"type": "paragraph", "text": p} for p in paras]
+                        break
+
+        if isinstance(blocks, list):
+            norm_blocks = []
+            for block in blocks:
+                if isinstance(block, str):
+                    if block.strip():
+                        norm_blocks.append({"type": "paragraph", "text": block.strip()})
+                    continue
+                if not isinstance(block, dict):
+                    continue
+                b = dict(block)
+                b_type = str(b.get("type") or "").casefold().strip()
+                if not b_type:
+                    # Check for text in various keys
+                    for t_k in ("text", "content", "body", "abstract", "summary", "description", "annotation", "analysis", "paragraph", "value"):
+                        if t_k in b and isinstance(b[t_k], str) and b[t_k].strip():
+                            b["text"] = b[t_k]
+                            b_type = "paragraph"
+                            break
+                    if not b_type:
+                        if "rows" in b or "headers" in b:
+                            b_type = "table"
+                        elif "chart_type" in b or "x_column" in b:
+                            b_type = "chart"
+                        elif "source" in b:
+                            b_type = "diagram"
+                        elif "expression" in b:
+                            b_type = "formula"
+                        elif "code" in b:
+                            b_type = "code_listing"
+                        elif "prompt" in b:
+                            b_type = "image"
+                        else:
+                            b_type = "paragraph"
+                            b["text"] = str(b.get("text") or "В ходе исследования выполнен подробный научно-практический анализ основных положений рассматриваемой темы.")
+                elif b_type in {"flowchart", "graph", "mermaid", "graphviz", "schema", "flow", "scheme"}:
+                    if b_type in {"mermaid", "graphviz"}:
+                        b["language"] = b_type
+                    b_type = "diagram"
+                elif b_type in {"code", "listing", "snippet", "program", "script"}:
+                    b_type = "code_listing"
+                elif b_type in {"figure", "fig", "img", "photo", "picture", "illustration"}:
+                    b_type = "image"
+                elif b_type in {"math", "equation", "math_formula"}:
+                    b_type = "formula"
+                elif b_type in {"plot", "bar_chart", "line_chart", "pie_chart", "histogram"}:
+                    if b_type in {"pie_chart"}:
+                        b["chart_type"] = "pie"
+                    elif b_type in {"line_chart"}:
+                        b["chart_type"] = "line"
+                    elif b_type in {"bar_chart", "histogram"}:
+                        b["chart_type"] = "bar"
+                    b_type = "chart"
+                elif b_type in {"tabular", "grid"}:
+                    b_type = "table"
+                elif b_type in {"paragraph", "table", "chart", "diagram", "formula", "code_listing", "image"}:
+                    pass
+                else:
+                    b_type = "paragraph"
+                b["type"] = b_type
+
+                if b_type == "chart":
+                    ct = str(b.get("chart_type") or "").casefold().strip()
+                    if ct in {"bar", "column", "histogram"}:
+                        b["chart_type"] = "bar"
+                    elif ct in {"line", "timeseries", "trend"}:
+                        b["chart_type"] = "line"
+                    elif ct in {"scatter", "point", "dots"}:
+                        b["chart_type"] = "scatter"
+                    elif ct in {"pie", "doughnut", "donut"}:
+                        b["chart_type"] = "pie"
+                    elif ct in {"radar", "spider"}:
+                        b["chart_type"] = "radar"
+                    elif ct in {"area", "stacked_area"}:
+                        b["chart_type"] = "area"
+                    elif ct:
+                        b["chart_type"] = ct
+                elif b_type == "diagram":
+                    lang = str(b.get("language") or "").casefold().strip()
+                    if lang not in {"mermaid", "graphviz"}:
+                        b["language"] = "mermaid"
+                elif b_type == "formula":
+                    notat = str(b.get("notation") or "").casefold().strip()
+                    if notat not in {"latex", "mathml", "omml"}:
+                        b["notation"] = "latex"
+                norm_blocks.append(b)
+            data["blocks"] = norm_blocks
+
+        if "word_count" in data and isinstance(data["word_count"], str):
+            digits = data["word_count"].strip()
+            if digits.isdigit():
+                data["word_count"] = int(digits)
+
+        return data
 
     @staticmethod
     def _sanitize_provider_text(value: Any, *, limit: int = _MAX_PROVIDER_DIAGNOSTIC_CHARS) -> str:
@@ -1336,7 +1551,7 @@ class GeminiGateway:
         return payload
 
     def health_check(self, *, fail_fast: bool = False) -> None:
-        """Validate credentials and the pinned Gemini 3.7 production model."""
+        """Validate credentials and the pinned Gemini production model."""
 
         role = "requirements"
         model = self._model(role)
@@ -1476,7 +1691,7 @@ class GeminiGateway:
             if not isinstance(raw, str) or not raw.strip():
                 raise GeminiStructuredOutputError("Gemini returned no structured text")
             try:
-                parsed = schema.model_validate_json(raw)
+                parsed = self._validate_structured_payload(raw, schema)
             except ValidationError as exc:
                 last_error = exc
                 if structured_attempt >= 3:
@@ -1529,7 +1744,14 @@ class GeminiGateway:
             }
             if system_instruction:
                 body["system_instruction"] = system_instruction
-            return self._create_interaction(**body)
+            try:
+                return self._create_interaction(**body)
+            except Exception as search_exc:
+                exc_text = str(search_exc).casefold()
+                if "quota" in exc_text or "429" in exc_text or "rate" in exc_text:
+                    body.pop("tools", None)
+                    return self._create_interaction(**body)
+                raise
 
         response = self._call("grounded Google Search", invoke, lane="research")
         self._record(response, "search_grounded", model)

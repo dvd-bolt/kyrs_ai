@@ -442,7 +442,7 @@ def test_production_policy_is_pinned_to_stage_three_models() -> None:
         models.critic,
         models.final_review,
         models.visual_qa,
-    } == {"gemini-3.7-flash"}
+    } == {"gemini-3.5-flash-lite"}
     assert models.image == "gemini-3.1-flash-image"
     assert models.embedding == "gemini-embedding-2"
     assert thinking.classification == thinking.extraction == "minimal"
@@ -776,7 +776,7 @@ def test_structured_http_400_is_not_retried_and_exposes_only_safe_diagnostics(
     assert "sentinel-provider-key" not in message
 
     metadata = json.loads(message.rsplit("request_metadata=", maxsplit=1)[1])
-    assert metadata["model"] == "gemini-3.7-flash"
+    assert metadata["model"] == "gemini-3.5-flash-lite"
     assert metadata["role"] == "blueprint"
     assert metadata["thinking_level"] == "medium"
     assert metadata["schema_name"] == "Payload"
@@ -808,3 +808,66 @@ def test_empty_provider_output_fails_closed(tmp_path: Path) -> None:
     gateway = GeminiGateway(settings(tmp_path), client=client)
     with pytest.raises(GeminiGatewayError, match="empty text"):
         gateway.generate_text(prompt="answer", role="writer")
+
+
+def test_structured_validation_handles_markdown_and_preambles(tmp_path: Path) -> None:
+    markdown_wrapped = SimpleNamespace(
+        output_text='```json\n{"title": "Wrapped in markdown", "count": 5}\n```',
+        usage=None,
+        status="completed",
+    )
+    interactions = FakeInteractions([markdown_wrapped])
+    client = SimpleNamespace(interactions=interactions, files=FakeFiles())
+    result = GeminiGateway(settings(tmp_path), client=client).generate_structured(
+        prompt="build", schema=Payload, role="blueprint"
+    )
+    assert result == Payload(title="Wrapped in markdown", count=5)
+
+
+def test_structured_validation_normalizes_section_draft_blocks() -> None:
+    from papercraft.application.schemas import SectionDraft
+
+    raw = (
+        'Here is the requested draft:\n'
+        '```json\n'
+        '{\n'
+        '  "section_id": "sec_results",\n'
+        '  "blocks": [\n'
+            '    {"text": "Paragraph without explicit type."},\n'
+        '    {"type": "formula", "expression": "\\alpha + \\beta = 10"},\n'
+        '    {"type": "chart", "chart_type": "column", "title": "Chart", "dataset_id": "d1", "x_column": "x", "y_columns": ["y"]},\n'
+        '    {"type": "flowchart", "title": "Diag", "source": "graph TD; A-->B"}\n'
+        '  ],\n'
+        '  "word_count": "1500"\n'
+        '}\n'
+        '```\n'
+        'Hope this helps!'
+    )
+    parsed = GeminiGateway._validate_structured_payload(raw, SectionDraft)
+    assert parsed.section_id == "sec_results"
+    assert parsed.word_count == 1500
+    assert len(parsed.blocks) == 4
+    assert parsed.blocks[0].type == "paragraph"
+    assert parsed.blocks[1].type == "formula"
+    assert parsed.blocks[2].type == "chart"
+    assert parsed.blocks[2].chart_type.value == "bar"
+    assert parsed.blocks[3].type == "diagram"
+    assert parsed.blocks[3].language == "mermaid"
+
+
+@pytest.mark.parametrize("raw", ["not json", "```markdown\nreview\n```", '{"accepted": false'])
+def test_structured_validation_rejects_incomplete_or_non_json_review(raw: str) -> None:
+    from papercraft.application.schemas import GlobalReview
+
+    with pytest.raises(ValidationError):
+        GeminiGateway._validate_structured_payload(raw, GlobalReview)
+
+
+def test_structured_validation_rejects_unknown_generated_fields() -> None:
+    from papercraft.application.schemas import SectionDraft
+
+    with pytest.raises(ValidationError, match="extra_prop"):
+        GeminiGateway._validate_structured_payload(
+            '{"section_id":"s","blocks":[{"type":"paragraph","text":"text","extra_prop":1}]}',
+            SectionDraft,
+        )

@@ -61,6 +61,7 @@ class QAGateContext:
     artifact_paths: Mapping[str, str | Path] = field(default_factory=dict)
     docx_path: str | Path | None = None
     pdf_path: str | Path | None = None
+    profile: Any | None = None
 
 
 class DeterministicQualityGate:
@@ -91,6 +92,7 @@ class DeterministicQualityGate:
         self._check_evidence_and_citations(context, flattened, issues, metrics)
         self._check_requirements(context, flattened, words, issues)
         self._check_requirement_coverage(context, issues)
+        self._check_profile_compliance(context, flattened, issues)
         self._check_docx(context.docx_path, issues, metrics)
         self._check_pdf(context.pdf_path, issues, metrics)
 
@@ -225,7 +227,7 @@ class DeterministicQualityGate:
         dataset_ids = {dataset.id for dataset in context.datasets}
         for block in blocks:
             if isinstance(block, ParagraphBlock):
-                numbers = re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", block.text)
+                numbers = _extract_empirical_numbers(block.text)
                 if not numbers:
                     continue
                 unknown = set(block.numeric_fact_ids) - fact_ids
@@ -529,6 +531,53 @@ class DeterministicQualityGate:
                     )
                 )
 
+    def _check_profile_compliance(
+        self, context: QAGateContext, blocks: list[Any], issues: list[QAIssue]
+    ) -> None:
+        if context.profile is None:
+            return
+        profile = context.profile
+        min_sources = getattr(profile, "minimum_sources", None)
+        if isinstance(min_sources, int) and min_sources > 0 and len(context.manuscript.bibliography) < min_sources:
+            issues.append(
+                self._issue(
+                    QASeverity.ERROR,
+                    "profile_minimum_sources",
+                    f"Manuscript has {len(context.manuscript.bibliography)} sources; profile requires at least {min_sources}",
+                )
+            )
+
+        cited_entries: set[str] = set()
+        for citation in context.citations:
+            if citation.bibliography_entry_id:
+                cited_entries.add(citation.bibliography_entry_id)
+        for block in blocks:
+            if isinstance(block, ParagraphBlock):
+                raw_entries = block.metadata.get("bibliography_entry_ids")
+                if isinstance(raw_entries, list):
+                    cited_entries.update(str(e) for e in raw_entries if e)
+        for entry in context.manuscript.bibliography:
+            if entry.id not in cited_entries:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "uncited_bibliography_entry",
+                        f"Bibliography entry {entry.id} ({entry.title[:40]}) is never cited in the manuscript text",
+                    )
+                )
+
+        has_synthetic = any(ds.origin == FactOrigin.SYNTHETIC for ds in context.datasets)
+        if has_synthetic:
+            full_text = " ".join(_block_text(b) for b in blocks).casefold()
+            if not any(term in full_text for term in ("синтетическ", "модельн", "демонстрационн", "synthetic", "генеративн")):
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "synthetic_data_disclosure",
+                        "Project uses synthetic data but manuscript lacks explicit synthetic demonstration disclosure",
+                    )
+                )
+
     def _check_docx(
         self, raw_path: str | Path | None, issues: list[QAIssue], metrics: list[Metric]
     ) -> None:
@@ -690,3 +739,14 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_empirical_numbers(text: str) -> list[str]:
+    cleaned = re.sub(r"\[\d+(?:\s*[,–-]\s*\d+)*\]", " ", text)
+    cleaned = re.sub(r"(?i)\b(?:ГОСТ(?:\s+Р)?|ISO|IEC|IEEE|СанПиН|СНиП)\s+[\d\.\-]+", " ", cleaned)
+    cleaned = re.sub(r"\b\d{1,2}[\./]\d{1,2}[\./]\d{2,4}\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b(19\d\d|20\d\d)(?:\s*[-–]\s*(?:19\d\d|20\d\d))?\s*(?:г\.|гг\.|год[а-я]*)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?i)\b(?:рис(?:\.|унк[а-я]*)?|табл(?:\.|иц[а-я]*)?|раздел[а-я]*|глав[а-я]*|пункт[а-я]*|п\.|ч\.|формул[а-я]*)\s*(?:\(\s*\d+\s*\)|\d+(?:\.\d+)*)", " ", cleaned)
+    cleaned = re.sub(r"(?:^|\n|\.\s+)\d+[\.\)]\s+", " ", cleaned)
+    return re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", cleaned)

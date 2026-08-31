@@ -49,6 +49,7 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
             consent_to_remote_processing=True,
             generate_pdf=False,
             maximum_revision_cycles=2,
+            allow_synthetic_data=True,
         ),
     )
     methodology = tmp_path / "methodology.txt"
@@ -126,13 +127,13 @@ def test_full_autopilot_produces_docx_and_qa(tmp_path: Path) -> None:
             "blocks": [
                 {
                     "type": "paragraph",
-                    "text": " ".join(["Automation improves reproducibility through deterministic stages."] * 12),
+                        "text": " ".join(["Automation improves reproducibility through deterministic stages."] * 17),
                     "claim_ids": [claim.id],
                     "bibliography_entry_ids": [entry.id],
                 }
             ],
             "conclusion": "The evidence supports reproducible automation.",
-            "word_count": 96,
+            "word_count": 102,
         }
 
     fake.enqueue("generate_structured", section_response)

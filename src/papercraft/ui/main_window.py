@@ -63,6 +63,7 @@ from papercraft.config import AppSettings
 from papercraft.domain import (
     ArtifactKind,
     DomainProfile,
+    FactOrigin,
     GenerationRun,
     HeadingBlock,
     ParagraphBlock,
@@ -847,6 +848,11 @@ class MainWindow(QMainWindow):
         self.check_requirements = QCheckBox("Остановиться после требований")
         self.check_outline = QCheckBox("Остановиться после плана")
         self.check_final = QCheckBox("Остановиться перед выпуском")
+        self.allow_synthetic_data = QCheckBox("Разрешить только демонстрационные синтетические данные")
+        self.allow_synthetic_data.setToolTip(
+            "Используются только после отсутствия пользовательских и открытых данных; "
+            "работа будет помечена как непубликационный демонстрационный черновик."
+        )
         self.cost_enabled = QCheckBox("Ограничить стоимость")
         self.cost_limit = QDoubleSpinBox()
         self.cost_limit.setRange(0.01, 10000)
@@ -856,6 +862,7 @@ class MainWindow(QMainWindow):
             self.check_requirements,
             self.check_outline,
             self.check_final,
+            self.allow_synthetic_data,
             self.cost_enabled,
             self.cost_limit,
         ):
@@ -889,6 +896,26 @@ class MainWindow(QMainWindow):
         self.requirements_table.setMinimumHeight(240)
         requirements.content_layout.addWidget(self.requirements_table)
         layout.addWidget(requirements)
+
+        datasets_section = CollapsibleSection(
+            "Датасеты и доказательная база",
+            "Реестр эмпирических данных, первоисточников и статус синтетики.",
+            icon=icon("refresh"),
+            expanded=False,
+        )
+        self.datasets_table = self._table(
+            [
+                "Название датасета",
+                "Происхождение",
+                "Строк / Колонок",
+                "Репозиторий / Лицензия",
+                "Публикация",
+            ],
+            stretch_column=0,
+        )
+        self.datasets_table.setMinimumHeight(200)
+        datasets_section.content_layout.addWidget(self.datasets_table)
+        layout.addWidget(datasets_section)
 
         plan = Card(accessible_name="План работы")
         plan_header = SectionHeader(
@@ -1456,11 +1483,13 @@ class MainWindow(QMainWindow):
         self.check_requirements.setChecked(options.checkpoint_requirements)
         self.check_outline.setChecked(options.checkpoint_outline)
         self.check_final.setChecked(options.checkpoint_final_review)
+        self.allow_synthetic_data.setChecked(options.allow_synthetic_data)
         self.cost_enabled.setChecked(options.maximum_cost is not None)
         if options.maximum_cost is not None:
             self.cost_limit.setValue(float(options.maximum_cost))
         self._refresh_sources()
         self._refresh_requirements()
+        self._refresh_datasets()
         self._refresh_plan()
         self._refresh_results()
         self._update_navigation_access()
@@ -1497,6 +1526,7 @@ class MainWindow(QMainWindow):
                 "checkpoint_requirements": self.check_requirements.isChecked(),
                 "checkpoint_outline": self.check_outline.isChecked(),
                 "checkpoint_final_review": self.check_final.isChecked(),
+                "allow_synthetic_data": self.allow_synthetic_data.isChecked(),
                 "maximum_cost": Decimal(str(self.cost_limit.value()))
                 if self.cost_enabled.isChecked()
                 else None,
@@ -1572,6 +1602,36 @@ class MainWindow(QMainWindow):
                 filename_item.setToolTip(f"SHA-256: {source.sha256}")
         self.metric_sources.set_value(str(len(sources)))
         self.metric_sources.set_detail("добавлено в проект")
+
+    def _refresh_datasets(self) -> None:
+        self.datasets_table.setRowCount(0)
+        if self.workspace is None:
+            return
+        datasets = self.workspace.repository.list_datasets(self.workspace.project.id)
+        for ds in datasets:
+            origin_label = {
+                FactOrigin.USER: "Пользовательский",
+                FactOrigin.VERIFIED_SOURCE: "Открытый (Zenodo/DataCite)",
+                FactOrigin.SYNTHETIC: "Синтетический (Демо)",
+                FactOrigin.CALCULATED: "Расчётный",
+            }.get(ds.origin, str(ds.origin.value))
+
+            repo_license = " — "
+            if ds.repository or ds.license:
+                repo_license = f"{ds.repository or ''} · {ds.license or ''}".strip(" ·")
+
+            pub_status = "Публикуемый" if ds.publishability == "publishable" else "Демонстрационный черновик"
+
+            self._append_row(
+                self.datasets_table,
+                [
+                    ds.name,
+                    origin_label,
+                    f"{len(ds.rows)} / {len(ds.columns)}",
+                    repo_license,
+                    pub_status,
+                ],
+            )
 
     def _refresh_requirements(self) -> None:
         self.requirements_table.setRowCount(0)

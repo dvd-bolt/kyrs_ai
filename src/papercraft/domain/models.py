@@ -24,6 +24,7 @@ from .enums import (
     FactOrigin,
     QASeverity,
     QAStatus,
+    QualityStatus,
     RequirementCategory,
     RequirementPriority,
     RunStatus,
@@ -64,7 +65,8 @@ class AutopilotOptions(DomainModel):
     currency: str = Field(default="USD", min_length=3, max_length=3)
     quality_mode: Literal["maximum", "balanced", "economy"] = "maximum"
     maximum_revision_cycles: int = Field(default=3, ge=1, le=10)
-    allow_synthetic_data: bool = True
+    # Synthetic data are an explicit, non-publishable demonstration fallback.
+    allow_synthetic_data: bool = False
     # Legacy projects can still deserialize ``auto``/``word``.  The private
     # beta pipeline deliberately normalises all new and existing runs to
     # LibreOffice before finalization.
@@ -78,6 +80,55 @@ class AutopilotOptions(DomainModel):
         return value.upper()
 
 
+class ScientificAuthor(DomainModel):
+    name: str = Field(min_length=1)
+    organization: str = Field(min_length=1)
+    email: str | None = None
+    orcid: str | None = None
+
+
+class ScientificArticleSpec(DomainModel):
+    kind: Literal["scientific_article"] = "scientific_article"
+    material_type: str = Field(default="research_article", min_length=1)
+    scientific_question: str = Field(default="", min_length=1)
+    authors: list[ScientificAuthor] = Field(default_factory=list)
+    organizations: list[str] = Field(default_factory=list)
+    udc: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    method_description: str = ""
+    data_requirements: str = ""
+    funding_statement: str = ""
+    conflict_of_interest_statement: str = ""
+
+
+class CourseworkSpec(DomainModel):
+    kind: Literal["coursework"] = "coursework"
+    institution: str = ""
+    programme: str = ""
+
+
+class ReportSpec(DomainModel):
+    kind: Literal["report"] = "report"
+    organization: str = ""
+    reporting_period: str = ""
+
+
+class SchoolProjectSpec(DomainModel):
+    kind: Literal["school_project"] = "school_project"
+    school: str = ""
+    grade: str = ""
+
+
+class UniversalProjectSpec(DomainModel):
+    kind: Literal["universal"] = "universal"
+
+
+ProfileSpec = Annotated[
+    ScientificArticleSpec | CourseworkSpec | ReportSpec | SchoolProjectSpec | UniversalProjectSpec,
+    Field(discriminator="kind"),
+]
+
+
 class ProjectBrief(DomainModel):
     title: str = ""
     topic: str = ""
@@ -86,6 +137,7 @@ class ProjectBrief(DomainModel):
     domain_profile: DomainProfile = DomainProfile.GENERAL
     language: str = "ru-RU"
     title_page: dict[str, JsonValue] = Field(default_factory=dict)
+    profile_spec: ProfileSpec | None = None
 
     @model_validator(mode="after")
     def derive_title(self) -> ProjectBrief:
@@ -634,6 +686,13 @@ class Dataset(DomainModel):
     source_ids: list[str] = Field(default_factory=list)
     synthetic_seed: int | None = None
     generation_method: str | None = None
+    repository: str | None = None
+    stable_id: str | None = None
+    version: str | None = None
+    license: str | None = None
+    retrieved_at: datetime | None = None
+    snapshot_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    publishability: Literal["publishable", "non_publishable_synthetic_demo", "unknown"] = "unknown"
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -651,6 +710,46 @@ class Dataset(DomainModel):
             }
             if missing:
                 raise ValueError(f"row {index} lacks required columns: {sorted(missing)}")
+        return self
+
+    @model_validator(mode="after")
+    def label_synthetic_publishability(self) -> Dataset:
+        if self.origin is FactOrigin.SYNTHETIC:
+            object.__setattr__(self, "publishability", "non_publishable_synthetic_demo")
+        return self
+
+
+class ClaimBinding(DomainModel):
+    """A precise text span that is supported by an evidence record."""
+
+    claim_id: str = Field(min_length=1)
+    block_id: str = Field(min_length=1)
+    span_start: int = Field(ge=0)
+    span_end: int = Field(gt=0)
+    evidence_id: str = Field(min_length=1)
+    locator: Locator
+
+    @model_validator(mode="after")
+    def validate_span(self) -> ClaimBinding:
+        if self.span_end <= self.span_start:
+            raise ValueError("binding span_end must be greater than span_start")
+        return self
+
+
+class NumericFactBinding(DomainModel):
+    """A numeric text span with its FactLedger and evidence provenance."""
+
+    fact_id: str = Field(min_length=1)
+    block_id: str = Field(min_length=1)
+    span_start: int = Field(ge=0)
+    span_end: int = Field(gt=0)
+    evidence_id: str | None = None
+    locator: Locator | None = None
+
+    @model_validator(mode="after")
+    def validate_span(self) -> NumericFactBinding:
+        if self.span_end <= self.span_start:
+            raise ValueError("binding span_end must be greater than span_start")
         return self
 
 
@@ -823,7 +922,7 @@ class AppendixBlock(DomainModel):
     blocks: list[ManuscriptBlock] = Field(default_factory=list)
 
 
-type ManuscriptBlock = Annotated[
+ManuscriptBlock = Annotated[
     ParagraphBlock
     | HeadingBlock
     | TableBlock
@@ -848,6 +947,9 @@ class Manuscript(DomainModel):
     revision: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    quality_status: QualityStatus = QualityStatus.NEEDS_REPAIR
+    claim_bindings: list[ClaimBinding] = Field(default_factory=list)
+    numeric_fact_bindings: list[NumericFactBinding] = Field(default_factory=list)
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 

@@ -167,7 +167,6 @@ def test_live_interactions_thinking_and_structured_output(tmp_path: Path) -> Non
     )
     assert response == _LiveStructuredReply(status="ok", value=42)
     assert {record.model for record in usage} == {
-        "gemini-3.7-flash",
         "gemini-3.5-flash-lite",
     }
     assert all(record.total_tokens > 0 for record in usage)

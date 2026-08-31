@@ -40,6 +40,7 @@ from papercraft.domain import (
     TableBlock,
     TemplateApplicationPlan,
 )
+from papercraft.infrastructure.research import format_gost_bibliography
 
 
 class DocxRenderError(RuntimeError):
@@ -279,13 +280,25 @@ class DocxRenderer:
             document = Document()
         self._configure_document(document, manuscript, preserve_template=template_path is not None)
         resolved_title = self._title_page(manuscript, title_page)
-        if self.config.include_title_page and template_path is None:
-            self._render_title_page(document, resolved_title)
-        if self.config.include_toc:
-            self._render_toc(document)
+        is_scientific = (
+            resolved_title.work_type == "scientific_article"
+            or manuscript.metadata.get("work_type") == "scientific_article"
+        )
+        if is_scientific and template_path is None:
+            self._render_scientific_article_header(document, resolved_title, manuscript)
+        else:
+            if self.config.include_title_page and template_path is None:
+                self._render_title_page(document, resolved_title)
+            if self.config.include_toc:
+                self._render_toc(document)
 
         for block in manuscript.blocks:
             self._render_block(document, block, artifact_paths, datasets, citations, template_plan)
+
+        declarations = manuscript.metadata.get("declarations")
+        if isinstance(declarations, dict) and declarations:
+            self._render_declarations(document, declarations)
+
         if manuscript.bibliography:
             self._render_bibliography(document, manuscript.bibliography)
 
@@ -388,6 +401,93 @@ class DocxRenderer:
         if isinstance(metadata_value, dict):
             return TitlePageInfo.from_mapping(metadata_value, fallback_topic=manuscript.title)
         return TitlePageInfo(topic=manuscript.title)
+
+    def _render_scientific_article_header(
+        self, document: Any, title: TitlePageInfo, manuscript: Manuscript
+    ) -> None:
+        article_meta = manuscript.metadata.get("scientific_article", {})
+        if not isinstance(article_meta, dict):
+            article_meta = {}
+
+        # UDC
+        udc = str(article_meta.get("udc") or manuscript.metadata.get("udc") or "004.89").strip()
+        udc_p = document.add_paragraph()
+        _plain_paragraph(udc_p, WD_ALIGN_PARAGRAPH.LEFT)
+        udc_run = udc_p.add_run(f"УДК {udc}")
+        _set_run_font(udc_run, self.config.font_name, 11, bold=True)
+        udc_p.paragraph_format.space_after = Pt(12)
+
+        # Title (RU)
+        title_p = document.add_paragraph()
+        _plain_paragraph(title_p, WD_ALIGN_PARAGRAPH.CENTER)
+        title_run = title_p.add_run(title.topic.upper())
+        _set_run_font(title_run, self.config.font_name, 14, bold=True)
+        title_p.paragraph_format.space_after = Pt(12)
+
+        # Authors (RU)
+        author_name = title.student or "Автор Исследования"
+        affiliation = title.university or title.department or ""
+        author_p = document.add_paragraph()
+        _plain_paragraph(author_p, WD_ALIGN_PARAGRAPH.CENTER)
+        a_run = author_p.add_run(author_name)
+        _set_run_font(a_run, self.config.font_name, 12, bold=True)
+        if affiliation:
+            aff_run = author_p.add_run(f"\n{affiliation}")
+            _set_run_font(aff_run, self.config.font_name, 11, italic=True)
+        if title.city:
+            loc_run = author_p.add_run(f", {title.city}")
+            _set_run_font(loc_run, self.config.font_name, 11, italic=True)
+        author_p.paragraph_format.space_after = Pt(14)
+
+        # Abstract (RU)
+        abstract_text = str(article_meta.get("abstract_ru") or manuscript.metadata.get("abstract") or "").strip()
+        if abstract_text:
+            abs_p = document.add_paragraph()
+            _plain_paragraph(abs_p, WD_ALIGN_PARAGRAPH.JUSTIFY)
+            abs_p.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+            label_run = abs_p.add_run("Аннотация. ")
+            _set_run_font(label_run, self.config.font_name, 11, bold=True)
+            text_run = abs_p.add_run(abstract_text)
+            _set_run_font(text_run, self.config.font_name, 11)
+            abs_p.paragraph_format.space_after = Pt(6)
+
+        # Keywords (RU)
+        keywords = article_meta.get("keywords_ru") or manuscript.metadata.get("keywords")
+        if isinstance(keywords, list) and keywords:
+            kw_text = ", ".join(str(k) for k in keywords)
+            kw_p = document.add_paragraph()
+            _plain_paragraph(kw_p, WD_ALIGN_PARAGRAPH.JUSTIFY)
+            kw_p.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+            kw_label = kw_p.add_run("Ключевые слова: ")
+            _set_run_font(kw_label, self.config.font_name, 11, bold=True, italic=True)
+            kw_run = kw_p.add_run(kw_text)
+            _set_run_font(kw_run, self.config.font_name, 11, italic=True)
+            kw_p.paragraph_format.space_after = Pt(18)
+
+    def _render_declarations(self, document: Any, declarations: Mapping[str, Any]) -> None:
+        dec_heading = document.add_paragraph()
+        dec_heading.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+        run = dec_heading.add_run("ДЕКЛАРАЦИИ И БЛАГОДАРНОСТИ")
+        _set_run_font(run, self.config.font_name, self.config.heading_2_size_pt, bold=True)
+        dec_heading.paragraph_format.space_before = Pt(12)
+        dec_heading.paragraph_format.space_after = Pt(6)
+
+        labels = {
+            "funding": "Финансирование: ",
+            "conflict_of_interest": "Конфликт интересов: ",
+            "data_availability": "Доступность данных: ",
+            "acknowledgments": "Благодарности: ",
+        }
+        for key, label in labels.items():
+            val = str(declarations.get(key) or "").strip()
+            if val:
+                p = document.add_paragraph()
+                p.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+                l_run = p.add_run(label)
+                _set_run_font(l_run, self.config.font_name, 11, bold=True)
+                v_run = p.add_run(val)
+                _set_run_font(v_run, self.config.font_name, 11)
+                p.paragraph_format.space_after = Pt(4)
 
     def _render_title_page(self, document: Any, title: TitlePageInfo) -> None:
         top_lines = [title.ministry, title.university, title.faculty, title.department]
@@ -716,10 +816,13 @@ def _set_style_font(style: Any, name: str, size: float, *, bold: bool = False) -
     style.element.rPr.rFonts.set(qn("w:cs"), name)
 
 
-def _set_run_font(run: Any, name: str, size: float, *, bold: bool = False) -> None:
+def _set_run_font(
+    run: Any, name: str, size: float, *, bold: bool = False, italic: bool = False
+) -> None:
     run.font.name = name
     run.font.size = Pt(size)
     run.font.bold = bold
+    run.font.italic = italic
     run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), name)
     run._element.get_or_add_rPr().rFonts.set(qn("w:cs"), name)
 
@@ -822,23 +925,7 @@ def _fit_image(path: Path, maximum_width_cm: float, maximum_height_cm: float) ->
 
 
 def _bibliography_text(entry: BibliographyEntry) -> str:
-    if entry.citation_text.strip():
-        return entry.citation_text.strip()
-    authors = ", ".join(entry.authors)
-    parts = [f"{authors}." if authors else "", entry.title]
-    if entry.publisher:
-        parts.append(f"— {entry.publisher}")
-    if entry.year:
-        parts.append(str(entry.year))
-    text = " ".join(part for part in parts if part).rstrip(".") + "."
-    if entry.doi:
-        text += f" DOI: {entry.doi}."
-    if entry.url:
-        text += f" URL: {entry.url}"
-        if entry.accessed_on:
-            text += f" (дата обращения: {entry.accessed_on.strftime('%d.%m.%Y')})"
-        text += "."
-    return text
+    return format_gost_bibliography(entry)
 
 
 def _sha256(path: Path) -> str:

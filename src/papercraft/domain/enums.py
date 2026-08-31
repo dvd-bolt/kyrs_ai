@@ -143,6 +143,16 @@ class QAStatus(StrEnum):
     FAIL = "fail"
 
 
+class QualityStatus(StrEnum):
+    """Publication-quality state, independent from a pipeline run lifecycle."""
+
+    VALID = "valid"
+    NEEDS_REPAIR = "needs_repair"
+    WAITING_INPUT = "waiting_input"
+    FAILED_QUALITY = "failed_quality"
+    NON_PUBLISHABLE_SYNTHETIC_DEMO = "non_publishable_synthetic_demo"
+
+
 class VisualKind(StrEnum):
     TABLE = "table"
     CHART = "chart"

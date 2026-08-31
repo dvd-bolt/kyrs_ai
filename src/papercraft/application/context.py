@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from papercraft.domain import (
     BibliographyEntry,
     Claim,
+    ClaimStatus,
     Dataset,
     Evidence,
     ProjectBlueprint,
@@ -42,11 +43,11 @@ class ContextBuilder:
         selected_claims = [
             item
             for item in claims
-            # Unassigned claims used to be copied into every section.  The
-            # blueprint now binds planned claims to their section, so only an
-            # explicit required claim may cross section boundaries.
-            if item.id in section.required_claim_ids or item.section_id == section.id
+            if (item.id in section.required_claim_ids or item.section_id == section.id)
+            and item.status == ClaimStatus.SUPPORTED
         ]
+        if not selected_claims and claims:
+            selected_claims = [item for item in claims if item.status == ClaimStatus.SUPPORTED]
         evidence_ids = {item_id for claim in selected_claims for item_id in claim.evidence_ids}
         selected_evidence = [item for item in evidence if item.id in evidence_ids and item.verified]
         # A fresh web verification can deduplicate a new URL record into an
@@ -69,8 +70,18 @@ class ContextBuilder:
             for item in bibliography
             if item.id in evidence_bibliography_ids or item.source_id in selected_sources
         ]
-        dataset_ids = set(section.required_fact_ids)
-        selected_datasets = [item for item in datasets if not dataset_ids or item.id in dataset_ids]
+        if not selected_bibliography and bibliography:
+            selected_bibliography = list(bibliography)
+
+        target_dataset_ids = {
+            vr.dataset_id for vr in section.visual_requests if vr.dataset_id
+        } | set(section.required_fact_ids)
+        selected_datasets = [
+            item for item in datasets
+            if not target_dataset_ids or item.id in target_dataset_ids or item.name in target_dataset_ids
+        ]
+        if not selected_datasets and datasets:
+            selected_datasets = list(datasets)
         return SectionContext(
             section=section,
             claims=selected_claims,

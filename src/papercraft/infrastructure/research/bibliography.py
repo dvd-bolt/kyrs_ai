@@ -150,6 +150,34 @@ class BibliographyValidator:
         return BibliographyValidation(normalized, not errors, tuple(errors), tuple(warnings))
 
 
+def format_gost_bibliography(entry: BibliographyEntry) -> str:
+    """Render a deterministic ГОСТ-base reference from structured fields.
+
+    ``citation_text`` is intentionally ignored: it is model/user free text and
+    cannot be a trustworthy final bibliographic record.  This is a base format,
+    not a claim of conformance to a particular journal's house style.
+    """
+    normalized = BibliographyValidator().normalize(entry)
+    responsibility = ", ".join(normalized.authors)
+    parts = [f"{responsibility}." if responsibility else "", normalized.title.rstrip(".") + "."]
+    if normalized.publisher:
+        parts.append(f"— {normalized.publisher}.")
+    if normalized.year:
+        parts.append(f"— {normalized.year}.")
+    if normalized.doi:
+        parts.append(f"— DOI: {normalized.doi}.")
+    elif normalized.isbn:
+        parts.append(f"— ISBN {normalized.isbn}.")
+    if normalized.url:
+        access = (
+            f" (дата обращения: {normalized.accessed_on.strftime('%d.%m.%Y')})"
+            if normalized.accessed_on
+            else ""
+        )
+        parts.append(f"— URL: {normalized.url}{access}.")
+    return " ".join(part for part in parts if part).replace("..", ".")
+
+
 @dataclass(frozen=True, slots=True)
 class DeduplicationResult:
     entries: tuple[BibliographyEntry, ...]
@@ -240,6 +268,7 @@ __all__ = [
     "DeduplicationResult",
     "canonical_url",
     "deduplicate_bibliography",
+    "format_gost_bibliography",
     "normalize_doi",
     "normalize_isbn",
     "valid_doi",
