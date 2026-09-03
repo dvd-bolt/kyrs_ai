@@ -184,6 +184,9 @@ class LegacyCourseProjectImporter:
 
         # A sanitized snapshot aids audits without requiring the old application.
         AtomicArtifactStore(paths.derived).write_json("legacy_import.json", data)
+        persisted_project = repository.get_project(project.id)
+        if persisted_project is not None:
+            result.project = persisted_project
         return result
 
     @staticmethod

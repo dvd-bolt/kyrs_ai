@@ -420,7 +420,8 @@ class DocxRenderer:
         # Title (RU)
         title_p = document.add_paragraph()
         _plain_paragraph(title_p, WD_ALIGN_PARAGRAPH.CENTER)
-        title_run = title_p.add_run(title.topic.upper())
+        title_ru = str(article_meta.get("title_ru") or title.topic).strip()
+        title_run = title_p.add_run(title_ru.upper())
         _set_run_font(title_run, self.config.font_name, 14, bold=True)
         title_p.paragraph_format.space_after = Pt(12)
 
@@ -463,6 +464,36 @@ class DocxRenderer:
             kw_run = kw_p.add_run(kw_text)
             _set_run_font(kw_run, self.config.font_name, 11, italic=True)
             kw_p.paragraph_format.space_after = Pt(18)
+
+        title_en = str(article_meta.get("title_en") or "").strip()
+        if title_en:
+            title_en_p = document.add_paragraph()
+            _plain_paragraph(title_en_p, WD_ALIGN_PARAGRAPH.CENTER)
+            title_en_run = title_en_p.add_run(title_en.upper())
+            _set_run_font(title_en_run, self.config.font_name, 13, bold=True)
+            title_en_p.paragraph_format.space_after = Pt(8)
+
+        abstract_en = str(article_meta.get("abstract_en") or "").strip()
+        if abstract_en:
+            abstract_en_p = document.add_paragraph()
+            _plain_paragraph(abstract_en_p, WD_ALIGN_PARAGRAPH.JUSTIFY)
+            abstract_en_p.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+            abstract_en_label = abstract_en_p.add_run("Abstract. ")
+            _set_run_font(abstract_en_label, self.config.font_name, 11, bold=True)
+            abstract_en_run = abstract_en_p.add_run(abstract_en)
+            _set_run_font(abstract_en_run, self.config.font_name, 11)
+            abstract_en_p.paragraph_format.space_after = Pt(6)
+
+        keywords_en = article_meta.get("keywords_en")
+        if isinstance(keywords_en, list) and keywords_en:
+            keywords_en_p = document.add_paragraph()
+            _plain_paragraph(keywords_en_p, WD_ALIGN_PARAGRAPH.JUSTIFY)
+            keywords_en_p.paragraph_format.first_line_indent = Cm(self.config.paragraph_indent_cm)
+            keywords_en_label = keywords_en_p.add_run("Keywords: ")
+            _set_run_font(keywords_en_label, self.config.font_name, 11, bold=True, italic=True)
+            keywords_en_run = keywords_en_p.add_run(", ".join(str(keyword) for keyword in keywords_en))
+            _set_run_font(keywords_en_run, self.config.font_name, 11, italic=True)
+            keywords_en_p.paragraph_format.space_after = Pt(18)
 
     def _render_declarations(self, document: Any, declarations: Mapping[str, Any]) -> None:
         dec_heading = document.add_paragraph()

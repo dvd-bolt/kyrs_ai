@@ -34,6 +34,8 @@ class MigrationService:
             steps.append("add append-only section revision payload history")
         if from_version < 4 <= to_version:
             steps.append("add append-only plan revision payload history")
+        if from_version < 5 <= to_version:
+            steps.append("add immutable submission releases and fail-closed READY boundary")
         return MigrationPlan(from_version=from_version, to_version=to_version, steps=steps)
 
     def apply(self, plan: MigrationPlan, *, project_id: str | None = None) -> MigrationResult:

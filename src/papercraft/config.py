@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class ModelPolicy(BaseModel):
@@ -43,6 +43,51 @@ class ModelPolicy(BaseModel):
         if not value or any(ch.isspace() for ch in value):
             raise ValueError("Gemini model identifiers must be non-empty and contain no spaces")
         return value
+
+
+class ProviderPolicy(BaseModel):
+    """Fallback models grouped by the Gemini capability they can replace.
+
+    The primary model stays pinned in :class:`ModelPolicy` for every run.  A
+    fallback is deliberately capability-specific: an image model can never be
+    selected for text, structured output, or vision work.
+    """
+
+    text_fallback: str = "gemini-3.5-flash-lite"
+    structured_fallback: str = "gemini-3.5-flash-lite"
+    vision_fallback: str = "gemini-3.5-flash-lite"
+    image_fallback: str = "gemini-3.1-flash-image"
+
+    @field_validator("text_fallback", "structured_fallback", "vision_fallback", "image_fallback")
+    @classmethod
+    def validate_fallback_model_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ch.isspace() for ch in value):
+            raise ValueError("Gemini fallback model identifiers must be non-empty and contain no spaces")
+        return value
+
+
+class ModelCapabilityRegistry:
+    """Resolve a role to compatible primary/fallback model candidates."""
+
+    _structured_roles = frozenset({"classification", "extraction", "requirements", "blueprint"})
+    _vision_roles = frozenset({"visual_qa"})
+
+    def __init__(self, models: ModelPolicy, provider: ProviderPolicy) -> None:
+        self._models = models
+        self._provider = provider
+
+    def candidates(self, role: str) -> tuple[str, ...]:
+        primary = getattr(self._models, role)
+        if role == "image":
+            fallback = self._provider.image_fallback
+        elif role in self._vision_roles:
+            fallback = self._provider.vision_fallback
+        elif role in self._structured_roles:
+            fallback = self._provider.structured_fallback
+        else:
+            fallback = self._provider.text_fallback
+        return (primary,) if fallback == primary else (primary, fallback)
 
 
 ThinkingLevel = Literal["minimal", "low", "medium", "high"]
@@ -123,8 +168,8 @@ class AppSettings(BaseModel):
 
     projects_root: Path
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    gemini_api_key: SecretStr | None = None
     model_policy: ModelPolicy = Field(default_factory=ModelPolicy)
+    provider_policy: ProviderPolicy = Field(default_factory=ProviderPolicy)
     thinking_policy: ThinkingPolicy = Field(default_factory=ThinkingPolicy)
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
     performance_policy: PerformancePolicy = Field(default_factory=PerformancePolicy)
@@ -143,14 +188,12 @@ class AppSettings(BaseModel):
             base = Path(local_app_data) if local_app_data else Path.home() / ".local" / "share"
             root = base / "PaperCraftAI" / "projects"
 
-        raw_key = os.getenv("GEMINI_API_KEY", "").strip()
         log_level = os.getenv("PAPERCRAFT_LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             log_level = "INFO"
         return cls(
             projects_root=root,
             log_level=cast(Literal["DEBUG", "INFO", "WARNING", "ERROR"], log_level),
-            gemini_api_key=SecretStr(raw_key) if raw_key else None,
         )
 
     def ensure_directories(self) -> None:

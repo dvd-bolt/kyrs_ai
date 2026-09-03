@@ -19,6 +19,13 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "httpx>=0.28,<1",
   "platformdirs>=4.3,<5",
+  "tree-sitter==0.26.0",
+  "tree-sitter-c==0.24.2",
+  "tree-sitter-c-sharp==0.23.5",
+  "tree-sitter-cpp==0.23.4",
+  "tree-sitter-java==0.23.5",
+  "tree-sitter-javascript==0.25.0",
+  "tree-sitter-typescript==0.23.2",
 ]
 
 [project.optional-dependencies]

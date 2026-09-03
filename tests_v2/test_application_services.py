@@ -11,16 +11,100 @@ from papercraft.application import (
     StageContext,
     StageOutcome,
 )
+from papercraft.application.release import build_submission_release
 from papercraft.config import AppSettings
 from papercraft.domain import (
     Artifact,
     ArtifactKind,
     AutopilotOptions,
+    GenerationRun,
+    Manuscript,
+    Outline,
+    ParagraphBlock,
+    ProjectBlueprint,
     ProjectBrief,
+    QAReport,
+    RequirementSet,
     RunStatus,
+    SectionSpec,
     SourceRole,
 )
 from papercraft.infrastructure.persistence import sha256_file
+from papercraft.profiles.models import ProfilePolicy, ProfileSectionTemplate, WorkProfile
+
+
+def _release_outcome(context: StageContext) -> StageOutcome:
+    if context.stage.name in {
+        PipelineStage.CONSISTENCY_QA.value,
+        PipelineStage.FINAL_GEMINI_REVIEW.value,
+    }:
+        return StageOutcome(
+            checkpoint={"accepted": True, "blocker_issues": [], "factual_issues": []}
+        )
+    if context.stage.name != PipelineStage.PACKAGE.value:
+        return StageOutcome(checkpoint={"ok": True})
+
+    requirements = RequirementSet(project_id=context.project.id)
+    context.repository.save_requirement_set(requirements)
+    blueprint = ProjectBlueprint(
+        project_id=context.project.id,
+        topic=context.project.brief.topic,
+        outline=Outline(sections=[SectionSpec(id="body", title="Body")]),
+    )
+    context.repository.save_blueprint(blueprint)
+    manuscript = Manuscript(
+        project_id=context.project.id,
+        title=context.project.brief.title,
+        blocks=[ParagraphBlock(text="Release fixture")],
+    )
+    context.repository.save_manuscript(manuscript)
+    path = context.paths.artifacts / context.run.id / "release.docx"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"release-fixture")
+    artifact = Artifact(
+        project_id=context.project.id,
+        run_id=context.run.id,
+        stage_id=context.stage.id,
+        kind=ArtifactKind.DOCX,
+        path=str(path),
+        sha256=sha256_file(path),
+        size_bytes=path.stat().st_size,
+    )
+    context.repository.save_artifact(artifact)
+    report = QAReport(
+        project_id=context.project.id,
+        run_id=context.run.id,
+        metadata={"deterministic": True, "gate_version": 1},
+    )
+    context.repository.save_qa_report(report)
+    project = context.repository.get_project(context.project.id)
+    assert project is not None
+    release = build_submission_release(
+        project=project,
+        run=GenerationRun.model_validate(context.run),
+        manuscript=manuscript,
+        docx_artifact=artifact,
+        report=report,
+        requirements=requirements,
+        blueprint=blueprint,
+        profile=WorkProfile(
+            id="test-profile",
+            version="1",
+            display_name="Test",
+            work_type="coursework",
+            description="Test",
+            sections=[
+                ProfileSectionTemplate(
+                    key="body", title="Body", target_words=100, purpose="Test"
+                )
+            ],
+            policy=ProfilePolicy(voice="academic", minimum_sources=0),
+        ),
+    )
+    return StageOutcome(
+        artifacts=[artifact],
+        checkpoint={"release": release.model_dump(mode="json")},
+    )
 
 
 def test_project_and_source_services(tmp_path: Path) -> None:
@@ -41,7 +125,7 @@ def test_pipeline_is_checkpointed_and_resumable(tmp_path: Path) -> None:
 
     def handler(context):
         calls.append(context.stage.name)
-        return StageOutcome(checkpoint={"ok": True})
+        return _release_outcome(context)
 
     handlers = {stage: handler for stage in PipelineStage}
     service = AutopilotService(
@@ -111,7 +195,7 @@ def test_pipeline_failure_can_retry_from_stage(tmp_path: Path) -> None:
         if context.stage.name == PipelineStage.PLAN.value and fail_once["value"]:
             fail_once["value"] = False
             raise RuntimeError("bad plan")
-        return StageOutcome()
+        return _release_outcome(context)
 
     service = AutopilotService(
         settings,
@@ -213,7 +297,7 @@ def test_refresh_research_refuses_changed_project_inputs_without_mutating_run(tm
     workspace = projects.create(ProjectBrief(topic="Original assignment"))
 
     def handler(context: StageContext) -> StageOutcome:
-        return StageOutcome()
+        return _release_outcome(context)
 
     initial = AutopilotService(
         settings,

@@ -42,6 +42,7 @@ from papercraft.domain import (
     TableBlock,
 )
 from papercraft.infrastructure.calculations import FactLedger, FactLedgerError
+from papercraft.profiles import WorkProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,7 @@ class QAGateContext:
     project_id: str
     run_id: str
     manuscript: Manuscript
+    profile: WorkProfile
     facts: Sequence[FactRecord] = ()
     datasets: Sequence[Dataset] = ()
     claims: Sequence[Claim] = ()
@@ -61,7 +63,6 @@ class QAGateContext:
     artifact_paths: Mapping[str, str | Path] = field(default_factory=dict)
     docx_path: str | Path | None = None
     pdf_path: str | Path | None = None
-    profile: Any | None = None
 
 
 class DeterministicQualityGate:
@@ -534,11 +535,9 @@ class DeterministicQualityGate:
     def _check_profile_compliance(
         self, context: QAGateContext, blocks: list[Any], issues: list[QAIssue]
     ) -> None:
-        if context.profile is None:
-            return
         profile = context.profile
-        min_sources = getattr(profile, "minimum_sources", None)
-        if isinstance(min_sources, int) and min_sources > 0 and len(context.manuscript.bibliography) < min_sources:
+        min_sources = profile.policy.minimum_sources
+        if min_sources > 0 and len(context.manuscript.bibliography) < min_sources:
             issues.append(
                 self._issue(
                     QASeverity.ERROR,

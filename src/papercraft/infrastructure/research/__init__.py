@@ -22,14 +22,22 @@ from .datasets import (
     DiscoveredDataset,
     ZenodoDatasetDiscovery,
 )
-from .evidence import EvidenceCoverage, EvidenceGraph, evidence_from_fragment, link_claim_evidence
+from .evidence import (
+    EvidenceCoverage,
+    EvidenceGraph,
+    evidence_from_fragment,
+    final_text_claims,
+    link_claim_evidence,
+)
 from .scholarly import (
     CrossrefClient,
     DOIResolver,
     OfficialSourcePolicy,
     OpenAlexClient,
     ScholarlyDiscovery,
+    ScholarlyMetadataValidation,
     ScholarlyRecord,
+    validate_scholarly_record,
 )
 from .snapshots import SnapshotCaptureResult, SourceSnapshotStore
 from .url_verifier import (
@@ -68,6 +76,7 @@ __all__ = [
     "PinnedHTTPTransport",
     "SafeTarget",
     "ScholarlyDiscovery",
+    "ScholarlyMetadataValidation",
     "ScholarlyRecord",
     "SnapshotCaptureResult",
     "SourceSnapshotStore",
@@ -81,6 +90,7 @@ __all__ = [
     "canonical_url",
     "deduplicate_bibliography",
     "evidence_from_fragment",
+    "final_text_claims",
     "format_gost_bibliography",
     "link_claim_evidence",
     "normalize_doi",
@@ -89,5 +99,6 @@ __all__ = [
     "valid_doi",
     "valid_isbn",
     "validate_bibliography_entry",
+    "validate_scholarly_record",
     "verify_url",
 ]

@@ -98,6 +98,22 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class SubmissionStatus(StrEnum):
+    DRAFT = "DRAFT"
+    RUNNING = "RUNNING"
+    WAITING_PROVIDER = "WAITING_PROVIDER"
+    WAITING_INPUT = "WAITING_INPUT"
+    QUALITY_FAILED = "QUALITY_FAILED"
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
+    SUPERSEDED = "SUPERSEDED"
+    CANCELLED = "CANCELLED"
+
+
+class ReleaseStatus(StrEnum):
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
+    SUPERSEDED = "SUPERSEDED"
+
+
 class StageStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -185,11 +201,13 @@ __all__ = [
     "QAIssueSeverity",
     "QASeverity",
     "QAStatus",
+    "ReleaseStatus",
     "RequirementCategory",
     "RequirementPriority",
     "RunStatus",
     "SourceRole",
     "StageStatus",
+    "SubmissionStatus",
     "VisualKind",
     "WorkType",
 ]

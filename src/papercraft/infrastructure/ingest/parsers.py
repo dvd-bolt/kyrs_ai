@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from papercraft.domain import Source
+from papercraft.infrastructure.code_analysis import StaticCodeAnalyzer, legacy_code_metadata
 
 from ._domain import fragment, locator
 from .classification import CODE_SUFFIXES, IMAGE_SUFFIXES
@@ -104,22 +105,24 @@ class TextParser(SourceParser):
 class CodeParser(SourceParser):
     suffixes = CODE_SUFFIXES | frozenset({".json", ".xml", ".ipynb"})
 
-    def __init__(self, lines_per_fragment: int = 160) -> None:
+    def __init__(
+        self, lines_per_fragment: int = 160, analyzer: StaticCodeAnalyzer | None = None
+    ) -> None:
         self.lines_per_fragment = max(1, lines_per_fragment)
+        self.analyzer = analyzer or StaticCodeAnalyzer()
 
     def parse(self, source: Source) -> ParseResult:
         path = _path(source)
         text, encoding = _decode(path.read_bytes())
         lines = text.splitlines()
-        symbols = self._symbols(path, text)
-        analysis = self._analysis(path, text, symbols)
+        analysis = self.analyzer.analyze(source)
+        metadata = legacy_code_metadata(analysis)
+        symbols = metadata["symbols"]
         result = ParseResult(
             source.id,
             metadata={
                 "encoding": encoding,
-                "language": path.suffix.lstrip(".").casefold(),
-                "symbols": symbols,
-                "code_analysis": analysis,
+                **metadata,
             },
         )
         for start in range(0, len(lines), self.lines_per_fragment):
@@ -138,11 +141,18 @@ class CodeParser(SourceParser):
                     content=content,
                     source_locator=locator(
                         source_id=source.id,
-                        path=path,
+                        path=source.original_name,
                         line_start=start_line,
                         line_end=end_line,
+                        details={"source_hash": analysis.source_hash},
                     ),
-                    metadata={"symbols": chunk_symbols, "language": path.suffix.lstrip(".")},
+                    metadata={
+                        "symbols": chunk_symbols,
+                        "language": analysis.language.value,
+                        "source_hash": analysis.source_hash,
+                        "parser": analysis.parser,
+                        "confidence": analysis.confidence,
+                    },
                     ordinal=f"code:{start_line}-{end_line}",
                 )
             )

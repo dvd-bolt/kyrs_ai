@@ -23,6 +23,7 @@ from papercraft.domain import (
     RunStatus,
     StageRun,
     StageStatus,
+    SubmissionRelease,
 )
 from papercraft.infrastructure.gemini import GeminiUnavailableError
 from papercraft.infrastructure.persistence import AtomicArtifactStore, ProjectPaths, sha256_file
@@ -310,6 +311,12 @@ class AutopilotService:
         if run is None:
             raise KeyError(f"Unknown run: {run_id}")
         if run.status == RunStatus.SUCCEEDED:
+            release = self.repository.get_current_release(self.project.id)
+            if release is None or release.run_id != run.id:
+                run.status = RunStatus.FAILED
+                run.error = "A succeeded run has no current READY_TO_SUBMIT release"
+                run.finished_at = datetime.now(UTC)
+                return self.repository.save_run_preserving_control(run)
             corrupted = self._first_corrupt_completed_stage(run)
             if corrupted is None:
                 self._terminal(run)
@@ -454,18 +461,33 @@ class AutopilotService:
                 self._event(run, stage, "checkpoint_waiting", f"Approval required after {stage.name}")
                 return run
 
-        run.status = RunStatus.SUCCEEDED
-        run.current_stage = None
-        run.finished_at = datetime.now(UTC)
-        run = self.repository.save_run_preserving_control(run)
-        if run.status in {RunStatus.PAUSED, RunStatus.CANCELLED}:
-            if run.status == RunStatus.CANCELLED:
-                self._terminal(run)
-            return run
+        package_stage = next(
+            (stage for stage in self.repository.list_stages(run.id) if stage.name == PipelineStage.PACKAGE.value),
+            None,
+        )
+        if package_stage is None:
+            raise RuntimeError("Package stage is unavailable")
+        raw_release = package_stage.checkpoint.get("release")
+        try:
+            release = SubmissionRelease.model_validate(raw_release)
+        except Exception:
+            return self._fail(run, package_stage, RuntimeError("Package did not produce a valid release candidate"))
+
+        # Remote cleanup is part of successful completion.  Run it before the
+        # atomic READY/SUCCEEDED commit so cleanup failure cannot leave a false
+        # ready release behind.
         self._terminal(run)
         run = self.repository.get_run(run.id) or run
-        if run.status == RunStatus.SUCCEEDED:
-            self._event(run, None, "run_succeeded", "Autopilot completed successfully")
+        if run.metadata.get("terminal_cleanup_pending"):
+            return self._fail(run, package_stage, RuntimeError("Terminal cleanup failed"))
+        try:
+            run = self.repository.finalize_submission_release(
+                release,
+                finished_at=datetime.now(UTC),
+            )
+        except Exception as error:
+            return self._fail(run, package_stage, RuntimeError(f"Release finalization failed: {error}"))
+        self._event(run, None, "run_succeeded", "Autopilot completed with READY_TO_SUBMIT release")
         return run
 
     @staticmethod

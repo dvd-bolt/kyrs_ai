@@ -22,6 +22,7 @@ from papercraft.infrastructure.gemini import GeminiAuthenticationError, GeminiPo
 
 from .commands import WorkerAction
 from .lease import ProviderWorkerLease, WorkerLease
+from .protocol import JsonlWorker
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -178,9 +179,52 @@ def _emit(payload: dict[str, object], *, error: bool = False) -> None:
     )
 
 
+def jsonl_main() -> int:
+    """Read exactly one protocol-v1 request and write only protocol events."""
+
+    first = sys.stdin.readline()
+    extra = sys.stdin.readline()
+    if not first or extra:
+        return 2
+    try:
+        payload = json.loads(first)
+    except json.JSONDecodeError:
+        return 2
+    if not isinstance(payload, dict):
+        return 2
+    try:
+        settings = AppSettings.from_environment()
+        events = JsonlWorker(settings).handle(payload)
+    except ValueError:
+        # When the envelope is parseable enough to recover its identity, the
+        # protocol requires a safe failure event rather than a silent exit.
+        request_id = payload.get("request_id")
+        project_id = payload.get("project_id")
+        if not isinstance(request_id, str) or not request_id.strip() or not isinstance(project_id, str) or not project_id.strip():
+            return 2
+        from papercraft.application.api import WorkerEvent
+
+        events = [
+            WorkerEvent(
+                request_id=request_id,
+                project_id=project_id,
+                sequence=1,
+                event_type="request_failed",
+                error_code="VALIDATION_ERROR",
+                message="Worker request is invalid.",
+            )
+        ]
+    for event in events:
+        print(event.model_dump_json(), flush=True)
+    return 1 if events[-1].event_type == "request_failed" else 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    arguments_list = list(sys.argv[1:] if argv is None else argv)
+    if not arguments_list or arguments_list == ["--jsonl"]:
+        return jsonl_main()
     parser = _parser()
-    arguments = parser.parse_args(argv)
+    arguments = parser.parse_args(arguments_list)
     _validate(arguments, parser)
     settings = AppSettings.from_environment()
     if arguments.projects_root:

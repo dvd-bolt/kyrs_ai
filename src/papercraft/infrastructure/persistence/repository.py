@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 from collections.abc import Collection, Iterator
@@ -31,6 +32,7 @@ from papercraft.domain import (
     Project,
     ProjectBlueprint,
     QAReport,
+    ReleaseStatus,
     RemoteResource,
     RequirementSet,
     RevisionRecord,
@@ -41,12 +43,14 @@ from papercraft.domain import (
     SourceSnapshot,
     StageRun,
     StageStatus,
+    SubmissionRelease,
+    SubmissionStatus,
 )
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -140,6 +144,15 @@ CREATE TABLE IF NOT EXISTS run_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON run_events(run_id, sequence);
+CREATE TABLE IF NOT EXISTS worker_requests (
+    request_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    outcome TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_worker_requests_project ON worker_requests(project_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS domain_objects (
     kind TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -190,6 +203,18 @@ CREATE TABLE IF NOT EXISTS plan_revision_payloads (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_revision_payloads_project
     ON plan_revision_payloads(project_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS submission_releases (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_submission_releases_project
+    ON submission_releases(project_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_submission_releases_one_ready
+    ON submission_releases(project_id) WHERE status = 'READY_TO_SUBMIT';
 """
 
 
@@ -237,11 +262,71 @@ class SQLiteRepository:
                 raise RuntimeError(
                     f"database schema {current} is newer than supported schema {_SCHEMA_VERSION}"
                 )
-            # All schema additions are additive.  A dedicated MigrationService
-            # creates a backup before upgrading an existing project; this
-            # bootstrap keeps a freshly-created project at the current version.
-            connection.executescript(_SCHEMA)
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            backup_path: Path | None = None
+            if 0 < current < _SCHEMA_VERSION:
+                backups_dir = self.database.parent / "backups"
+                backups_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backups_dir / (
+                    f"pre_migration_v{current}_to_v{_SCHEMA_VERSION}_{uuid4().hex[:8]}.db"
+                )
+                backup_connection = sqlite3.connect(backup_path)
+                try:
+                    connection.backup(backup_connection)
+                    backup_connection.commit()
+                    integrity = backup_connection.execute("PRAGMA integrity_check").fetchone()
+                    if integrity is None or str(integrity[0]) != "ok":
+                        raise RuntimeError("automatic pre-migration backup failed integrity check")
+                finally:
+                    backup_connection.close()
+            try:
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + _SCHEMA
+                    + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
+                )
+            except Exception:
+                connection.rollback()
+                raise
+            if backup_path is not None:
+                project_row = connection.execute(
+                    "SELECT id FROM projects ORDER BY created_at,id LIMIT 1"
+                ).fetchone()
+                project_id = None if project_row is None else str(project_row["id"])
+                backup: BackupRecord | None = None
+                if project_id is not None:
+                    backup = BackupRecord(
+                        project_id=project_id,
+                        path=str(backup_path),
+                        sha256=self._file_sha256(backup_path),
+                        size_bytes=backup_path.stat().st_size,
+                        label=f"before schema migration {current}->{_SCHEMA_VERSION}",
+                    )
+                    connection.execute(
+                        """INSERT INTO backup_records(id,project_id,data,created_at)
+                           VALUES(?,?,?,?)""",
+                        (
+                            backup.id,
+                            backup.project_id,
+                            self._json(backup),
+                            backup.created_at.isoformat(),
+                        ),
+                    )
+                migration = MigrationRecord(
+                    project_id=project_id,
+                    from_version=current,
+                    to_version=_SCHEMA_VERSION,
+                    backup_id=backup.id if backup is not None else None,
+                )
+                connection.execute(
+                    """INSERT INTO migration_records(id,project_id,data,applied_at)
+                       VALUES(?,?,?,?)""",
+                    (
+                        migration.id,
+                        migration.project_id,
+                        self._json(migration),
+                        migration.applied_at.isoformat(),
+                    ),
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -271,8 +356,78 @@ class SQLiteRepository:
     def _load(row: sqlite3.Row | None, model_type: type[TModel]) -> TModel | None:
         return None if row is None else model_type.model_validate_json(row["data"])
 
+    @staticmethod
+    def _stable_hash(value: object) -> str:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _bump_project_content(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        reason: str,
+    ) -> Project | None:
+        row = connection.execute("SELECT data FROM projects WHERE id=?", (project_id,)).fetchone()
+        project = self._load(row, Project)
+        if project is None:
+            return None
+        project.content_revision += 1
+        project.updated_at = datetime.now(project.updated_at.tzinfo)
+        if project.current_release_id is not None:
+            release_row = connection.execute(
+                "SELECT data FROM submission_releases WHERE id=? AND project_id=?",
+                (project.current_release_id, project.id),
+            ).fetchone()
+            release = self._load(release_row, SubmissionRelease)
+            if release is not None and release.status is ReleaseStatus.READY_TO_SUBMIT:
+                release = release.model_copy(
+                    update={
+                        "status": ReleaseStatus.SUPERSEDED,
+                        "superseded_at": datetime.now(release.created_at.tzinfo),
+                        "superseded_reason": reason,
+                    }
+                )
+                connection.execute(
+                    "UPDATE submission_releases SET status=?,data=? WHERE id=?",
+                    (release.status.value, self._json(release), release.id),
+                )
+            project.current_release_id = None
+            project.submission_status = SubmissionStatus.DRAFT
+        connection.execute(
+            "UPDATE projects SET data=?,updated_at=? WHERE id=?",
+            (self._json(project), project.updated_at.isoformat(), project.id),
+        )
+        return project
+
     def save_project(self, project: Project) -> None:
-        with self._session() as connection:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM projects WHERE id=?", (project.id,)).fetchone()
+            current = self._load(row, Project)
+            if current is not None:
+                if current.brief != project.brief or current.options != project.options:
+                    current = self._bump_project_content(
+                        connection,
+                        project.id,
+                        reason="project_or_profile_changed",
+                    ) or current
+                project.content_revision = current.content_revision
+                project.current_release_id = current.current_release_id
+                project.submission_status = current.submission_status
             connection.execute(
                 """INSERT INTO projects(id, data, created_at, updated_at) VALUES (?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at""",
@@ -299,7 +454,15 @@ class SQLiteRepository:
         return [Project.model_validate_json(row["data"]) for row in rows]
 
     def save_source(self, source: Source) -> None:
-        with self._session() as connection:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM sources WHERE id=?", (source.id,)).fetchone()
+            existing = self._load(row, Source)
+            if existing != source:
+                self._bump_project_content(
+                    connection,
+                    source.project_id,
+                    reason="source_changed",
+                )
             connection.execute(
                 """INSERT INTO sources(id,project_id,role,sha256,data,created_at) VALUES(?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET role=excluded.role,sha256=excluded.sha256,data=excluded.data""",
@@ -369,7 +532,15 @@ class SQLiteRepository:
     ) -> None:
         if table not in {"requirements", "blueprints"}:
             raise ValueError("unsupported versioned table")
-        with self._session() as connection:
+        with self.transaction() as connection:
+            row = connection.execute(f"SELECT data FROM {table} WHERE id=?", (object_id,)).fetchone()
+            existing = None if row is None else model.__class__.model_validate_json(row["data"])
+            if existing != model:
+                self._bump_project_content(
+                    connection,
+                    project_id,
+                    reason=f"{table}_changed",
+                )
             connection.execute(
                 f"""INSERT INTO {table}(id,project_id,data,created_at) VALUES(?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
@@ -387,7 +558,15 @@ class SQLiteRepository:
         return self._load(row, model_type)
 
     def save_manuscript(self, manuscript: Manuscript) -> None:
-        with self._session() as connection:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT data FROM manuscripts WHERE id=?", (manuscript.id,)).fetchone()
+            existing = self._load(row, Manuscript)
+            if existing != manuscript:
+                self._bump_project_content(
+                    connection,
+                    manuscript.project_id,
+                    reason="manuscript_changed",
+                )
             self._save_manuscript(connection, manuscript)
 
     def _save_manuscript(self, connection: sqlite3.Connection, manuscript: Manuscript) -> None:
@@ -433,6 +612,11 @@ class SQLiteRepository:
         if not payload:
             raise ValueError("section revision payload must not be blank")
         with self.transaction() as connection:
+            self._bump_project_content(
+                connection,
+                manuscript.project_id,
+                reason="section_changed",
+            )
             if baseline_payload is not None:
                 existing = connection.execute(
                     """SELECT 1 FROM section_revision_payloads
@@ -540,6 +724,11 @@ class SQLiteRepository:
         if not payload:
             raise ValueError("plan revision payload must not be blank")
         with self.transaction() as connection:
+            self._bump_project_content(
+                connection,
+                blueprint.project_id,
+                reason="blueprint_changed",
+            )
             if baseline_payload is not None:
                 existing = connection.execute(
                     "SELECT 1 FROM plan_revision_payloads WHERE project_id=? LIMIT 1",
@@ -625,7 +814,16 @@ class SQLiteRepository:
         return None if row is None else str(row["payload"])
 
     def save_run(self, run: GenerationRun) -> None:
-        with self._session() as connection:
+        if run.status is RunStatus.SUCCEEDED:
+            raise ValueError("RunStatus.SUCCEEDED can be persisted only by finalize_submission_release")
+        with self.transaction() as connection:
+            existing = connection.execute("SELECT 1 FROM runs WHERE id=?", (run.id,)).fetchone()
+            if existing is None:
+                self._bump_project_content(
+                    connection,
+                    run.project_id,
+                    reason="model_policy_or_generation_changed",
+                )
             connection.execute(
                 """INSERT INTO runs(id,project_id,status,data,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)
                    ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data,
@@ -646,6 +844,8 @@ class SQLiteRepository:
         methods and may intentionally change the durable status.
         """
 
+        if run.status is RunStatus.SUCCEEDED:
+            raise ValueError("RunStatus.SUCCEEDED can be persisted only by finalize_submission_release")
         with self.transaction() as connection:
             row = connection.execute("SELECT data FROM runs WHERE id=?", (run.id,)).fetchone()
             current = self._load(row, GenerationRun)
@@ -733,6 +933,8 @@ class SQLiteRepository:
     ) -> GenerationRun:
         """Compare-and-set a run status while retaining concurrent cost data."""
 
+        if status is RunStatus.SUCCEEDED:
+            raise ValueError("RunStatus.SUCCEEDED requires finalize_submission_release")
         with self.transaction() as connection:
             row = connection.execute("SELECT data FROM runs WHERE id=?", (run_id,)).fetchone()
             run = self._load(row, GenerationRun)
@@ -779,6 +981,11 @@ class SQLiteRepository:
                 raise RuntimeError(f"run status {run.status.value} is not eligible for retry")
             if maximum_cost is not None and run.cost >= maximum_cost:
                 raise RuntimeError("run cost has reached the configured maximum")
+            self._bump_project_content(
+                connection,
+                run.project_id,
+                reason="generation_retried",
+            )
 
             rows = connection.execute(
                 "SELECT data FROM stages WHERE run_id=? ORDER BY stage_order,id", (run_id,)
@@ -900,6 +1107,196 @@ class SQLiteRepository:
             ).fetchone()
         return self._load(row, QAReport)
 
+    def get_release(self, release_id: str) -> SubmissionRelease | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT data FROM submission_releases WHERE id=?",
+                (release_id,),
+            ).fetchone()
+        return self._load(row, SubmissionRelease)
+
+    def get_current_release(self, project_id: str) -> SubmissionRelease | None:
+        with self._session() as connection:
+            row = connection.execute(
+                """SELECT data FROM submission_releases
+                   WHERE project_id=? AND status='READY_TO_SUBMIT'
+                   ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+                (project_id,),
+            ).fetchone()
+        return self._load(row, SubmissionRelease)
+
+    def supersede_current_release(self, project_id: str, *, reason: str) -> Project:
+        if not reason.strip():
+            raise ValueError("supersession reason must not be blank")
+        with self.transaction() as connection:
+            project = self._bump_project_content(
+                connection,
+                project_id,
+                reason=reason,
+            )
+            if project is None:
+                raise KeyError(project_id)
+        return project
+
+    def finalize_submission_release(
+        self,
+        release: SubmissionRelease,
+        *,
+        finished_at: datetime,
+    ) -> GenerationRun:
+        """Atomically validate the release scope, create READY and succeed its run."""
+
+        with self.transaction() as connection:
+            project = self._load(
+                connection.execute(
+                    "SELECT data FROM projects WHERE id=?", (release.project_id,)
+                ).fetchone(),
+                Project,
+            )
+            run = self._load(
+                connection.execute(
+                    "SELECT data FROM runs WHERE id=? AND project_id=?",
+                    (release.run_id, release.project_id),
+                ).fetchone(),
+                GenerationRun,
+            )
+            manuscript = self._load(
+                connection.execute(
+                    """SELECT data FROM manuscripts WHERE project_id=?
+                       ORDER BY revision DESC LIMIT 1""",
+                    (release.project_id,),
+                ).fetchone(),
+                Manuscript,
+            )
+            requirements = self._load(
+                connection.execute(
+                    """SELECT data FROM requirements WHERE project_id=?
+                       ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+                    (release.project_id,),
+                ).fetchone(),
+                RequirementSet,
+            )
+            blueprint = self._load(
+                connection.execute(
+                    """SELECT data FROM blueprints WHERE project_id=?
+                       ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+                    (release.project_id,),
+                ).fetchone(),
+                ProjectBlueprint,
+            )
+            artifact = self._load(
+                connection.execute(
+                    "SELECT data FROM artifacts WHERE id=?", (release.docx_artifact_id,)
+                ).fetchone(),
+                Artifact,
+            )
+            report = self._load(
+                connection.execute(
+                    "SELECT data FROM qa_reports WHERE id=?", (release.qa_report_id,)
+                ).fetchone(),
+                QAReport,
+            )
+            if any(
+                item is None
+                for item in (project, run, manuscript, requirements, blueprint, artifact, report)
+            ):
+                raise ValueError("release scope is incomplete")
+            assert project is not None
+            assert run is not None
+            assert manuscript is not None
+            assert requirements is not None
+            assert blueprint is not None
+            assert artifact is not None
+            assert report is not None
+            if run.status not in {RunStatus.RUNNING, RunStatus.RETRYING}:
+                raise ValueError("release run is not active")
+            if project.content_revision != release.project_content_revision:
+                raise ValueError("project content revision changed before release")
+            if project.current_release_id is not None:
+                raise ValueError("project already has a current release")
+            if run.input_hash != release.input_hash:
+                raise ValueError("release input hash is stale")
+            if self._stable_hash(run.model_policy) != release.model_policy_hash:
+                raise ValueError("release model policy hash is stale")
+            if manuscript.id != release.manuscript_id or manuscript.revision != release.manuscript_revision:
+                raise ValueError("release manuscript is stale")
+            if self._stable_hash(manuscript.model_dump(mode="json")) != release.manuscript_hash:
+                raise ValueError("release manuscript hash is stale")
+            if requirements.revision != release.requirements_revision:
+                raise ValueError("release requirements revision is stale")
+            if blueprint.revision != release.blueprint_revision:
+                raise ValueError("release blueprint revision is stale")
+            if artifact.project_id != project.id or artifact.run_id != run.id:
+                raise ValueError("release DOCX belongs to another scope")
+            if artifact.kind.value != "docx" or artifact.sha256 != release.docx_hash:
+                raise ValueError("release DOCX record is invalid")
+            document_path = Path(artifact.path)
+            if (
+                not document_path.is_file()
+                or document_path.stat().st_size != artifact.size_bytes
+                or self._file_sha256(document_path) != release.docx_hash
+            ):
+                raise ValueError("release DOCX failed integrity verification")
+            if report.project_id != project.id or report.run_id != run.id:
+                raise ValueError("release QA belongs to another scope")
+            if report.status.value != "pass" or any(
+                not issue.resolved and issue.severity.value != "info"
+                for issue in report.issues
+            ):
+                raise ValueError("release QA is not an exact PASS")
+            if report.metadata.get("deterministic") is not True:
+                raise ValueError("release QA is not a deterministic gate result")
+            if (
+                any(rule.mandatory for rule in requirements.rules)
+                and report.requirement_coverage is None
+            ):
+                raise ValueError("mandatory requirements lack release coverage")
+            if self._stable_hash(report.model_dump(mode="json")) != release.qa_scope_hash:
+                raise ValueError("release QA scope hash is stale")
+            for stage_name in ("consistency_qa", "final_gemini_review"):
+                stage = self._load(
+                    connection.execute(
+                        "SELECT data FROM stages WHERE run_id=? AND name=?",
+                        (run.id, stage_name),
+                    ).fetchone(),
+                    StageRun,
+                )
+                if stage is None or stage.status is not StageStatus.SUCCEEDED:
+                    raise ValueError(f"{stage_name} did not succeed")
+                if stage.checkpoint.get("accepted") is not True:
+                    raise ValueError(f"{stage_name} was not explicitly accepted")
+                if any(stage.checkpoint.get(key) for key in ("blocker_issues", "factual_issues")):
+                    raise ValueError(f"{stage_name} contains release-blocking model issues")
+
+            connection.execute(
+                """INSERT INTO submission_releases(id,project_id,run_id,status,data,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    release.id,
+                    release.project_id,
+                    release.run_id,
+                    release.status.value,
+                    self._json(release),
+                    release.created_at.isoformat(),
+                ),
+            )
+            project.current_release_id = release.id
+            project.submission_status = SubmissionStatus.READY_TO_SUBMIT
+            project.updated_at = finished_at
+            connection.execute(
+                "UPDATE projects SET data=?,updated_at=? WHERE id=?",
+                (self._json(project), project.updated_at.isoformat(), project.id),
+            )
+            run.status = RunStatus.SUCCEEDED
+            run.current_stage = None
+            run.finished_at = finished_at
+            run.error = None
+            connection.execute(
+                "UPDATE runs SET status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (run.status.value, self._json(run), run.id),
+            )
+        return run
+
     def append_event(self, event: RunEvent) -> int:
         with self._session() as connection:
             cursor = connection.execute(
@@ -928,6 +1325,38 @@ class SQLiteRepository:
                 (run_id, after_sequence),
             ).fetchall()
         return [(int(row["sequence"]), RunEvent.model_validate_json(row["data"])) for row in rows]
+
+    def get_worker_request(self, request_id: str) -> tuple[str, str, str | None] | None:
+        """Return ``(project_id, fingerprint, outcome_json)`` for protocol replay."""
+
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT project_id,fingerprint,outcome FROM worker_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["project_id"]), str(row["fingerprint"]), (
+            str(row["outcome"]) if row["outcome"] is not None else None
+        )
+
+    def record_worker_request(self, request_id: str, project_id: str, fingerprint: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO worker_requests(request_id,project_id,fingerprint,created_at)
+                   VALUES(?,?,?,CURRENT_TIMESTAMP)""",
+                (request_id, project_id, fingerprint),
+            )
+
+    def complete_worker_request(self, request_id: str, outcome_json: str) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE worker_requests SET outcome=?,completed_at=CURRENT_TIMESTAMP
+                   WHERE request_id=? AND outcome IS NULL""",
+                (outcome_json, request_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("worker request is missing or already completed")
 
     def _save_object(self, kind: str, project_id: str, object_id: str, parent_id: str | None, model: BaseModel) -> None:
         with self._session() as connection:
@@ -960,19 +1389,61 @@ class SQLiteRepository:
         return self._list_objects("evidence", project_id, Evidence)
 
     def save_source_snapshot(self, snapshot: SourceSnapshot) -> None:
-        self._save_object(
-            "source_snapshot",
-            snapshot.project_id,
-            snapshot.id,
-            snapshot.source_id,
-            snapshot,
-        )
+        """Persist an immutable capture; an ID can never be repointed or rewritten."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT data FROM domain_objects WHERE kind='source_snapshot' AND id=?",
+                (snapshot.id,),
+            ).fetchone()
+            if row is not None:
+                existing = SourceSnapshot.model_validate_json(row["data"])
+                if existing != snapshot:
+                    raise ValueError("SourceSnapshot is immutable and cannot be replaced")
+                return
+            connection.execute(
+                """INSERT INTO domain_objects(kind,id,project_id,parent_id,data,updated_at)
+                   VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                (
+                    "source_snapshot",
+                    snapshot.id,
+                    snapshot.project_id,
+                    snapshot.source_id,
+                    self._json(snapshot),
+                ),
+            )
 
     def list_source_snapshots(self, project_id: str) -> list[SourceSnapshot]:
         return self._list_objects("source_snapshot", project_id, SourceSnapshot)
 
     def save_bibliography_entry(self, project_id: str, entry: BibliographyEntry) -> None:
         self._save_object("bibliography", project_id, entry.id, entry.source_id, entry)
+
+    def replace_bibliography_entries(
+        self, project_id: str, entries: list[BibliographyEntry]
+    ) -> None:
+        """Publish a canonical bibliography so duplicates cannot inflate source minimums."""
+
+        unique_ids = [entry.id for entry in entries]
+        if len(unique_ids) != len(set(unique_ids)):
+            raise ValueError("bibliography entry IDs must be unique")
+        with self.transaction() as connection:
+            connection.execute(
+                "DELETE FROM domain_objects WHERE kind='bibliography' AND project_id=?",
+                (project_id,),
+            )
+            for entry in entries:
+                connection.execute(
+                    """INSERT INTO domain_objects(kind,id,project_id,parent_id,data,updated_at)
+                       VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                    (
+                        "bibliography",
+                        entry.id,
+                        project_id,
+                        entry.source_id,
+                        self._json(entry),
+                    ),
+                )
 
     def list_bibliography(self, project_id: str) -> list[BibliographyEntry]:
         return self._list_objects("bibliography", project_id, BibliographyEntry)
@@ -993,6 +1464,11 @@ class SQLiteRepository:
 
         project_id = manuscript.project_id
         with self.transaction() as connection:
+            self._bump_project_content(
+                connection,
+                project_id,
+                reason="manuscript_changed",
+            )
             connection.execute(
                 "DELETE FROM domain_objects WHERE kind='citation' AND project_id=?",
                 (project_id,),

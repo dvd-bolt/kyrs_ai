@@ -9,7 +9,13 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 
-from papercraft.domain import Artifact, ArtifactKind, GenerationRun, RunStatus
+from papercraft.domain import (
+    Artifact,
+    ArtifactKind,
+    GenerationRun,
+    ReleaseStatus,
+    RunStatus,
+)
 from papercraft.infrastructure.persistence import sha256_file
 
 from .autopilot import AutopilotService, PipelineStage
@@ -61,32 +67,37 @@ class DocumentService:
 
         if artifact.kind not in {ArtifactKind.DOCX, ArtifactKind.PDF}:
             return
+        if artifact.kind is ArtifactKind.PDF:
+            raise DocumentExportBlocked("Only the released DOCX is user-exportable.")
         if not artifact.run_id:
             raise DocumentExportBlocked("Export is blocked until release QA is completed.")
+        project = self.repository.get_project(self.project_id)
+        release = self.repository.get_current_release(self.project_id)
+        if (
+            project is None
+            or release is None
+            or release.status is not ReleaseStatus.READY_TO_SUBMIT
+            or project.current_release_id != release.id
+            or project.content_revision != release.project_content_revision
+        ):
+            raise DocumentExportBlocked("Export is blocked until the current revision is READY_TO_SUBMIT.")
+        if release.docx_artifact_id != artifact.id or release.run_id != artifact.run_id:
+            raise DocumentExportBlocked("Export is blocked until this exact DOCX passes release QA.")
         run = self.repository.get_run(artifact.run_id)
         if run is None or run.status is not RunStatus.SUCCEEDED:
             raise DocumentExportBlocked("Export is blocked until the release run succeeds.")
-        report = self.repository.get_latest_qa_report(artifact.run_id)
-        if report is None:
-            raise DocumentExportBlocked("Export is blocked until release QA is completed.")
-        if report.status.value == "fail":
-            raise DocumentExportBlocked("Export is blocked by unresolved release-QA issues.")
-        raw_scope = report.metadata.get("release_scope")
-        if not isinstance(raw_scope, dict):
-            raise DocumentExportBlocked("Export is blocked: the release-QA scope is unavailable.")
-        expected_artifact_id = raw_scope.get(
-            "docx_artifact_id" if artifact.kind is ArtifactKind.DOCX else "pdf_artifact_id"
-        )
-        if expected_artifact_id != artifact.id:
-            raise DocumentExportBlocked("Export is blocked until the latest document passes release QA.")
         manuscript = self.repository.get_latest_manuscript(self.project_id)
-        if manuscript is None or raw_scope.get("manuscript_id") != manuscript.id:
+        if (
+            manuscript is None
+            or manuscript.id != release.manuscript_id
+            or manuscript.revision != release.manuscript_revision
+        ):
             raise DocumentExportBlocked("Export is blocked until the edited manuscript passes release QA.")
         blueprint = self.repository.get_latest_blueprint(self.project_id)
-        if blueprint is None or raw_scope.get("blueprint_id") != blueprint.id:
+        if blueprint is None or blueprint.revision != release.blueprint_revision:
             raise DocumentExportBlocked("Export is blocked until the edited plan passes release QA.")
         requirements = self.repository.get_latest_requirement_set(self.project_id)
-        if requirements is None or raw_scope.get("requirement_set_id") != requirements.id:
+        if requirements is None or requirements.revision != release.requirements_revision:
             raise DocumentExportBlocked(
                 "Export is blocked until the current requirements pass release QA."
             )
@@ -167,7 +178,9 @@ class DocumentService:
         return target
 
     def open_in_word(self, run_id: str | None = None) -> None:
-        path = self.latest(ArtifactKind.DOCX, run_id)
+        artifact = self._latest_artifact(ArtifactKind.DOCX, run_id)
+        self._assert_export_allowed(artifact)
+        path = self._validated_path(artifact)
         if os.name == "nt":
             os.startfile(path)
             return

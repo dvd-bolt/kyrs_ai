@@ -20,10 +20,11 @@ from .gateway import (
     UsageRecord,
 )
 from .ports import GeminiPort
-from .secrets import CredentialSecretStore
+from .secrets import CredentialSecretStore, CredentialStoreUnavailableError, SecretStore
 
 __all__ = [
     "CredentialSecretStore",
+    "CredentialStoreUnavailableError",
     "FakeGeminiGateway",
     "GeminiAuthenticationError",
     "GeminiConfigurationError",
@@ -37,5 +38,6 @@ __all__ = [
     "GroundedResult",
     "ProviderRequestCoordinator",
     "RemoteFile",
+    "SecretStore",
     "UsageRecord",
 ]

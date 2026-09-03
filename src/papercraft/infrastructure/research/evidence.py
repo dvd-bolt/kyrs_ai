@@ -2,11 +2,57 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 from papercraft.domain import Claim, ClaimStatus, Evidence, Locator, SourceFragment, new_id
+
+_FACTUAL_CUE = re.compile(
+    r"(?:\d|%|\b(?:is|are|was|were|has|have|increased|decreased|reported|"
+    r"shows?|demonstrates?|составля(?:ет|ли)|увелич(?:ился|илась|илось|ились|ение)|"
+    r"сниз(?:ился|илась|илось|ились|жение)|показал(?:а|о|и)?|выявил(?:а|о|и)?|"
+    r"установил(?:а|о|и)?|согласно)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def final_text_claims(
+    project_id: str,
+    text: str,
+    *,
+    section_id: str | None = None,
+    block_id: str | None = None,
+) -> list[Claim]:
+    """Extract conservative factual claims from final prose lacking bindings.
+
+    This is a release guard, not an evidence inference mechanism. A newly
+    discovered assertion must re-enter research and receive verified evidence.
+    """
+
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    claims: list[Claim] = []
+    seen: set[str] = set()
+    for sentence in sentences:
+        normalized = " ".join(sentence.split())
+        key = normalized.casefold().rstrip(".!?")
+        if len(normalized) < 12 or key in seen or not _FACTUAL_CUE.search(normalized):
+            continue
+        seen.add(key)
+        claims.append(
+            Claim(
+                project_id=project_id,
+                text=normalized,
+                section_id=section_id,
+                metadata={
+                    "origin": "final_text",
+                    "block_id": block_id or "",
+                    "requires_verified_evidence": True,
+                },
+            )
+        )
+    return claims
 
 
 @dataclass(frozen=True, slots=True)

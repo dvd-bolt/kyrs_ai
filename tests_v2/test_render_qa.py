@@ -14,6 +14,7 @@ from papercraft.domain import (
     BibliographyEntry,
     ChartSpec,
     ChartType,
+    Citation,
     Dataset,
     DatasetColumn,
     DataType,
@@ -48,6 +49,22 @@ from papercraft.infrastructure.qa import (
 )
 from papercraft.infrastructure.render import DocxRenderer, RenderConfig
 from papercraft.infrastructure.visuals import ChartRenderer, LocalDiagramRenderer
+from papercraft.profiles.models import ProfilePolicy, ProfileSectionTemplate, WorkProfile
+
+
+def _qa_profile() -> WorkProfile:
+    return WorkProfile(
+        id="qa-test",
+        display_name="QA test",
+        work_type="coursework",
+        description="Neutral deterministic QA fixture",
+        sections=[
+            ProfileSectionTemplate(
+                key="body", title="Body", target_words=100, purpose="Test"
+            )
+        ],
+        policy=ProfilePolicy(voice="academic", minimum_sources=0),
+    )
 
 
 def test_fact_ledger_calculates_without_expression_evaluation() -> None:
@@ -295,7 +312,12 @@ def test_qa_gate_and_reports_are_deterministic_and_escape_html(tmp_path: Path) -
         ],
     )
     report = DeterministicQualityGate().run(
-        QAGateContext(project_id="p1", run_id="run-1", manuscript=manuscript)
+        QAGateContext(
+            project_id="p1",
+            run_id="run-1",
+            manuscript=manuscript,
+            profile=_qa_profile(),
+        )
     )
     assert report.status == QAStatus.FAIL
     categories = {issue.category for issue in report.issues}
@@ -354,8 +376,12 @@ def test_qa_accepts_rendered_docx_and_complete_provenance(tmp_path: Path) -> Non
             project_id="p1",
             run_id="run-2",
             manuscript=manuscript,
+            profile=_qa_profile(),
             facts=[fact],
             datasets=[dataset],
+            citations=[
+                Citation(bibliography_entry_id=manuscript.bibliography[0].id)
+            ],
             artifact_paths={"figure-1": image_path},
             docx_path=docx_path,
         )

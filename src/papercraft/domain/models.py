@@ -25,11 +25,13 @@ from .enums import (
     QASeverity,
     QAStatus,
     QualityStatus,
+    ReleaseStatus,
     RequirementCategory,
     RequirementPriority,
     RunStatus,
     SourceRole,
     StageStatus,
+    SubmissionStatus,
     VisualKind,
     WorkType,
 )
@@ -94,7 +96,13 @@ class ScientificArticleSpec(DomainModel):
     authors: list[ScientificAuthor] = Field(default_factory=list)
     organizations: list[str] = Field(default_factory=list)
     udc: str | None = None
+    title_ru: str = ""
+    title_en: str = ""
+    abstract_ru: str = ""
+    abstract_en: str = ""
     keywords: list[str] = Field(default_factory=list)
+    keywords_ru: list[str] = Field(default_factory=list)
+    keywords_en: list[str] = Field(default_factory=list)
     method_description: str = ""
     data_requirements: str = ""
     funding_statement: str = ""
@@ -151,6 +159,9 @@ class Project(DomainModel):
     brief: ProjectBrief = Field(default_factory=ProjectBrief)
     options: AutopilotOptions = Field(default_factory=AutopilotOptions)
     schema_version: int = Field(default=1, ge=1)
+    submission_status: SubmissionStatus = SubmissionStatus.DRAFT
+    content_revision: int = Field(default=1, ge=1)
+    current_release_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
@@ -350,6 +361,7 @@ class RequirementSet(DomainModel):
     conflicts: list[Conflict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     schema_version: int = Field(default=1, ge=1)
+    revision: int = Field(default=1, ge=1)
 
 
 class RequirementCoverage(DomainModel):
@@ -585,6 +597,7 @@ class ProjectBlueprint(DomainModel):
     required_claims: list[str] = Field(default_factory=list)
     planned_visuals: list[VisualRequest] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
+    revision: int = Field(default=1, ge=1)
 
 
 class Claim(DomainModel):
@@ -1077,6 +1090,41 @@ class QAReport(DomainModel):
         rank = {QAStatus.PASS: 0, QAStatus.WARNING: 1, QAStatus.FAIL: 2}
         if rank[derived] > rank[self.status]:
             object.__setattr__(self, "status", derived)
+        return self
+
+
+class SubmissionRelease(DomainModel):
+    """Immutable proof that one exact DOCX passed release policy 1."""
+
+    id: str = Field(default_factory=new_id, min_length=1)
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    manuscript_id: str = Field(min_length=1)
+    manuscript_revision: int = Field(ge=1)
+    docx_artifact_id: str = Field(min_length=1)
+    qa_report_id: str = Field(min_length=1)
+    project_content_revision: int = Field(ge=1)
+    input_hash: str = Field(min_length=1)
+    requirements_revision: int = Field(ge=1)
+    blueprint_revision: int = Field(ge=1)
+    profile_id: str = Field(min_length=1)
+    profile_version: str = Field(min_length=1)
+    model_policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manuscript_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    docx_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qa_scope_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: ReleaseStatus = ReleaseStatus.READY_TO_SUBMIT
+    created_at: datetime = Field(default_factory=utc_now)
+    superseded_at: datetime | None = None
+    superseded_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_release_state(self) -> SubmissionRelease:
+        if self.status is ReleaseStatus.READY_TO_SUBMIT:
+            if self.superseded_at is not None or self.superseded_reason is not None:
+                raise ValueError("a ready release cannot contain supersession metadata")
+        elif self.superseded_at is None or not self.superseded_reason:
+            raise ValueError("a superseded release requires timestamp and reason")
         return self
 
 

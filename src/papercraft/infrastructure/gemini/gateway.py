@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from math import ceil
@@ -26,7 +27,7 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from papercraft.config import AppSettings, PerformancePolicy
+from papercraft.config import AppSettings, ModelCapabilityRegistry, PerformancePolicy
 
 from .ports import validate_interaction_id
 from .secrets import CredentialSecretStore, SecretStore
@@ -96,9 +97,11 @@ class GeminiUnavailableError(GeminiGatewayError):
         message: str = "",
         *,
         retry_after_seconds: float | None = None,
+        fallback_eligible: bool = False,
     ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.fallback_eligible = fallback_eligible
 
 
 class GeminiStructuredOutputError(GeminiGatewayError):
@@ -582,6 +585,7 @@ class GeminiGateway:
             settings.performance_policy,
             sleep=sleep,
         )
+        self.model_capabilities = ModelCapabilityRegistry(settings.model_policy, settings.provider_policy)
         self._usage_lock = RLock()
         self._work_item_id: ContextVar[str] = ContextVar(
             "papercraft_gemini_work_item_id",
@@ -592,11 +596,7 @@ class GeminiGateway:
             default=None,
         )
 
-        key = (
-            settings.gemini_api_key.get_secret_value()
-            if settings.gemini_api_key is not None
-            else self.secret_store.get_api_key()
-        )
+        key = self.secret_store.get_api_key()
         if client is None:
             if not key:
                 raise GeminiAuthenticationError(
@@ -631,14 +631,37 @@ class GeminiGateway:
         self.client = client
 
     def _model(self, role: str) -> str:
-        policy = self.settings.model_policy
         try:
-            value = getattr(policy, role)
+            value = self.model_capabilities.candidates(role)[0]
         except AttributeError as exc:
             raise ValueError(f"Unknown Gemini model role: {role}") from exc
         if not isinstance(value, str):
             raise ValueError(f"Model role is not textual: {role}")
         return value
+
+    def _call_with_model_fallback(
+        self,
+        *,
+        role: str,
+        operation: str,
+        invoke: Callable[[str], Any],
+        max_attempts: int | None = None,
+    ) -> tuple[Any, str]:
+        """Try only a compatible fallback after a safe provider refusal."""
+
+        candidates = self.model_capabilities.candidates(role)
+        for index, model in enumerate(candidates):
+            try:
+                return self._call(operation, partial(invoke, model), max_attempts=max_attempts), model
+            except GeminiConfigurationError:
+                if index + 1 == len(candidates):
+                    raise
+            except GeminiUnavailableError as exc:
+                # Network timeouts can be ambiguous paid POSTs and must wait
+                # durably instead of being reissued against another model.
+                if not exc.fallback_eligible or index + 1 == len(candidates):
+                    raise
+        raise AssertionError("model fallback candidates must not be empty")
 
     def _thinking_level(self, role: str) -> str:
         try:
@@ -1319,6 +1342,7 @@ class GeminiGateway:
         raise GeminiUnavailableError(
             f"{operation} failed after {attempt_limit} attempts: {diagnostic}",
             retry_after_seconds=last_retry_after_seconds,
+            fallback_eligible=self._status_code(last_error) == 429 if last_error is not None else False,
         ) from last_error
 
     def _create_interaction(self, **body: Any) -> _InteractionResponse:
@@ -1554,9 +1578,7 @@ class GeminiGateway:
         """Validate credentials and the pinned Gemini production model."""
 
         role = "requirements"
-        model = self._model(role)
-
-        def invoke() -> Any:
+        def invoke(model: str) -> Any:
             return self._create_interaction(
                 model=model,
                 input="Reply with OK.",
@@ -1565,9 +1587,12 @@ class GeminiGateway:
                 timeout=self.settings.request_timeout_seconds,
             )
 
-        response = self._call(
-            "Gemini health check",
-            invoke,
+        # Health checks have no document payload and are safe to repeat on a
+        # compatible fallback after 429/model-compatibility failures.
+        response, model = self._call_with_model_fallback(
+            role=role,
+            operation="Gemini health check",
+            invoke=invoke,
             max_attempts=1 if fail_fast else None,
         )
         self._record(response, "health_check", model)

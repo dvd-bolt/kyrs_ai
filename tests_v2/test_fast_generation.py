@@ -407,6 +407,45 @@ def test_paid_section_response_is_checkpointed_after_cancel_and_resumed_without_
     assert workspace.repository.get_latest_manuscript(workspace.project.id) is not None
 
 
+def test_section_is_rejected_when_repair_budget_is_exhausted(tmp_path: Path) -> None:
+    settings = AppSettings(projects_root=tmp_path / "projects", minimum_free_space_mb=128)
+    workspace = ProjectService(settings).create(
+        ProjectBrief(topic="Fail closed section"),
+        AutopilotOptions(maximum_revision_cycles=1),
+    )
+    section = SectionSpec(id="intro", title="Introduction", order=0)
+    workspace.repository.save_blueprint(
+        ProjectBlueprint(
+            project_id=workspace.project.id,
+            topic="Fail closed section",
+            outline=Outline(sections=[section]),
+        )
+    )
+    workspace.repository.save_requirement_set(RequirementSet(project_id=workspace.project.id))
+    gateway = FakeGeminiGateway()
+    gateway.enqueue(
+        "generate_structured",
+        {
+            "section_id": section.id,
+            "blocks": [{"type": "paragraph", "text": "Unaccepted draft."}],
+            "conclusion": "Incomplete",
+            "word_count": 2,
+        },
+    )
+    gateway.enqueue(
+        "generate_structured",
+        {
+            "accepted": False,
+            "issues": ["Insufficient evidence"],
+            "repair_instructions": ["Add verified evidence"],
+        },
+    )
+
+    with pytest.raises(StageExecutionError, match="was not accepted"):
+        ProductionStageFactory(gateway).generate_sections(_context(workspace, settings))
+    assert workspace.repository.get_latest_manuscript(workspace.project.id) is None
+
+
 def test_paid_grounded_response_is_checkpointed_after_cancel_without_replaying_search(
     tmp_path: Path,
 ) -> None:

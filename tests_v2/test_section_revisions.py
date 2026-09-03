@@ -333,7 +333,9 @@ def test_invalid_replacement_does_not_write_a_revision(tmp_path: Path) -> None:
     assert revisions.list_revisions("intro") == []
 
 
-def test_existing_v2_database_adds_revision_payloads_without_losing_manuscript(tmp_path: Path) -> None:
+def test_existing_v2_database_migrates_to_v5_with_backup_without_losing_manuscript(
+    tmp_path: Path,
+) -> None:
     workspace, generated = _workspace_with_manuscript(tmp_path)
 
     with sqlite3.connect(workspace.paths.database) as connection:
@@ -343,13 +345,19 @@ def test_existing_v2_database_adds_revision_payloads_without_losing_manuscript(t
 
     upgraded = SQLiteRepository(workspace.paths.database)
 
-    assert upgraded.schema_version == 4
+    assert upgraded.schema_version == 5
     assert upgraded.get_latest_manuscript(workspace.project.id) == generated
     with sqlite3.connect(workspace.paths.database) as connection:
         tables = {
             str(row[0])
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert {"section_revision_payloads", "plan_revision_payloads"} <= tables
+    assert {
+        "section_revision_payloads",
+        "plan_revision_payloads",
+        "submission_releases",
+    } <= tables
+    backups = upgraded.list_backup_records(workspace.project.id)
+    assert backups and Path(backups[0].path).is_file()
     result = SectionRevisionService(workspace.project.id, upgraded).revise_section("intro", "После миграции.")
     assert result.record.revision == 2

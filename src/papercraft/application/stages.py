@@ -15,7 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from time import monotonic
 from typing import Any, TypeVar, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from pydantic import JsonValue
 
@@ -101,12 +101,14 @@ from papercraft.infrastructure.research import (
     ScholarlyRecord,
     SourceSnapshotStore,
     URLVerifier,
+    final_text_claims,
 )
 from papercraft.profiles import ProfileRegistry, WorkProfile, default_profile_registry
 
 from .autopilot import PipelineStage, StageContext, StageHandler, StageOutcome
 from .context import ContextBuilder
 from .ports import RepositoryPort
+from .release import ReleasePolicyError, build_submission_release
 from .run_state import durable_run_state_lock
 from .scheduling import FailurePolicy, WorkCancelled, WorkItem, WorkStatus, run_dependency_aware
 from .schemas import (
@@ -717,7 +719,13 @@ class ProductionStageFactory:
             raise StageExecutionError(
                 "Unresolvable requirement conflicts: " + "; ".join(conflict.description or conflict.key for conflict in unresolved)
             )
-        requirements = RequirementSet(project_id=context.project.id, rules=rules, conflicts=conflicts)
+        previous_requirements = context.repository.get_latest_requirement_set(context.project.id)
+        requirements = RequirementSet(
+            project_id=context.project.id,
+            rules=rules,
+            conflicts=conflicts,
+            revision=(previous_requirements.revision + 1) if previous_requirements else 1,
+        )
         context.repository.save_requirement_set(requirements)
         path = context.artifact_store.write_json(f"{context.run.id}/requirements.json", requirements)
         return StageOutcome(
@@ -1594,8 +1602,9 @@ class ProductionStageFactory:
             if retained_id:
                 evidence.metadata["bibliography_entry_id"] = retained_id
                 context.repository.save_evidence(context.project.id, evidence)
-        for entry in deduplicated.entries:
-            context.repository.save_bibliography_entry(context.project.id, entry)
+        context.repository.replace_bibliography_entries(
+            context.project.id, list(deduplicated.entries)
+        )
         path = context.artifact_store.write_json(
             f"{context.run.id}/verified_research.json",
             {
@@ -1637,7 +1646,10 @@ class ProductionStageFactory:
             role="blueprint",
             system_instruction=SYSTEM_GUARD,
         )
-        blueprint = _blueprint(context.project.id, generated, claims)
+        previous_blueprint = context.repository.get_latest_blueprint(context.project.id)
+        blueprint = _blueprint(context.project.id, generated, claims).model_copy(
+            update={"revision": (previous_blueprint.revision + 1) if previous_blueprint else 1}
+        )
         for claim in claims:
             context.repository.save_claim(claim)
         context.repository.save_blueprint(blueprint)
@@ -2043,33 +2055,9 @@ class ProductionStageFactory:
                     duration_ms=int((monotonic() - started) * 1000),
                 )
             if checkpoint.cycle + 1 >= context.project.options.maximum_revision_cycles:
-                # Graceful completion: ensure minimum word count before proceeding
-                actual_words = sum([len(re.findall(r"\b\w+\b", b.text)) for b in draft.blocks if isinstance(b, DraftParagraph)])
-                if section.target_words and actual_words < int(section.target_words * 0.75):
-                    theses = section.theses or [section.title]
-                    topic_str = context.project.brief.topic or "исследуемой темы"
-                    extra_paras: list[DraftParagraph] = []
-                    for _idx, thesis in enumerate(theses):
-                        if actual_words + sum([len(re.findall(r"\b\w+\b", p.text)) for p in extra_paras]) >= int(section.target_words * 0.85):
-                            break
-                        extra_paras.append(
-                            DraftParagraph(
-                                text=(
-                                    f"В рамках комплексного анализа проблематики «{topic_str}» "
-                                    f"детально рассмотрен аспект: {thesis}. "
-                                    "Анализ научных источников и практических данных свидетельствует о "
-                                    "значимости установленных закономерностей для обоснования полученных выводов."
-                                ),
-                                claim_ids=draft.blocks[0].claim_ids if draft.blocks and isinstance(draft.blocks[0], DraftParagraph) else [],
-                                bibliography_entry_ids=draft.blocks[0].bibliography_entry_ids if draft.blocks and isinstance(draft.blocks[0], DraftParagraph) else [],
-                            )
-                        )
-                    if extra_paras:
-                        draft = draft.model_copy(update={"blocks": list(draft.blocks) + cast(list[DraftBlock], extra_paras)})
-                return _TimedWorkResult(
-                    key=section.id,
-                    value=draft,
-                    duration_ms=int((monotonic() - started) * 1000),
+                raise StageExecutionError(
+                    f"Section {section.title} was not accepted after "
+                    f"{context.project.options.maximum_revision_cycles} quality cycle(s)"
                 )
             # The critique response was returned successfully. Respect a
             # cancellation before deciding whether to spend another request
@@ -2686,6 +2674,24 @@ class ProductionStageFactory:
 
             raw_claim_ids = block.metadata.get("claim_ids", [])
             claim_ids = [str(item) for item in raw_claim_ids] if isinstance(raw_claim_ids, list) else []
+            if not claim_ids:
+                discovered = final_text_claims(
+                    context.project.id,
+                    block.text,
+                    section_id=(
+                        str(block.metadata.get("section_id"))
+                        if block.metadata.get("section_id")
+                        else None
+                    ),
+                    block_id=block.id,
+                )
+                if discovered:
+                    for claim in discovered:
+                        context.repository.save_claim(claim)
+                    raise StageExecutionError(
+                        "Final text contains factual claim(s) without a verified evidence binding; "
+                        "rebuild research before release"
+                    )
             unsupported = [
                 cid for cid in claim_ids
                 if cid not in claims or claims[cid].status != ClaimStatus.SUPPORTED
@@ -2766,21 +2772,17 @@ class ProductionStageFactory:
             for entry_id in entry_ids:
                 if entry_id not in used:
                     used.append(entry_id)
-                if entry_id in matched:
-                    selected_evidence = matched[entry_id]
-                    citation = Citation(
-                        claim_id=selected_evidence.claim_id,
-                        evidence_id=selected_evidence.id,
-                        bibliography_entry_id=entry_id,
-                        marker=f"[{used.index(entry_id) + 1}]",
+                if entry_id not in matched:
+                    raise StageExecutionError(
+                        "Citation has no verified claim/evidence lineage: " + entry_id
                     )
-                else:
-                    citation = Citation(
-                        claim_id=None,
-                        evidence_id=None,
-                        bibliography_entry_id=entry_id,
-                        marker=f"[{used.index(entry_id) + 1}]",
-                    )
+                selected_evidence = matched[entry_id]
+                citation = Citation(
+                    claim_id=selected_evidence.claim_id,
+                    evidence_id=selected_evidence.id,
+                    bibliography_entry_id=entry_id,
+                    marker=f"[{used.index(entry_id) + 1}]",
+                )
                 citations.append(citation)
                 block_citation_ids.append(citation.id)
 
@@ -2868,9 +2870,11 @@ class ProductionStageFactory:
             curr_issues = context.run.metadata.setdefault("consistency_issues", [])
             if isinstance(curr_issues, list):
                 curr_issues.extend([str(i) for i in raw_issues])
+        if not review.accepted or raw_issues:
+            raise StageExecutionError("Global manuscript review rejected the current revision")
         return StageOutcome(
             checkpoint={
-                "accepted": True,
+                "accepted": review.accepted,
                 "blocker_issues": cast(JsonValue, review.blocker_issues),
                 "factual_issues": cast(JsonValue, review.factual_issues),
                 "style_issues": cast(JsonValue, review.style_issues),
@@ -2882,6 +2886,21 @@ class ProductionStageFactory:
         from papercraft.infrastructure.render import DocxRenderer
 
         manuscript = _need(context.repository.get_latest_manuscript(context.project.id), "Manuscript")
+        article_spec = context.project.brief.profile_spec
+        if context.project.brief.work_type.value == "scientific_article" and article_spec is not None:
+            article_metadata = article_spec.model_dump(mode="json")
+            article_metadata["title_ru"] = str(article_metadata.get("title_ru") or manuscript.title)
+            if not article_metadata.get("keywords_ru"):
+                article_metadata["keywords_ru"] = article_metadata.get("keywords", [])
+            manuscript = manuscript.model_copy(
+                update={
+                    "metadata": {
+                        **manuscript.metadata,
+                        "work_type": "scientific_article",
+                        "scientific_article": article_metadata,
+                    }
+                }
+            )
         all_artifacts = context.repository.list_artifacts(context.project.id, run_id=context.run.id)
         artifact_paths = {artifact.id: artifact.path for artifact in all_artifacts}
         datasets = {dataset.id: dataset for dataset in context.repository.list_datasets(context.project.id)}
@@ -3179,7 +3198,16 @@ class ProductionStageFactory:
             curr_issues = context.run.metadata.setdefault("final_review_issues", [])
             if isinstance(curr_issues, list):
                 curr_issues.extend([str(i) for i in raw_issues])
-        return StageOutcome(checkpoint={"accepted": True}, message="Final Gemini review passed")
+        if not review.accepted or raw_issues:
+            raise StageExecutionError("Final Gemini review rejected the current revision")
+        return StageOutcome(
+            checkpoint={
+                "accepted": review.accepted,
+                "blocker_issues": cast(JsonValue, review.blocker_issues),
+                "factual_issues": cast(JsonValue, review.factual_issues),
+            },
+            message="Final Gemini review passed",
+        )
 
     def package(self, context: StageContext) -> StageOutcome:
         from papercraft.infrastructure.qa import (
@@ -3194,6 +3222,7 @@ class ProductionStageFactory:
         evidence = context.repository.list_evidence(context.project.id)
         citations = context.repository.list_citations(context.project.id)
         blueprint = context.repository.get_latest_blueprint(context.project.id)
+        profile = self._profile(context)
         requirement_coverage = (
             _build_requirement_coverage(
                 manuscript,
@@ -3229,6 +3258,7 @@ class ProductionStageFactory:
                 artifact_paths={artifact.id: artifact.path for artifact in artifacts},
                 docx_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.DOCX), None),
                 pdf_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.PDF), None),
+                profile=profile,
             )
         )
         raw_visual_issues = context.run.metadata.get("visual_qa_issues", [])
@@ -3269,19 +3299,33 @@ class ProductionStageFactory:
         context.repository.save_qa_report(report)
         for artifact in qa_artifacts:
             context.repository.save_artifact(artifact)
-        if report.status.value == "fail":
-            has_critical_methodology_gap = any(
-                issue.category in {"requirement_conflict", "requirement_coverage"}
-                and issue.severity in {QASeverity.BLOCKER, QASeverity.CRITICAL}
-                for issue in report.issues
-                if not issue.resolved
+        if report.status.value != "pass":
+            raise StageExecutionError(
+                f"Release QA must be PASS, got {report.status.value.upper()}"
             )
-            if has_critical_methodology_gap:
-                raise StageExecutionError("Release QA contains blocking issues")
+        if docx_artifact is None or requirements is None or blueprint is None:
+            raise StageExecutionError("Release scope is incomplete")
+        project = _need(context.repository.get_project(context.project.id), "Project")
+        try:
+            release = build_submission_release(
+                project=project,
+                run=context.run,
+                manuscript=manuscript,
+                docx_artifact=docx_artifact,
+                report=report,
+                requirements=requirements,
+                blueprint=blueprint,
+                profile=profile,
+            )
+        except ReleasePolicyError as error:
+            raise StageExecutionError(str(error)) from error
         return StageOutcome(
             artifacts=qa_artifacts,
-            checkpoint={"qa_status": report.status.value},
-            message="DOCX, PDF and QA report released",
+            checkpoint={
+                "qa_status": report.status.value,
+                "release": cast(JsonValue, release.model_dump(mode="json")),
+            },
+            message="DOCX and QA report passed release policy",
         )
 
     @staticmethod
@@ -4469,10 +4513,7 @@ def _research_candidates(
 
 def _snapshot_fetch_url(candidate: ScholarlyRecord) -> str:
     if candidate.doi:
-        return f"https://api.crossref.org/works/{quote(candidate.doi, safe='/()')}"
-    openalex_id = str(candidate.metadata.get("openalex_id") or "")
-    if openalex_id.startswith("https://openalex.org/"):
-        return openalex_id.replace("https://openalex.org/", "https://api.openalex.org/works/", 1)
+        return candidate.canonical_url
     return candidate.landing_url
 
 

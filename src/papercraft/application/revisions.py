@@ -449,6 +449,7 @@ class SectionRevisionService:
         persisted = blueprint.model_copy(deep=True)
         persisted.id = new_id()
         persisted.created_at = utc_now()
+        persisted.revision = current.revision + 1
         payload = self._encode_plan_payload(persisted, source=source, restored_from_id=restored_from_id)
         record = self.repository.commit_plan_override(
             persisted,
@@ -638,7 +639,7 @@ class SectionRevisionService:
     ) -> bool:
         """Detect plan fields whose change can affect every section prompt."""
 
-        excluded = {"id", "created_at", "outline"}
+        excluded = {"id", "created_at", "outline", "revision"}
         return previous.model_dump(mode="json", exclude=excluded) != updated.model_dump(
             mode="json", exclude=excluded
         )

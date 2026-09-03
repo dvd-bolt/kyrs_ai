@@ -26,6 +26,22 @@ from papercraft.domain import (
     TableSpec,
 )
 from papercraft.infrastructure.qa import DeterministicQualityGate, QAGateContext
+from papercraft.profiles.models import ProfilePolicy, ProfileSectionTemplate, WorkProfile
+
+
+def _qa_profile() -> WorkProfile:
+    return WorkProfile(
+        id="qa-test",
+        display_name="QA test",
+        work_type="coursework",
+        description="Neutral deterministic QA fixture",
+        sections=[
+            ProfileSectionTemplate(
+                key="body", title="Body", target_words=100, purpose="Test"
+            )
+        ],
+        policy=ProfilePolicy(voice="academic", minimum_sources=0),
+    )
 
 
 def _requirements() -> RequirementSet:
@@ -170,6 +186,7 @@ def test_qa_gate_exports_blockers_for_critical_coverage_and_evidence_gaps() -> N
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=manuscript,
             requirements=requirements,
             requirement_coverage=coverage,
@@ -203,6 +220,7 @@ def test_qa_gate_rejects_a_coverage_report_that_omits_a_requirement() -> None:
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="Coverage QA",
@@ -233,6 +251,7 @@ def test_qa_gate_blocks_critical_covered_requirement_without_a_location() -> Non
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="Coverage QA",
@@ -259,6 +278,7 @@ def test_qa_gate_blocks_unbound_user_authored_paragraph() -> None:
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="User edit evidence",
@@ -281,6 +301,7 @@ def test_qa_gate_blocks_generated_inline_numeric_table_without_provenance() -> N
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="Generated table evidence",
@@ -310,6 +331,7 @@ def test_qa_gate_accepts_inline_numeric_table_bound_to_known_facts() -> None:
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="User table facts",
@@ -342,10 +364,12 @@ def test_qa_gate_accepts_inline_numeric_table_bound_to_known_dataset() -> None:
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="Dataset table",
                 blocks=[
+                    ParagraphBlock(text="Synthetic demonstration dataset."),
                     TableBlock(
                         spec=TableSpec(
                             dataset_id=dataset.id,
@@ -367,6 +391,7 @@ def test_qa_gate_allows_text_only_inline_table_without_numeric_provenance() -> N
         QAGateContext(
             project_id="project-1",
             run_id="run-1",
+            profile=_qa_profile(),
             manuscript=Manuscript(
                 project_id="project-1",
                 title="Text table",

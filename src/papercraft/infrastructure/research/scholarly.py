@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
-from .bibliography import normalize_doi
+from .bibliography import canonical_url, normalize_doi, valid_doi
 from .url_verifier import URLVerificationResult, URLVerifier
 
 
@@ -27,6 +27,31 @@ class ScholarlyRecord:
     @property
     def canonical_url(self) -> str:
         return f"https://doi.org/{quote(self.doi, safe='/()') }" if self.doi else self.landing_url
+
+
+@dataclass(frozen=True, slots=True)
+class ScholarlyMetadataValidation:
+    """Structural validation for discovery metadata, never evidence validation."""
+
+    valid: bool
+    errors: tuple[str, ...] = ()
+
+
+def validate_scholarly_record(record: ScholarlyRecord) -> ScholarlyMetadataValidation:
+    """Check bibliographic metadata without treating an API record as article text."""
+
+    errors: list[str] = []
+    if len(record.title.strip()) < 3:
+        errors.append("invalid-title")
+    if not canonical_url(record.landing_url):
+        errors.append("invalid-url")
+    if record.doi is not None and not valid_doi(record.doi):
+        errors.append("invalid-doi")
+    if record.year is not None and not 1000 <= record.year <= 2100:
+        errors.append("implausible-year")
+    if any(not author.strip() for author in record.authors):
+        errors.append("invalid-author")
+    return ScholarlyMetadataValidation(valid=not errors, errors=tuple(errors))
 
 
 def _clean_markup(value: str) -> str:
@@ -229,7 +254,9 @@ class ScholarlyDiscovery:
         unique: list[ScholarlyRecord] = []
         keys: set[str] = set()
         for record in collected:
-            key = record.doi or record.landing_url.casefold()
+            if not validate_scholarly_record(record).valid:
+                continue
+            key = record.doi or canonical_url(record.landing_url) or record.landing_url.casefold()
             if key in keys:
                 continue
             keys.add(key)
@@ -245,5 +272,7 @@ __all__ = [
     "OfficialSourcePolicy",
     "OpenAlexClient",
     "ScholarlyDiscovery",
+    "ScholarlyMetadataValidation",
     "ScholarlyRecord",
+    "validate_scholarly_record",
 ]

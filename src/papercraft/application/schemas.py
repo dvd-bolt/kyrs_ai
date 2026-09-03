@@ -604,16 +604,6 @@ class SectionCritique(GeneratedModel):
                 data = dict(data[wrapper_key])
                 break
         data = dict(data)
-        if "accepted" not in data:
-            for alias in ("is_accepted", "approved", "passed", "valid"):
-                if alias in data:
-                    data["accepted"] = bool(data[alias])
-                    break
-            if "accepted" not in data and "status" in data:
-                data["accepted"] = str(data["status"]).casefold() in {"ok", "passed", "accepted", "approved", "success"}
-            if "accepted" not in data:
-                raw_issues = data.get("issues", [])
-                data["accepted"] = len(raw_issues) == 0 if isinstance(raw_issues, list) else False
         if "scores" not in data or not isinstance(data["scores"], dict):
             if isinstance(data.get("scores"), list):
                 scores_dict = {}
@@ -652,15 +642,6 @@ class GlobalReview(GeneratedModel):
                 data = dict(data[wrapper_key])
                 break
         data = dict(data)
-        if "accepted" not in data:
-            for alias in ("is_accepted", "approved", "passed", "valid"):
-                if alias in data:
-                    data["accepted"] = bool(data[alias])
-                    break
-            if "accepted" not in data and "status" in data:
-                data["accepted"] = str(data["status"]).casefold() in {"ok", "passed", "accepted", "approved", "success"}
-            if "accepted" not in data:
-                data["accepted"] = True
         for list_key in ("blocker_issues", "factual_issues", "consistency_issues", "style_issues", "repair_instructions"):
             val = data.get(list_key)
             if val is None:

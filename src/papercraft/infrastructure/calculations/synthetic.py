@@ -105,6 +105,10 @@ class SyntheticDatasetFactory:
             metadata={
                 "synthetic": True,
                 "purpose": spec.purpose,
+                "disclosure": (
+                    "Модельные (синтетические) данные сформированы для учебной демонстрации; "
+                    "они не являются наблюдениями реальной организации."
+                ),
                 "generator_version": 1,
                 "column_specs": metadata_spec,
             },

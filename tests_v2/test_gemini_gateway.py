@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import BaseModel, SecretStr, ValidationError
+from pydantic import BaseModel, ValidationError
 
 from papercraft.application.schemas import ResearchPlan
 from papercraft.config import AppSettings, ModelPolicy, RetryPolicy, ThinkingPolicy
@@ -119,10 +119,17 @@ def settings(tmp_path: Path) -> AppSettings:
 
 
 def test_owned_sdk_client_disables_nested_http_retries(tmp_path: Path) -> None:
-    configured = settings(tmp_path).model_copy(
-        update={"gemini_api_key": SecretStr("unit-test-only")}
-    )
-    gateway = GeminiGateway(configured)
+    class StaticSecretStore:
+        def get_api_key(self) -> str:
+            return "unit-test-only"
+
+        def set_api_key(self, _value: str) -> None:
+            raise AssertionError("not used")
+
+        def delete_api_key(self) -> None:
+            raise AssertionError("not used")
+
+    gateway = GeminiGateway(settings(tmp_path), secret_store=StaticSecretStore())
 
     retry_config = gateway.client.interactions.sdk_configuration.retry_config
     assert retry_config.max_retries == 1
