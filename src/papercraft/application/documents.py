@@ -20,6 +20,7 @@ from papercraft.infrastructure.persistence import sha256_file
 
 from .autopilot import AutopilotService, PipelineStage
 from .ports import RepositoryPort
+from .release import stable_hash
 
 
 class DocumentService:
@@ -84,15 +85,23 @@ class DocumentService:
         if release.docx_artifact_id != artifact.id or release.run_id != artifact.run_id:
             raise DocumentExportBlocked("Export is blocked until this exact DOCX passes release QA.")
         run = self.repository.get_run(artifact.run_id)
-        if run is None or run.status is not RunStatus.SUCCEEDED:
+        if (
+            run is None
+            or run.status is not RunStatus.SUCCEEDED
+            or run.input_hash != release.input_hash
+            or stable_hash(run.model_policy) != release.model_policy_hash
+        ):
             raise DocumentExportBlocked("Export is blocked until the release run succeeds.")
         manuscript = self.repository.get_latest_manuscript(self.project_id)
         if (
             manuscript is None
             or manuscript.id != release.manuscript_id
             or manuscript.revision != release.manuscript_revision
+            or stable_hash(manuscript.model_dump(mode="json")) != release.manuscript_hash
         ):
             raise DocumentExportBlocked("Export is blocked until the edited manuscript passes release QA.")
+        if artifact.sha256 != release.docx_hash:
+            raise DocumentExportBlocked("Export is blocked because the released DOCX scope is stale.")
         blueprint = self.repository.get_latest_blueprint(self.project_id)
         if blueprint is None or blueprint.revision != release.blueprint_revision:
             raise DocumentExportBlocked("Export is blocked until the edited plan passes release QA.")

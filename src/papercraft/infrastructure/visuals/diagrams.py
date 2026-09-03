@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import os
 import re
 import shutil
@@ -29,7 +30,7 @@ class DiagramRenderResult:
 
 
 class LocalDiagramRenderer:
-    """Render Mermaid locally, falling back to a deterministic Pillow diagram."""
+    """Render a declarative graph without evaluating its source language."""
 
     _BLOCKED = re.compile(
         r"(?i)(%%\s*\{|\bclick\b|javascript\s*:|file\s*:|data\s*:|url\s*\(|"
@@ -44,14 +45,18 @@ class LocalDiagramRenderer:
         self, spec: DiagramSpec, output_path: str | os.PathLike[str]
     ) -> DiagramRenderResult:
         output = Path(output_path).expanduser().resolve()
-        if output.suffix.lower() != ".png":
-            raise DiagramRenderError("diagrams must be rendered to a .png file")
+        if output.suffix.lower() not in {".png", ".svg"}:
+            raise DiagramRenderError("diagrams must be rendered to a .png or .svg file")
         self._validate(spec)
         output.parent.mkdir(parents=True, exist_ok=True)
 
+        if output.suffix.lower() == ".svg":
+            self._render_svg(spec, output)
+            return DiagramRenderResult(output, _sha256(output), "safe-svg")
+
         executable = self.mermaid_cli or shutil.which("mmdc")
         warnings: list[str] = []
-        if spec.language == "mermaid" and executable:
+        if spec.language == "mermaid" and executable and not spec.nodes:
             try:
                 self._render_mermaid_cli(spec.source, output, executable)
                 return DiagramRenderResult(output, _sha256(output), "mermaid-cli")
@@ -70,6 +75,16 @@ class LocalDiagramRenderer:
             raise DiagramRenderError("diagram source exceeds 100,000 characters")
         if "\x00" in source or self._BLOCKED.search(source):
             raise DiagramRenderError("diagram source contains an unsafe directive")
+
+    @staticmethod
+    def _nodes_and_edges(spec: DiagramSpec) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
+        if spec.nodes:
+            return (
+                [(node.id, node.label) for node in spec.nodes],
+                [(edge.source, edge.target, edge.label) for edge in spec.edges],
+            )
+        nodes, edges = _parse_nodes_and_edges(spec.source, spec.language)
+        return nodes, [(left, right, "") for left, right in edges]
 
     def _render_mermaid_cli(self, source: str, output: Path, executable: str) -> None:
         with tempfile.TemporaryDirectory(prefix="papercraft-diagram-") as temporary_dir:
@@ -106,14 +121,18 @@ class LocalDiagramRenderer:
     def _render_fallback(self, spec: DiagramSpec, output: Path) -> None:
         from PIL import Image, ImageDraw
 
-        nodes, edges = _parse_nodes_and_edges(spec.source, spec.language)
+        nodes, labelled_edges = self._nodes_and_edges(spec)
         if not nodes:
             nodes = [(f"node_{index}", line.strip()) for index, line in enumerate(spec.source.splitlines()) if line.strip()]
         if not nodes:
             nodes = [("empty", "Диаграмма")]
         nodes = nodes[:60]
         known_ids = {node_id for node_id, _ in nodes}
-        edges = [(left, right) for left, right in edges if left in known_ids and right in known_ids][:120]
+        edges = [
+            (left, right, label)
+            for left, right, label in labelled_edges
+            if left in known_ids and right in known_ids
+        ][:120]
 
         width = 1600
         box_width = 430
@@ -150,7 +169,7 @@ class LocalDiagramRenderer:
                 spacing=5,
             )
 
-        for left_id, right_id in edges:
+        for left_id, right_id, _label in edges:
             left_box, right_box = positions[left_id], positions[right_id]
             start = ((left_box[0] + left_box[2]) // 2, left_box[3])
             end = ((right_box[0] + right_box[2]) // 2, right_box[1])
@@ -167,6 +186,45 @@ class LocalDiagramRenderer:
         temporary = Path(temporary_name)
         try:
             image.save(temporary, "PNG", optimize=True)
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _render_svg(self, spec: DiagramSpec, output: Path) -> None:
+        """Write a self-contained SVG: labels are escaped and no active XML is accepted."""
+        nodes, labelled_edges = self._nodes_and_edges(spec)
+        if not nodes:
+            nodes = [("empty", "Диаграмма")]
+        nodes = nodes[:60]
+        known = {node_id for node_id, _ in nodes}
+        edges = [edge for edge in labelled_edges if edge[0] in known and edge[1] in known][:120]
+        height = max(450, 130 + len(nodes) * 145)
+        positions = {
+            node_id: (800, 105 + index * 145)
+            for index, (node_id, _label) in enumerate(nodes)
+        }
+        rows = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="{height}" viewBox="0 0 1600 {height}">',
+            '<defs><marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#526276"/></marker></defs>',
+            '<rect width="100%" height="100%" fill="white"/>',
+            f'<text x="800" y="60" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" fill="#111827">{html.escape(spec.title or "Диаграмма")}</text>',
+        ]
+        for left, right, label in edges:
+            start, end = positions[left], positions[right]
+            rows.append(f'<line x1="{start[0]}" y1="{start[1] + 62}" x2="{end[0]}" y2="{end[1] - 62}" stroke="#526276" stroke-width="4" marker-end="url(#arrow)"/>')
+            if label:
+                rows.append(f'<text x="{(start[0] + end[0]) // 2 + 18}" y="{(start[1] + end[1]) // 2}" font-family="Arial, sans-serif" font-size="18">{html.escape(label)}</text>')
+        for node_id, label in nodes:
+            x, y = positions[node_id]
+            rows.extend((
+                f'<rect x="{x - 215}" y="{y - 62}" width="430" height="125" rx="18" fill="#EEF4FF" stroke="#315EA8" stroke-width="4"/>',
+                f'<text x="{x}" y="{y}" text-anchor="middle" dominant-baseline="middle" font-family="Arial, sans-serif" font-size="27" fill="#111827">{html.escape(_clean_label(label))}</text>',
+            ))
+        rows.append("</svg>")
+        temporary = output.with_name(f".{output.name}.tmp")
+        try:
+            temporary.write_text("\n".join(rows), encoding="utf-8")
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)

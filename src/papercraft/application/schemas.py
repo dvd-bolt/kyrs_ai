@@ -7,7 +7,6 @@ which keeps generated identifiers and project ownership under local control.
 
 from __future__ import annotations
 
-import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -376,6 +375,8 @@ class DraftChart(GeneratedModel):
 class DraftDiagram(GeneratedModel):
     type: Literal["diagram"] = "diagram"
     title: str = Field(min_length=1)
+    nodes: list[dict[str, str]] = Field(default_factory=list)
+    edges: list[dict[str, str]] = Field(default_factory=list)
     language: Literal["mermaid", "graphviz"] = "mermaid"
     source: str = Field(min_length=1)
 
@@ -440,6 +441,7 @@ class DraftImage(GeneratedModel):
     prompt: str = Field(default="Scientific illustration", min_length=0)
     aspect_ratio: str = "4:3"
     alt_text: str = ""
+    optional: bool = True
 
     @model_validator(mode="before")
     @classmethod
@@ -469,124 +471,6 @@ class SectionDraft(GeneratedModel):
     conclusion: str = ""
     word_count: int = Field(default=0, ge=0)
     unresolved_claims: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_draft(cls, data: Any) -> Any:
-        if isinstance(data, str):
-            data = {"blocks": [{"type": "paragraph", "text": data}]}
-        elif isinstance(data, list):
-            data = {"blocks": data}
-        elif not isinstance(data, dict):
-            return data
-
-        # Unwrap nested root object wrappers
-        for wrapper_key in (
-            "draft", "section", "section_draft", "data", "result",
-            "response", "payload", "article", "paper", "content", "output"
-        ):
-            if wrapper_key in data and isinstance(data[wrapper_key], dict) and any(
-                k in data[wrapper_key] for k in ("blocks", "paragraphs", "text", "section_id", "id", "abstract", "summary")
-            ):
-                data = dict(data[wrapper_key])
-                break
-
-        data = dict(data)
-        if not data.get("section_id"):
-            for id_alias in ("id", "key", "sec_id", "sectionId", "section_name", "title"):
-                if data.get(id_alias):
-                    data["section_id"] = str(data[id_alias])
-                    break
-        if not data.get("section_id"):
-            data["section_id"] = "section-1"
-
-        raw_blocks = data.get("blocks")
-        if not isinstance(raw_blocks, list) or not raw_blocks:
-            raw_text = ""
-            for text_key in (
-                "text", "content", "body", "abstract", "summary",
-                "description", "annotation", "analysis", "section_text",
-                "text_ru", "introduction", "theory", "practical", "conclusion",
-            ):
-                if data.get(text_key) and isinstance(data[text_key], str):
-                    raw_text = str(data[text_key]).strip()
-                    break
-
-            if raw_text:
-                paras = [p.lstrip("#").strip() for p in raw_text.split("\n\n") if p.lstrip("#").strip()]
-                if paras:
-                    data["blocks"] = [{"type": "paragraph", "text": p} for p in paras]
-            elif isinstance(data.get("paragraphs"), list):
-                data["blocks"] = [
-                    {"type": "paragraph", "text": str(p).strip()}
-                    for p in data["paragraphs"]
-                    if str(p).strip()
-                ]
-            elif isinstance(data.get("sentences"), list):
-                sent_text = " ".join(str(s).strip() for s in data["sentences"] if str(s).strip())
-                if sent_text:
-                    data["blocks"] = [{"type": "paragraph", "text": sent_text}]
-            else:
-                data["blocks"] = []
-        else:
-            norm_blocks = []
-            for item in raw_blocks:
-                if isinstance(item, str):
-                    if item.strip():
-                        norm_blocks.append({"type": "paragraph", "text": item.strip()})
-                elif isinstance(item, dict):
-                    b = dict(item)
-                    b_type = str(b.get("type") or "").casefold().strip()
-                    if not b_type or b_type not in {"paragraph", "table", "chart", "diagram", "formula", "code_listing", "image"}:
-                        if "text" in b or "content" in b or "abstract" in b or "summary" in b or "body" in b:
-                            b_type = "paragraph"
-                        elif "rows" in b or "headers" in b:
-                            b_type = "table"
-                        elif "chart_type" in b or "x_column" in b:
-                            b_type = "chart"
-                        elif "source" in b:
-                            b_type = "diagram"
-                        elif "expression" in b:
-                            b_type = "formula"
-                        elif "code" in b:
-                            b_type = "code_listing"
-                        elif "prompt" in b:
-                            b_type = "image"
-                        elif b_type in {"flowchart", "graph", "mermaid", "graphviz"}:
-                            b_type = "diagram"
-                        else:
-                            b_type = "paragraph"
-                    b["type"] = b_type
-                    norm_blocks.append(b)
-                else:
-                    norm_blocks.append(item)
-            data["blocks"] = norm_blocks
-
-        if not data.get("blocks"):
-            data["blocks"] = [{
-                "type": "paragraph",
-                "text": "В рамках комплексного анализа проблематики детально исследованы ключевые теоретические и эмпирические аспекты.",
-            }]
-
-        if data.get("conclusion") is None:
-            data["conclusion"] = ""
-        if data.get("unresolved_claims") is None:
-            data["unresolved_claims"] = []
-
-        if "word_count" in data and data["word_count"] is not None:
-            try:
-                data["word_count"] = int(re.sub(r"[^\d]", "", str(data["word_count"])))
-            except Exception:
-                data["word_count"] = 0
-        else:
-            actual_words = sum(
-                len(re.findall(r"\b\w+\b", b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")))
-                for b in data["blocks"]
-                if (isinstance(b, dict) and b.get("type") == "paragraph") or getattr(b, "type", None) == "paragraph"
-            )
-            data["word_count"] = actual_words
-        return data
-
 
 class SectionCritique(GeneratedModel):
     accepted: bool

@@ -112,6 +112,13 @@ supersedes the current release and invalidates downstream stage hashes.
 `domain_objects` with `kind`, `id`, `project_id`, optional `parent_id`, JSON payload, and
 `updated_at`.
 
+`ChartSpec` pins the Dataset ID, selected columns, labels, caption and alt text; every rendered
+chart artifact also carries an accessible source-value table. `DiagramSpec` uses bounded typed
+nodes and directed edges (legacy Mermaid/Graphviz source is read-only compatibility input) and
+may render only sanitized SVG or PNG. `ImageSpec` carries the local prompt, caption, alt text and
+optional flag. Image artifacts record the pinned model, prompt hash, output SHA-256 and generation
+attempt. AI images are illustrations only and never create or support factual claims.
+
 Every factual claim links to evidence and a stable locator. Every numeric manuscript value links
 to a fact ledger entry whose origin is `user | verified_source | calculated | synthetic`.
 Synthetic datasets store seed, algorithm/version, assumptions, and disclosure text; they never
@@ -160,6 +167,11 @@ input and dependency hashes match.
 size, `created_at`, metadata. Supported kinds include source copy, extracted text, requirements,
 blueprint, dataset, image/chart/diagram, manuscript, DOCX, internal PDF, page preview, and QA.
 
+DOCX artifacts carry `phase: draft | repair_draft | final`. Drafts are immutable inputs to
+LibreOffice finalization; only a `final` DOCX with `finalizer=libreoffice` and
+`fields_updated=true` may be referenced by a release. PDF artifacts are internal release-QA
+inputs (`user_exportable=false`) and are never a user export format.
+
 `RemoteResource`: `id`, `project_id`, `run_id`, `stage_id?`, provider, remote ID/URI, local hash,
 MIME type, `created_at`, `deleted_at?`, cleanup state. Provider resources are registered before
 use and deletion is retried until durable `deleted_at` is set.
@@ -168,6 +180,9 @@ use and deletion is retried until durable `deleted_at` is set.
 
 `QAReport`: `id`, `project_id`, `run_id`, `status: PASS | WARNING | FAIL`, issues, metrics,
 requirement coverage, summary, `release_scope`, and `created_at`.
+
+Release QA records the exact `input_hash`, canonical manuscript hash, final DOCX hash, and
+internal PDF hash. A missing or mismatched input/manuscript/DOCX hash blocks release creation.
 
 Each `QAIssue` has ID, severity (`info | warning | error | critical | blocker`), category,
 message, optional requirement/artifact/locator, auto-fixable flag, resolved flag/resolution, and

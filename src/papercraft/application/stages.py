@@ -35,6 +35,8 @@ from papercraft.domain import (
     DatasetColumn,
     DataType,
     DiagramBlock,
+    DiagramEdge,
+    DiagramNode,
     DiagramSpec,
     Evidence,
     FactOrigin,
@@ -108,13 +110,12 @@ from papercraft.profiles import ProfileRegistry, WorkProfile, default_profile_re
 from .autopilot import PipelineStage, StageContext, StageHandler, StageOutcome
 from .context import ContextBuilder
 from .ports import RepositoryPort
-from .release import ReleasePolicyError, build_submission_release
+from .release import ReleasePolicyError, build_submission_release, stable_hash
 from .run_state import durable_run_state_lock
 from .scheduling import FailurePolicy, WorkCancelled, WorkItem, WorkStatus, run_dependency_aware
 from .schemas import (
     BlueprintGeneration,
     DataPreparationPlan,
-    DraftBlock,
     DraftChart,
     DraftCodeListing,
     DraftDiagram,
@@ -350,13 +351,14 @@ class _SectionGenerationResult:
 @dataclass(frozen=True, slots=True)
 class _VisualGenerationResult:
     block_id: str
-    path: Path
+    path: Path | None
     kind: ArtifactKind
     metadata: dict[str, JsonValue]
     fingerprint: str
     duration_ms: int
     cache_hit: bool = False
     cached_artifact: Artifact | None = None
+    skipped_optional: bool = False
 
 
 def _fingerprint(value: Any) -> str:
@@ -509,17 +511,15 @@ class ProductionStageFactory:
             path = Path(source.stored_path)
             if not path.is_file() or sha256_file(path) != source.sha256:
                 raise StageExecutionError(f"Source is missing or corrupt: {source.original_name}")
-        finalizer_name = "not-required"
-        if context.project.options.generate_pdf:
-            from papercraft.infrastructure.render import DocumentFinalizer
+        from papercraft.infrastructure.render import DocumentFinalizer
 
-            finalizer = DocumentFinalizer()
-            if finalizer.libreoffice_available():
-                finalizer_name = "libreoffice"
-            else:
-                raise StageExecutionError(
-                    "LibreOffice is required for PDF export in the private beta"
-                )
+        finalizer = DocumentFinalizer()
+        if finalizer.libreoffice_available():
+            finalizer_name = "libreoffice"
+        else:
+            raise StageExecutionError(
+                "Bundled LibreOffice is required for final DOCX and internal page QA"
+            )
         estimated_cost = _estimate_run_cost(context, sources, self._profile(context))
         if (
             context.project.options.maximum_cost is not None
@@ -1647,7 +1647,7 @@ class ProductionStageFactory:
             system_instruction=SYSTEM_GUARD,
         )
         previous_blueprint = context.repository.get_latest_blueprint(context.project.id)
-        blueprint = _blueprint(context.project.id, generated, claims).model_copy(
+        blueprint = _ensure_profile_sections(_blueprint(context.project.id, generated, claims), profile).model_copy(
             update={"revision": (previous_blueprint.revision + 1) if previous_blueprint else 1}
         )
         for claim in claims:
@@ -1933,8 +1933,6 @@ class ProductionStageFactory:
             check_cancelled()
             min_w = int(section.target_words * 0.75)
             max_w = int(section.target_words * 1.25)
-            available_claims = [str(item["id"]) for item in cast(list[dict[str, Any]], payload.get("claims", []))]
-            available_bib = [str(item["id"]) for item in cast(list[dict[str, Any]], payload.get("bibliography", []))]
             prompt_instruction = (
                 f"Write section «{section.title}» as structured typed blocks in authentic, high-uniqueness student Russian. "
                 f"Target length: {section.target_words} words (allowed range: {min_w}–{max_w} words). "
@@ -1944,41 +1942,12 @@ class ProductionStageFactory:
                 "Burstiness: vary sentence length. Link claim_ids and bibliography_entry_ids in factual paragraphs.\n"
                 + json.dumps(payload, ensure_ascii=False)
             )
-            try:
-                draft = self.gateway.generate_structured(
-                    prompt=prompt_instruction,
-                    schema=SectionDraft,
-                    role="writer",
-                    system_instruction=SYSTEM_GUARD,
-                )
-            except GeminiStructuredOutputError:
-                available_claims = [str(item["id"]) for item in cast(list[dict[str, Any]], payload.get("claims", []))]
-                available_bib = [str(item["id"]) for item in cast(list[dict[str, Any]], payload.get("bibliography", []))]
-                theses = section.theses or [section.title]
-                topic_str = context.project.brief.topic or "исследуемой темы"
-                fallback_paragraphs = []
-                # Synthesize comprehensive full-length paragraphs matching target words
-                for idx, thesis in enumerate(theses):
-                    sentences = [
-                        f"Исследование вопроса «{topic_str}» показало существенное влияние факторов, определяющих содержание направления: {thesis}.",
-                        "Анализ научной литературы и практических данных подтверждает наличие устойчивых взаимосвязей между изучаемыми параметрами.",
-                        "Полученные результаты позволяют систематизировать ключевые теоретические и прикладные аспекты исследуемой проблемы.",
-                        "Сопоставление эмпирических показателей демонстрирует практическую значимость сформированных аналитических выводов."
-                    ]
-                    para_text = " ".join(sentences)
-                    fallback_paragraphs.append(
-                        DraftParagraph(
-                            text=para_text,
-                            claim_ids=available_claims[idx:idx+2] if available_claims else [],
-                            bibliography_entry_ids=available_bib[idx:idx+1] if available_bib else [],
-                        )
-                    )
-                draft = SectionDraft(
-                    section_id=section.id,
-                    blocks=cast(list[DraftBlock], fallback_paragraphs),
-                    conclusion=section.expected_conclusion or f"Сформулированы выводы по разделу «{section.title}».",
-                    word_count=sum(len(re.findall(r"\b\w+\b", p.text)) for p in fallback_paragraphs),
-                )
+            draft = self.gateway.generate_structured(
+                prompt=prompt_instruction,
+                schema=SectionDraft,
+                role="writer",
+                system_instruction=SYSTEM_GUARD,
+            )
             checkpoint = _SectionQualityCheckpoint(phase="critique", cycle=0)
         else:
             draft = starting_draft
@@ -2459,12 +2428,19 @@ class ProductionStageFactory:
 
     def generate_visuals(self, context: StageContext) -> StageOutcome:
         _raise_if_provider_cooldown_active(context)
-        from papercraft.infrastructure.visuals import ChartRenderer, LocalDiagramRenderer
+        from papercraft.infrastructure.visuals import (
+            ChartRenderer,
+            GeminiImageAdapter,
+            ImageRenderError,
+            LocalDiagramRenderer,
+            accessible_chart_table,
+        )
 
         manuscript = _need(context.repository.get_latest_manuscript(context.project.id), "Manuscript")
         datasets = {item.id: item for item in context.repository.list_datasets(context.project.id)}
         artifacts: list[Artifact] = []
         artifact_by_block: dict[str, str] = {}
+        skipped_optional_blocks: set[str] = set()
         visual_dir = context.paths.artifacts / context.run.id / "visuals"
         visual_blocks = [
             (index, block)
@@ -2531,18 +2507,59 @@ class ProductionStageFactory:
                     raise StageExecutionError(f"Chart refers to unknown dataset: {block.spec.dataset_id}")
                 chart_result = ChartRenderer().render(block.spec, dataset, path)
                 metadata["renderer"] = chart_result.renderer
+                headers, rows = accessible_chart_table(block.spec, dataset)
+                metadata["caption"] = block.spec.caption or block.spec.title
+                metadata["alt_text"] = block.spec.alt_text or f"{block.spec.title}: {len(rows)} точек данных"
+                metadata["accessible_table"] = cast(
+                    JsonValue, {"headers": headers, "rows": rows}
+                )
             elif isinstance(block, DiagramBlock):
                 diagram_result = LocalDiagramRenderer().render(block.spec, path)
                 metadata["renderer"] = diagram_result.renderer
+                metadata["caption"] = block.spec.caption or block.spec.title
+                metadata["alt_text"] = block.spec.alt_text or f"{block.spec.title}: схема из {len(block.spec.nodes)} узлов"
             else:
-                with _gateway_work_item_scope(
-                    self.gateway,
-                    block.id,
-                    cancellation_requested=execution.cancellation_probe,
-                ):
-                    self.gateway.generate_image(prompt=block.image_spec.prompt, destination=path)
-                _verify_image(path)
-                metadata["renderer"] = "gemini-3.1-flash-image"
+                image_spec = block.image_spec
+                if image_spec is None:  # pragma: no cover - visual_blocks pre-filter
+                    raise StageExecutionError("Image specification is missing")
+                adapter = GeminiImageAdapter(
+                    self.gateway, model=context.settings.model_policy.image
+                )
+                last_error: Exception | None = None
+                for attempt in range(1, 3):
+                    try:
+                        with _gateway_work_item_scope(
+                            self.gateway,
+                            block.id,
+                            cancellation_requested=execution.cancellation_probe,
+                        ):
+                            image_result = adapter.generate(prompt=image_spec.prompt, destination=path)
+                        metadata.update(
+                            {
+                                "renderer": "gemini",
+                                "model": image_result.model,
+                                "prompt": image_spec.prompt,
+                                "prompt_sha256": hashlib.sha256(image_spec.prompt.encode("utf-8")).hexdigest(),
+                                "caption": image_spec.caption or block.caption,
+                                "alt_text": image_spec.alt_text or block.alt_text,
+                                "generation_attempt": attempt,
+                            }
+                        )
+                        break
+                    except ImageRenderError as exc:
+                        last_error = exc
+                else:
+                    if image_spec.optional:
+                        return _VisualGenerationResult(
+                            block_id=block.id,
+                            path=None,
+                            kind=kind,
+                            metadata={**metadata, "optional_failure": True, "attempts": 2},
+                            fingerprint=fingerprint,
+                            duration_ms=int((monotonic() - started) * 1000),
+                            skipped_optional=True,
+                        )
+                    raise StageExecutionError("Required image generation failed after one regeneration") from last_error
             return _VisualGenerationResult(
                 block_id=block.id,
                 path=path,
@@ -2556,6 +2573,19 @@ class ProductionStageFactory:
             if record.status is not WorkStatus.SUCCEEDED:
                 return
             result = cast(_VisualGenerationResult, record.result)
+            if result.skipped_optional:
+                skipped_optional_blocks.add(result.block_id)
+                self._record_work_item(
+                    context,
+                    item_id=result.block_id,
+                    fingerprint=result.fingerprint,
+                    duration_ms=result.duration_ms,
+                    cache_hit=False,
+                    current=progress.succeeded,
+                    total=progress.total,
+                    message=f"Необязательная иллюстрация пропущена после повторной генерации: {result.block_id}",
+                )
+                return
             if result.cache_hit:
                 cached = result.cached_artifact
                 if cached is None:  # pragma: no cover - cache result invariant
@@ -2577,6 +2607,8 @@ class ProductionStageFactory:
                     },
                 )
             else:
+                if result.path is None:  # pragma: no cover - optional result handled above
+                    raise StageExecutionError("Visual result has no artifact path")
                 artifact = _artifact(context, result.path, result.kind, "image/png", result.metadata)
             artifacts.append(artifact)
             artifact_by_block[result.block_id] = artifact.id
@@ -2637,6 +2669,8 @@ class ProductionStageFactory:
                 raise StageExecutionError("Visual generation did not complete: " + "; ".join(failures[:5]))
         updated: list[Any] = []
         for block in manuscript.blocks:
+            if block.id in skipped_optional_blocks:
+                continue
             artifact_id = artifact_by_block.get(block.id)
             if artifact_id and isinstance(block, (ChartBlock, DiagramBlock, FigureBlock)):
                 block = block.model_copy(update={"artifact_id": artifact_id})
@@ -2905,7 +2939,12 @@ class ProductionStageFactory:
         artifact_paths = {artifact.id: artifact.path for artifact in all_artifacts}
         datasets = {dataset.id: dataset for dataset in context.repository.list_datasets(context.project.id)}
         citations = {citation.id: citation for citation in context.repository.list_citations(context.project.id)}
-        output = context.paths.artifacts / context.run.id / _safe_output_name(manuscript.title, ".docx")
+        output = (
+            context.paths.artifacts
+            / context.run.id
+            / "draft"
+            / _safe_output_name(manuscript.title, ".draft.docx")
+        )
         templates = [
             source
             for source in context.repository.list_sources(context.project.id)
@@ -2938,47 +2977,82 @@ class ProductionStageFactory:
                 # QA of a supplied institution template.
                 "render_config": cast(JsonValue, _render_config_metadata(render_config)),
                 "template_applied": bool(templates),
+                "phase": "draft",
+                "input_hash": context.run.input_hash,
+                "manuscript_hash": stable_hash(manuscript.model_dump(mode="json")),
             },
         )
-        return StageOutcome(artifacts=[artifact], checkpoint={"docx_artifact_id": artifact.id}, message="Editable DOCX assembled")
+        return StageOutcome(
+            artifacts=[artifact],
+            checkpoint={"draft_docx_artifact_id": artifact.id},
+            message="Draft DOCX assembled",
+        )
 
     def word_finalize(self, context: StageContext) -> StageOutcome:
         from papercraft.infrastructure.render import DocumentFinalizer
 
-        docx = _latest_artifact(context, ArtifactKind.DOCX)
-        if not context.project.options.generate_pdf:
-            result = DocumentFinalizer().finalize(
-                docx.path,
-                # Old projects may retain the former ``auto``/``word`` value,
-                # but this beta has one supported finalizer.
-                preferred="libreoffice",
-                require_pdf=False,
-                allow_unfinalized=True,
-            )
-            return StageOutcome(checkpoint={"engine": result.engine, "fields_updated": result.fields_updated}, message="DOCX fields finalized")
-        return StageOutcome(checkpoint={"pending_pdf": True}, message="Office finalization selected")
+        manuscript = _need(
+            context.repository.get_latest_manuscript(context.project.id), "Manuscript"
+        )
+        draft = _latest_artifact(context, ArtifactKind.DOCX, phase="draft")
+        final_dir = context.paths.artifacts / context.run.id / "final"
+        final_docx = final_dir / _safe_output_name(manuscript.title, ".docx")
+        internal_pdf = final_dir / _safe_output_name(manuscript.title, ".internal.pdf")
+        result = DocumentFinalizer().finalize_copy(
+            draft.path,
+            final_docx,
+            pdf_path=internal_pdf,
+        )
+        if result.pdf is None or result.engine != "libreoffice" or not result.fields_updated:
+            raise StageExecutionError("LibreOffice did not produce finalized release artifacts")
+        manuscript_hash = stable_hash(manuscript.model_dump(mode="json"))
+        final_artifact = _artifact(
+            context,
+            final_docx,
+            ArtifactKind.DOCX,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            {
+                "phase": "final",
+                "draft_artifact_id": draft.id,
+                "draft_sha256": draft.sha256,
+                "finalizer": "libreoffice",
+                "fields_updated": True,
+                "input_hash": context.run.input_hash,
+                "manuscript_hash": manuscript_hash,
+            },
+        )
+        pdf_artifact = _artifact(
+            context,
+            internal_pdf,
+            ArtifactKind.PDF,
+            "application/pdf",
+            {
+                "purpose": "internal_release_qa",
+                "user_exportable": False,
+                "source_docx_artifact_id": final_artifact.id,
+                "engine": "libreoffice",
+            },
+        )
+        return StageOutcome(
+            artifacts=[final_artifact, pdf_artifact],
+            checkpoint={
+                "engine": "libreoffice",
+                "fields_updated": True,
+                "final_docx_artifact_id": final_artifact.id,
+                "pdf_artifact_id": pdf_artifact.id,
+            },
+            message="Final DOCX fields and internal PDF prepared by LibreOffice",
+        )
 
     def export_pdf(self, context: StageContext) -> StageOutcome:
-        if not context.project.options.generate_pdf:
-            return StageOutcome(skipped=True, message="PDF export disabled")
-        from papercraft.infrastructure.render import DocumentFinalizer
-
-        docx = _latest_artifact(context, ArtifactKind.DOCX)
-        output = Path(docx.path).with_suffix(".pdf")
-        result = DocumentFinalizer().finalize(
-            docx.path,
-            pdf_path=output,
-            preferred="libreoffice",
-            require_pdf=True,
+        pdf = _latest_artifact(context, ArtifactKind.PDF)
+        return StageOutcome(
+            skipped=True,
+            checkpoint={"pdf_artifact_id": pdf.id, "internal_only": True},
+            message="Internal PDF was produced during DOCX finalization",
         )
-        if result.pdf is None or not result.pdf.valid_header:
-            raise StageExecutionError("Office finalizer did not produce a valid PDF")
-        artifact = _artifact(context, output, ArtifactKind.PDF, "application/pdf", {"engine": result.engine, "fields_updated": result.fields_updated, "warnings": list(result.warnings)})
-        return StageOutcome(artifacts=[artifact], checkpoint={"engine": result.engine, "pdf_artifact_id": artifact.id}, message="PDF exported through Office")
 
     def pdf_visual_qa(self, context: StageContext) -> StageOutcome:
-        if not context.project.options.generate_pdf:
-            return StageOutcome(skipped=True, message="PDF visual QA disabled")
         maximum_cycles = min(3, context.project.options.maximum_revision_cycles)
         history: list[dict[str, JsonValue]] = []
         images: list[Path] = []
@@ -3131,10 +3205,20 @@ class ProductionStageFactory:
             if source.role == SourceRole.TEMPLATE
             and Path(source.stored_path).suffix.casefold() == ".docx"
         ]
-        docx_path = Path(_latest_artifact(context, ArtifactKind.DOCX).path)
+        current_final = _latest_artifact(context, ArtifactKind.DOCX, phase="final")
+        final_dir = context.paths.artifacts / context.run.id / "final"
+        docx_path = final_dir / _safe_output_name(
+            manuscript.title, f".repair-{cycle}.docx"
+        )
+        repair_draft = (
+            context.paths.artifacts
+            / context.run.id
+            / "draft"
+            / _safe_output_name(manuscript.title, f".repair-{cycle}.docx")
+        )
         render_result = DocxRenderer(config).render(
             manuscript,
-            docx_path,
+            repair_draft,
             template_path=templates[0].stored_path if templates else None,
             artifact_paths=artifact_paths,
             datasets=datasets,
@@ -3143,15 +3227,32 @@ class ProductionStageFactory:
         )
         if render_result.unresolved_artifact_ids:
             raise StageExecutionError("PDF repair introduced unresolved visual artifacts")
-        pdf_path = Path(_latest_artifact(context, ArtifactKind.PDF).path)
-        finalization = DocumentFinalizer().finalize(
+        pdf_path = final_dir / _safe_output_name(
+            manuscript.title, f".repair-{cycle}.internal.pdf"
+        )
+        finalization = DocumentFinalizer().finalize_copy(
+            repair_draft,
             docx_path,
             pdf_path=pdf_path,
-            preferred="libreoffice",
-            require_pdf=True,
         )
-        if finalization.pdf is None or not finalization.pdf.valid_header:
+        if (
+            finalization.pdf is None
+            or not finalization.pdf.valid_header
+            or not finalization.fields_updated
+        ):
             raise StageExecutionError("PDF repair did not produce a valid PDF")
+        repair_draft_artifact = _artifact(
+            context,
+            repair_draft,
+            ArtifactKind.DOCX,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            {
+                "phase": "repair_draft",
+                "repair_cycle": cycle,
+                "supersedes_final_artifact_id": current_final.id,
+            },
+        )
+        context.repository.save_artifact(repair_draft_artifact)
         context.repository.save_artifact(
             _artifact(
                 context,
@@ -3159,10 +3260,16 @@ class ProductionStageFactory:
                 ArtifactKind.DOCX,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 {
+                    "phase": "final",
+                    "draft_artifact_id": repair_draft_artifact.id,
                     "repair_cycle": cycle,
                     "categories": sorted(categories),
                     "render_config": cast(JsonValue, _render_config_metadata(config)),
                     "template_applied": bool(templates),
+                    "finalizer": "libreoffice",
+                    "fields_updated": True,
+                    "input_hash": context.run.input_hash,
+                    "manuscript_hash": stable_hash(manuscript.model_dump(mode="json")),
                 },
             )
         )
@@ -3177,6 +3284,8 @@ class ProductionStageFactory:
                     "categories": sorted(categories),
                     "engine": finalization.engine,
                     "fields_updated": finalization.fields_updated,
+                    "purpose": "internal_release_qa",
+                    "user_exportable": False,
                 },
             )
         )
@@ -3217,6 +3326,24 @@ class ProductionStageFactory:
         )
         manuscript = _need(context.repository.get_latest_manuscript(context.project.id), "Manuscript")
         artifacts = context.repository.list_artifacts(context.project.id, run_id=context.run.id)
+        docx_artifact = next(
+            (
+                artifact
+                for artifact in reversed(artifacts)
+                if artifact.kind is ArtifactKind.DOCX
+                and artifact.metadata.get("phase") == "final"
+            ),
+            None,
+        )
+        pdf_artifact = next(
+            (
+                artifact
+                for artifact in reversed(artifacts)
+                if artifact.kind is ArtifactKind.PDF
+                and artifact.metadata.get("purpose") == "internal_release_qa"
+            ),
+            None,
+        )
         requirements = context.repository.get_latest_requirement_set(context.project.id)
         claims = self._active_research_claims(context)
         evidence = context.repository.list_evidence(context.project.id)
@@ -3256,8 +3383,18 @@ class ProductionStageFactory:
                 sources=context.repository.list_sources(context.project.id),
                 source_snapshots=context.repository.list_source_snapshots(context.project.id),
                 artifact_paths={artifact.id: artifact.path for artifact in artifacts},
-                docx_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.DOCX), None),
-                pdf_path=next((artifact.path for artifact in reversed(artifacts) if artifact.kind == ArtifactKind.PDF), None),
+                docx_path=docx_artifact.path if docx_artifact is not None else None,
+                pdf_path=pdf_artifact.path if pdf_artifact is not None else None,
+                input_hash=context.run.input_hash,
+                expected_manuscript_hash=(
+                    str(docx_artifact.metadata.get("manuscript_hash"))
+                    if docx_artifact is not None
+                    else None
+                ),
+                expected_docx_hash=(
+                    docx_artifact.sha256 if docx_artifact is not None else None
+                ),
+                docx_finalized=True,
                 profile=profile,
             )
         )
@@ -3271,14 +3408,6 @@ class ProductionStageFactory:
                     continue
             report = report.model_copy(update={"issues": combined})
             report = type(report).model_validate(report.model_dump(mode="json"))
-        docx_artifact = next(
-            (artifact for artifact in reversed(artifacts) if artifact.kind is ArtifactKind.DOCX),
-            None,
-        )
-        pdf_artifact = next(
-            (artifact for artifact in reversed(artifacts) if artifact.kind is ArtifactKind.PDF),
-            None,
-        )
         release_scope: dict[str, JsonValue] = {
             "version": 1,
             "manuscript_id": manuscript.id,
@@ -3286,6 +3415,10 @@ class ProductionStageFactory:
             "requirement_set_id": requirements.id if requirements is not None else None,
             "docx_artifact_id": docx_artifact.id if docx_artifact is not None else None,
             "pdf_artifact_id": pdf_artifact.id if pdf_artifact is not None else None,
+            "input_hash": context.run.input_hash,
+            "manuscript_hash": stable_hash(manuscript.model_dump(mode="json")),
+            "docx_hash": docx_artifact.sha256 if docx_artifact is not None else None,
+            "pdf_hash": pdf_artifact.sha256 if pdf_artifact is not None else None,
         }
         report = report.model_copy(
             update={"metadata": {**report.metadata, "release_scope": release_scope}}
@@ -3498,6 +3631,47 @@ def _blueprint(project_id: str, generated: BlueprintGeneration, claims: Sequence
     )
 
 
+def _ensure_profile_sections(blueprint: ProjectBlueprint, profile: WorkProfile) -> ProjectBlueprint:
+    """Append omitted required profile sections before writing begins.
+
+    The provider may refine titles and theses, but it cannot silently remove a
+    required structural section.  Added sections intentionally receive no
+    global evidence fallback; their writer context stays empty until relevant
+    evidence exists.
+    """
+
+    present = {section.id for section in blueprint.outline.sections}
+    canonical_ids = {
+        hashlib.sha256(f"{blueprint.project_id}:{template.key}".encode()).hexdigest()[:32]
+        for template in profile.sections
+    }
+    present |= {section.id for section in blueprint.outline.sections if section.id in canonical_ids}
+    additions = [
+        template
+        for template in profile.sections
+        if template.required
+        and hashlib.sha256(f"{blueprint.project_id}:{template.key}".encode()).hexdigest()[:32]
+        not in present
+    ]
+    if not additions:
+        return blueprint
+    next_order = max((section.order for section in blueprint.outline.sections), default=-1) + 1
+    sections = [*blueprint.outline.sections]
+    for index, template in enumerate(additions):
+        sections.append(
+            SectionSpec(
+                id=template.key,
+                title=template.title,
+                level=template.level,
+                order=next_order + index,
+                target_words=template.target_words,
+                theses=[template.purpose],
+                expected_conclusion=template.purpose,
+            )
+        )
+    return blueprint.model_copy(update={"outline": Outline(sections=sections)})
+
+
 def _draft_blocks(
     draft: SectionDraft,
     bibliography: Sequence[BibliographyEntry],
@@ -3542,16 +3716,16 @@ def _draft_blocks(
         elif isinstance(block, DraftChart):
             if known_datasets is not None and block.dataset_id and block.dataset_id not in known_datasets:
                 raise StageExecutionError(f"Visual references unavailable or empty dataset: {block.dataset_id}")
-            result.append(ChartBlock(spec=ChartSpec(chart_type=block.chart_type, title=block.title, dataset_id=block.dataset_id, x_column=block.x_column, y_columns=block.y_columns, x_label=block.x_label, y_label=block.y_label)))
+            result.append(ChartBlock(spec=ChartSpec(chart_type=block.chart_type, title=block.title, dataset_id=block.dataset_id, x_column=block.x_column, y_columns=block.y_columns, x_label=block.x_label, y_label=block.y_label, caption=block.title)))
         elif isinstance(block, DraftDiagram):
-            result.append(DiagramBlock(spec=DiagramSpec(title=block.title, language=block.language, source=block.source)))
+            result.append(DiagramBlock(spec=DiagramSpec(title=block.title, language=block.language, source=block.source, nodes=[DiagramNode.model_validate(item) for item in block.nodes], edges=[DiagramEdge.model_validate(item) for item in block.edges], caption=block.title)))
         elif isinstance(block, DraftFormula):
             result.append(FormulaBlock(spec=FormulaSpec(expression=block.expression, notation=block.notation, label=block.label)))
         elif isinstance(block, DraftCodeListing):
             locator = Locator(source_id=block.source_id, line_start=block.line_start, line_end=block.line_end) if block.source_id else None
             result.append(CodeListingBlock(code=block.code, language=block.language, caption=block.caption, locator=locator))
         elif isinstance(block, DraftImage):
-            result.append(FigureBlock(caption=block.caption, image_spec=ImageSpec(prompt=block.prompt, aspect_ratio=block.aspect_ratio, alt_text=block.alt_text), alt_text=block.alt_text))
+            result.append(FigureBlock(caption=block.caption, image_spec=ImageSpec(prompt=block.prompt, aspect_ratio=block.aspect_ratio, alt_text=block.alt_text, caption=block.caption, optional=block.optional), alt_text=block.alt_text))
     return result
 
 
@@ -4523,10 +4697,23 @@ def _need(value: Any, name: str) -> Any:
     return value
 
 
-def _latest_artifact(context: StageContext, kind: ArtifactKind) -> Artifact:
-    candidates = [item for item in context.repository.list_artifacts(context.project.id, run_id=context.run.id) if item.kind == kind]
+def _latest_artifact(
+    context: StageContext,
+    kind: ArtifactKind,
+    *,
+    phase: str | None = None,
+) -> Artifact:
+    candidates = [
+        item
+        for item in context.repository.list_artifacts(
+            context.project.id, run_id=context.run.id
+        )
+        if item.kind == kind
+        and (phase is None or item.metadata.get("phase") == phase)
+    ]
     if not candidates:
-        raise StageExecutionError(f"Required artifact is missing: {kind.value}")
+        suffix = f" ({phase})" if phase else ""
+        raise StageExecutionError(f"Required artifact is missing: {kind.value}{suffix}")
     return max(candidates, key=lambda item: item.created_at)
 
 
@@ -4613,7 +4800,22 @@ def _render_pdf_pages(pdf: Path, destination: Path) -> list[Path]:
 def _basic_page_issues(pdf: Path, images: Sequence[Path]) -> list[QAIssue]:
     from PIL import Image, ImageStat
 
-    issues: list[QAIssue] = []
+    from papercraft.infrastructure.qa import DocumentInspectionError, inspect_pdf_layout
+
+    try:
+        layout_findings = inspect_pdf_layout(pdf)
+    except DocumentInspectionError as error:
+        raise StageExecutionError("Internal PDF could not be inspected") from error
+    issues = [
+        QAIssue(
+            severity=finding.severity,
+            category=finding.category,
+            message=finding.message,
+            locator=Locator(page=finding.page),
+            auto_fixable=finding.auto_fixable,
+        )
+        for finding in layout_findings
+    ]
     document: Any = _load_pymupdf().open(pdf)
     if len(document) != len(images):
         document.close()

@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -110,6 +111,68 @@ class DocumentFinalizer:
             require_pdf=require_pdf,
             allow_unfinalized=allow_unfinalized,
         )
+
+    def finalize_copy(
+        self,
+        draft_docx_path: str | os.PathLike[str],
+        final_docx_path: str | os.PathLike[str],
+        *,
+        pdf_path: str | os.PathLike[str],
+    ) -> FinalizationResult:
+        """Finalize a staged copy while retaining the immutable draft artifact."""
+
+        draft = Path(draft_docx_path).expanduser().resolve()
+        final = Path(final_docx_path).expanduser().resolve()
+        pdf = Path(pdf_path).expanduser().resolve()
+        if draft == final:
+            raise FinalizationError("Draft and final DOCX paths must be different")
+        _docx_result(draft)
+        draft_digest = _sha256(draft)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, staged_docx_name = tempfile.mkstemp(
+            prefix=f".{final.stem}-", suffix=".docx", dir=final.parent
+        )
+        os.close(descriptor)
+        staged_docx = Path(staged_docx_name)
+        descriptor, staged_pdf_name = tempfile.mkstemp(
+            prefix=f".{pdf.stem}-", suffix=".pdf", dir=pdf.parent
+        )
+        os.close(descriptor)
+        staged_pdf = Path(staged_pdf_name)
+        staged_pdf.unlink(missing_ok=True)
+        try:
+            shutil.copyfile(draft, staged_docx)
+            result = self.finalize(
+                staged_docx,
+                pdf_path=staged_pdf,
+                preferred="libreoffice",
+                require_pdf=True,
+            )
+            if result.engine != "libreoffice" or not result.fields_updated:
+                raise FinalizationError(
+                    "Bundled LibreOffice did not update the DOCX fields"
+                )
+            _docx_result(staged_docx)
+            _pdf_result(staged_pdf)
+            if _sha256(draft) != draft_digest:
+                raise FinalizationError("Draft DOCX changed during finalization")
+            os.replace(staged_docx, final)
+            os.replace(staged_pdf, pdf)
+            return FinalizationResult(
+                docx_path=final,
+                pdf=_pdf_result(pdf),
+                engine="libreoffice",
+                fields_updated=True,
+                warnings=result.warnings,
+            )
+        except FinalizationError:
+            raise
+        except OSError as exc:
+            raise FinalizationError("Could not publish finalized Office artifacts") from exc
+        finally:
+            staged_docx.unlink(missing_ok=True)
+            staged_pdf.unlink(missing_ok=True)
 
     def _finalize_libreoffice_then_word(
         self,
@@ -611,7 +674,24 @@ class DocumentFinalizer:
             if found:
                 return Path(found).resolve()
         if os.name == "nt":
-            candidates = [
+            configured = os.getenv("PAPERCRAFT_LIBREOFFICE")
+            bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+            candidates: list[Path] = []
+            if configured:
+                candidates.append(Path(configured))
+            candidates.extend(
+                [
+                bundle_root / "libreoffice" / "program" / "soffice.com",
+                Path(sys.executable).resolve().parent
+                / "runtime"
+                / "libreoffice"
+                / "program"
+                / "soffice.com",
+                Path(__file__).resolve().parents[4]
+                / "runtime"
+                / "libreoffice"
+                / "program"
+                / "soffice.com",
                 Path(os.environ.get("PROGRAMFILES", "C:/Program Files"))
                 / "LibreOffice"
                 / "program"
@@ -620,8 +700,16 @@ class DocumentFinalizer:
                 / "LibreOffice"
                 / "program"
                 / "soffice.com",
-            ]
-            return next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+                ]
+            )
+            for candidate in candidates:
+                if candidate.is_file():
+                    if candidate.suffix.casefold() == ".exe" and candidate.with_suffix(
+                        ".com"
+                    ).is_file():
+                        return candidate.with_suffix(".com").resolve()
+                    return candidate.resolve()
+            return None
         return None
 
 
@@ -649,3 +737,13 @@ def _docx_result(path: Path) -> None:
         raise
     except (OSError, zipfile.BadZipFile) as exc:
         raise FinalizationError("Updated DOCX is not a valid Office document") from exc
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

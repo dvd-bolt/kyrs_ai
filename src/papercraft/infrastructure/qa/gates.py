@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
-import zipfile
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +44,8 @@ from papercraft.domain import (
 from papercraft.infrastructure.calculations import FactLedger, FactLedgerError
 from papercraft.profiles import WorkProfile
 
+from .document import DocumentInspectionError, inspect_docx_package
+
 
 @dataclass(frozen=True, slots=True)
 class QAGateContext:
@@ -63,6 +65,10 @@ class QAGateContext:
     artifact_paths: Mapping[str, str | Path] = field(default_factory=dict)
     docx_path: str | Path | None = None
     pdf_path: str | Path | None = None
+    input_hash: str | None = None
+    expected_manuscript_hash: str | None = None
+    expected_docx_hash: str | None = None
+    docx_finalized: bool = False
 
 
 class DeterministicQualityGate:
@@ -94,7 +100,7 @@ class DeterministicQualityGate:
         self._check_requirements(context, flattened, words, issues)
         self._check_requirement_coverage(context, issues)
         self._check_profile_compliance(context, flattened, issues)
-        self._check_docx(context.docx_path, issues, metrics)
+        docx_hash = self._check_docx(context, flattened, issues, metrics)
         self._check_pdf(context.pdf_path, issues, metrics)
 
         counts = {
@@ -112,7 +118,18 @@ class DeterministicQualityGate:
             metrics=metrics,
             requirement_coverage=context.requirement_coverage,
             summary=summary,
-            metadata={"gate_version": 1, "deterministic": True},
+            metadata={
+                "gate_version": 2,
+                "deterministic": True,
+                "release_hashes": {
+                    "input_hash": context.input_hash,
+                    "manuscript_hash": _stable_hash(
+                        context.manuscript.model_dump(mode="json")
+                    ),
+                    "docx_hash": docx_hash,
+                    "pdf_hash": _file_sha256(context.pdf_path),
+                },
+            },
         )
 
     def _check_manuscript(
@@ -578,45 +595,154 @@ class DeterministicQualityGate:
                 )
 
     def _check_docx(
-        self, raw_path: str | Path | None, issues: list[QAIssue], metrics: list[Metric]
-    ) -> None:
-        if raw_path is None:
-            return
-        path = Path(raw_path)
-        if not path.is_file():
-            issues.append(self._issue(QASeverity.BLOCKER, "docx", f"DOCX does not exist: {path}"))
-            return
+        self,
+        context: QAGateContext,
+        blocks: list[Any],
+        issues: list[QAIssue],
+        metrics: list[Metric],
+    ) -> str | None:
+        if context.docx_path is None:
+            return None
+        path = Path(context.docx_path)
         try:
-            with zipfile.ZipFile(path) as archive:
-                corrupt = archive.testzip()
-                names = set(archive.namelist())
-                document_xml = archive.read("word/document.xml")
-                settings_xml = archive.read("word/settings.xml")
-                header_xml = b"".join(
-                    archive.read(name)
-                    for name in sorted(names)
-                    if name.startswith("word/header") and name.endswith(".xml")
+            inspection = inspect_docx_package(path)
+        except DocumentInspectionError:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx",
+                    "DOCX is not a valid release package",
                 )
-                footer_xml = b"".join(
-                    archive.read(name)
-                    for name in sorted(names)
-                    if name.startswith("word/footer") and name.endswith(".xml")
+            )
+            return None
+
+        if context.expected_docx_hash and inspection.sha256 != context.expected_docx_hash:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_hash",
+                    "DOCX hash does not match the release artifact",
                 )
-        except (OSError, KeyError, zipfile.BadZipFile) as exc:
-            issues.append(self._issue(QASeverity.BLOCKER, "docx", f"DOCX is invalid: {exc}"))
-            return
-        if corrupt:
-            issues.append(self._issue(QASeverity.BLOCKER, "docx", f"DOCX contains corrupt member {corrupt}"))
-        required = {"[Content_Types].xml", "word/document.xml", "word/styles.xml"}
-        if missing := required - names:
-            issues.append(self._issue(QASeverity.BLOCKER, "docx", f"DOCX lacks required members: {sorted(missing)}"))
-        if b"TOC " not in document_xml:
-            issues.append(self._issue(QASeverity.WARNING, "docx_toc", "DOCX has no dynamic TOC field"))
-        if b"updateFields" not in settings_xml:
-            issues.append(self._issue(QASeverity.WARNING, "docx_fields", "DOCX does not request field updates"))
-        if b"PAGE" not in header_xml + footer_xml:
-            issues.append(self._issue(QASeverity.WARNING, "docx_pagination", "DOCX has no dynamic PAGE field"))
+            )
+        manuscript_hash = _stable_hash(context.manuscript.model_dump(mode="json"))
+        if (
+            context.expected_manuscript_hash
+            and manuscript_hash != context.expected_manuscript_hash
+        ):
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "manuscript_hash",
+                    "Manuscript hash changed before release QA",
+                )
+            )
+        if inspection.forbidden_parts:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_active_content",
+                    "DOCX contains macros, embedded objects, or active content",
+                )
+            )
+        if inspection.external_relationships or inspection.active_fields:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_external_link",
+                    "DOCX contains an external relationship or active external field",
+                )
+            )
+        required_styles = {"Normal"}
+        if any(isinstance(block, HeadingBlock) for block in blocks):
+            required_styles.add("Heading 1")
+        if any(isinstance(block, (TableBlock, ChartBlock, DiagramBlock, FigureBlock)) for block in blocks):
+            required_styles.add("Caption")
+        available_styles = {style.casefold().replace(" ", "") for style in inspection.styles}
+        if missing_styles := {
+            style
+            for style in required_styles
+            if style.casefold().replace(" ", "") not in available_styles
+        }:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_styles",
+                    "DOCX lacks required styles: " + ", ".join(sorted(missing_styles)),
+                )
+            )
+        field_codes = "\n".join(inspection.field_codes).upper()
+        if not inspection.update_fields_on_open:
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_fields",
+                    "DOCX does not request field updates on open",
+                )
+            )
+        if "PAGE" not in field_codes:
+            issues.append(
+                self._issue(QASeverity.BLOCKER, "docx_pagination", "DOCX has no PAGE field")
+            )
+        if any(isinstance(block, TableBlock) for block in blocks) and "SEQ TABLE" not in field_codes:
+            issues.append(
+                self._issue(QASeverity.BLOCKER, "docx_fields", "DOCX table numbering field is missing")
+            )
+        if any(isinstance(block, (ChartBlock, DiagramBlock, FigureBlock)) for block in blocks) and "SEQ FIGURE" not in field_codes:
+            issues.append(
+                self._issue(QASeverity.BLOCKER, "docx_fields", "DOCX figure numbering field is missing")
+            )
+        expected_tables = sum(isinstance(block, TableBlock) for block in blocks)
+        if inspection.table_count < expected_tables or inspection.malformed_tables:
+            issues.append(
+                self._issue(QASeverity.BLOCKER, "docx_tables", "DOCX table structure is incomplete")
+            )
+        expected_images = len(
+            {
+                str(getattr(block, "artifact_id", ""))
+                for block in blocks
+                if isinstance(block, (ChartBlock, DiagramBlock, FigureBlock))
+                and getattr(block, "artifact_id", None)
+            }
+        )
+        if inspection.image_count < expected_images or inspection.invalid_images:
+            issues.append(
+                self._issue(QASeverity.BLOCKER, "docx_images", "DOCX image parts are missing or invalid")
+            )
+        if context.manuscript.bibliography:
+            normalized_text = " ".join(inspection.visible_text.casefold().split())
+            missing_entries = [
+                entry.title
+                for entry in context.manuscript.bibliography
+                if self._normalized(entry.title) not in normalized_text
+            ]
+            if missing_entries:
+                issues.append(
+                    self._issue(
+                        QASeverity.BLOCKER,
+                        "docx_bibliography",
+                        "DOCX bibliography is missing expected entries",
+                    )
+                )
+        if context.docx_finalized and "обновите оглавление" in inspection.visible_text.casefold():
+            issues.append(
+                self._issue(
+                    QASeverity.BLOCKER,
+                    "docx_fields",
+                    "DOCX still contains an unupdated field placeholder",
+                )
+            )
         metrics.append(Metric(name="docx_size", value=float(path.stat().st_size), unit="bytes"))
+        metrics.extend(
+            [
+                Metric(name="docx_tables", value=float(inspection.table_count), unit="tables"),
+                Metric(name="docx_images", value=float(inspection.image_count), unit="images"),
+            ]
+        )
+        return inspection.sha256
+
+    @staticmethod
+    def _normalized(value: str) -> str:
+        return " ".join(value.casefold().split())
 
     def _check_pdf(
         self, raw_path: str | Path | None, issues: list[QAIssue], metrics: list[Metric]
@@ -749,3 +875,30 @@ def _extract_empirical_numbers(text: str) -> list[str]:
     cleaned = re.sub(r"(?i)\b(?:рис(?:\.|унк[а-я]*)?|табл(?:\.|иц[а-я]*)?|раздел[а-я]*|глав[а-я]*|пункт[а-я]*|п\.|ч\.|формул[а-я]*)\s*(?:\(\s*\d+\s*\)|\d+(?:\.\d+)*)", " ", cleaned)
     cleaned = re.sub(r"(?:^|\n|\.\s+)\d+[\.\)]\s+", " ", cleaned)
     return re.findall(r"(?<![\w])[-+]?\d+(?:[.,]\d+)?", cleaned)
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(raw_path: str | Path | None) -> str | None:
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()

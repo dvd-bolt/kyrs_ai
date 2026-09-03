@@ -53,8 +53,8 @@ class ChartRenderer:
         if spec.dataset_id != dataset.id:
             raise ChartRenderError("chart dataset_id does not match the supplied dataset")
         output = Path(output_path).expanduser().resolve()
-        if output.suffix.lower() != ".png":
-            raise ChartRenderError("charts must be rendered to a .png file")
+        if output.suffix.lower() not in {".png", ".svg"}:
+            raise ChartRenderError("charts must be rendered to a .png or .svg file")
         unknown_options = set(spec.options) - self._ALLOWED_OPTIONS
         if unknown_options:
             raise ChartRenderError(f"unsupported chart options: {sorted(unknown_options)}")
@@ -112,12 +112,12 @@ class ChartRenderer:
 
             output.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{output.stem}.", suffix=".png", dir=output.parent
+                prefix=f".{output.stem}.", suffix=output.suffix, dir=output.parent
             )
             os.close(descriptor)
             temporary = Path(temporary_name)
             try:
-                figure.savefig(temporary, format="png", dpi=dpi, bbox_inches="tight")
+                figure.savefig(temporary, format=output.suffix[1:], dpi=dpi, bbox_inches="tight")
                 if temporary.stat().st_size == 0:
                     raise ChartRenderError("matplotlib produced an empty file")
                 os.replace(temporary, output)
@@ -126,6 +126,13 @@ class ChartRenderer:
         finally:
             plt.close(figure)
 
+        if output.suffix.lower() == ".svg":
+            return ChartRenderResult(
+                path=output,
+                sha256=_sha256(output),
+                width_pixels=0,
+                height_pixels=0,
+            )
         try:
             from PIL import Image
 
@@ -236,6 +243,20 @@ def render_chart(
     spec: ChartSpec, dataset: Dataset, output_path: str | os.PathLike[str]
 ) -> ChartRenderResult:
     return ChartRenderer().render(spec, dataset, output_path)
+
+
+def accessible_chart_table(spec: ChartSpec, dataset: Dataset) -> tuple[list[str], list[list[str]]]:
+    """Return the exact source values used by a chart for a future accessible renderer."""
+    if spec.dataset_id != dataset.id:
+        raise ChartRenderError("chart dataset_id does not match the supplied dataset")
+    headers = [spec.x_label or spec.x_column, *spec.y_columns]
+    columns = {column.name for column in dataset.columns}
+    if set([spec.x_column, *spec.y_columns]) - columns:
+        raise ChartRenderError("dataset lacks chart columns")
+    return headers, [
+        [str(row.get(column, "")) for column in [spec.x_column, *spec.y_columns]]
+        for row in dataset.rows
+    ]
 
 
 def _numeric(value: Any, label: str) -> float:

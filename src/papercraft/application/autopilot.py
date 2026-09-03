@@ -643,12 +643,16 @@ class AutopilotService:
         )
 
     def _checkpoint_required(self, stage: PipelineStage) -> bool:
-        options = self.project.options
-        return (
-            (stage == PipelineStage.EXTRACT_REQUIREMENTS and options.checkpoint_requirements)
-            or (stage == PipelineStage.PLAN and options.checkpoint_outline)
-            or (stage == PipelineStage.FINAL_GEMINI_REVIEW and options.checkpoint_final_review)
-        )
+        """Generation is an uninterrupted autopilot run.
+
+        The persisted checkpoint flags remain readable for existing local
+        projects, but no stage is allowed to turn them into a plan-approval
+        pause.  Provider/input waits and explicit pause/cancel controls are
+        intentionally unaffected.
+        """
+
+        del stage
+        return False
 
     @staticmethod
     def _checkpoint_acknowledged(run: GenerationRun, stage: PipelineStage) -> bool:

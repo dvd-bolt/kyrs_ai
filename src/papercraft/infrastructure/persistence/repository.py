@@ -1230,6 +1230,12 @@ class SQLiteRepository:
                 raise ValueError("release DOCX belongs to another scope")
             if artifact.kind.value != "docx" or artifact.sha256 != release.docx_hash:
                 raise ValueError("release DOCX record is invalid")
+            if (
+                artifact.metadata.get("phase") != "final"
+                or artifact.metadata.get("finalizer") != "libreoffice"
+                or artifact.metadata.get("fields_updated") is not True
+            ):
+                raise ValueError("release DOCX was not finalized by LibreOffice")
             document_path = Path(artifact.path)
             if (
                 not document_path.is_file()
@@ -1246,6 +1252,16 @@ class SQLiteRepository:
                 raise ValueError("release QA is not an exact PASS")
             if report.metadata.get("deterministic") is not True:
                 raise ValueError("release QA is not a deterministic gate result")
+            release_hashes = report.metadata.get("release_hashes")
+            if not isinstance(release_hashes, dict) or any(
+                release_hashes.get(key) != value
+                for key, value in {
+                    "input_hash": run.input_hash,
+                    "manuscript_hash": release.manuscript_hash,
+                    "docx_hash": release.docx_hash,
+                }.items()
+            ):
+                raise ValueError("release QA hashes are stale")
             if (
                 any(rule.mandatory for rule in requirements.rules)
                 and report.requirement_coverage is None

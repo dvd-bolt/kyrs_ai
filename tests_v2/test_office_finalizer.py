@@ -10,7 +10,9 @@ from docx import Document
 from papercraft.infrastructure.render import (
     DocumentFinalizer,
     FinalizationError,
+    FinalizationResult,
     FinalizationUnavailableError,
+    PDFResult,
 )
 
 _PDF = b"%PDF-1.7\nlocal fixture\n"
@@ -295,3 +297,45 @@ def test_uno_timeout_terminates_listener_and_hides_process_output(
     assert listener.terminated
     assert secret not in str(failure.value)
     assert "timed out" in str(failure.value)
+
+
+def test_finalize_copy_retains_draft_and_publishes_separate_final_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft = tmp_path / "draft" / "work.draft.docx"
+    draft.parent.mkdir()
+    _docx(draft)
+    original = draft.read_bytes()
+    final = tmp_path / "final" / "work.docx"
+    pdf = tmp_path / "final" / "work.internal.pdf"
+    finalizer = DocumentFinalizer()
+
+    def fake_finalize(
+        staged_docx: str | Path,
+        *,
+        pdf_path: str | Path | None = None,
+        **_kwargs: object,
+    ) -> FinalizationResult:
+        staged = Path(staged_docx)
+        document = Document(staged)
+        document.add_paragraph("Fields updated by LibreOffice fixture")
+        document.save(staged)
+        assert pdf_path is not None
+        staged_pdf = Path(pdf_path)
+        staged_pdf.write_bytes(_PDF)
+        return FinalizationResult(
+            staged,
+            PDFResult(staged_pdf, staged_pdf.stat().st_size, True),
+            "libreoffice",
+            True,
+        )
+
+    monkeypatch.setattr(finalizer, "finalize", fake_finalize)
+
+    result = finalizer.finalize_copy(draft, final, pdf_path=pdf)
+
+    assert draft.read_bytes() == original
+    assert final.is_file() and final.read_bytes() != original
+    assert pdf.read_bytes() == _PDF
+    assert result.docx_path == final.resolve()
+    assert result.pdf is not None and result.pdf.path == pdf.resolve()

@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from docx import Document
 
 from papercraft.application import (
     AutopilotService,
@@ -90,9 +91,10 @@ def test_fake_golden_pipeline(
     assert report.status.value in {"pass", "warning"}
     documents = DocumentService(workspace.project.id, workspace.repository)
     assert documents.export_block_reason(ArtifactKind.DOCX, run.id) is None
-    assert documents.export_block_reason(ArtifactKind.PDF, run.id) is None
+    assert documents.export_block_reason(ArtifactKind.PDF, run.id) is not None
     assert documents.export(ArtifactKind.DOCX, tmp_path / "released.docx", run.id).is_file()
-    assert documents.export(ArtifactKind.PDF, tmp_path / "released.pdf", run.id).is_file()
+    with pytest.raises(DocumentExportBlocked, match="Only the released DOCX"):
+        documents.export(ArtifactKind.PDF, tmp_path / "released.pdf", run.id)
     # A later successful requirement extraction makes the existing release
     # stale even before a subsequent run reaches planning or rendering.
     requirements = workspace.repository.get_latest_requirement_set(workspace.project.id)
@@ -104,7 +106,7 @@ def test_fake_golden_pipeline(
     assert documents.export_block_reason(ArtifactKind.PDF, run.id) is not None
     with pytest.raises(DocumentExportBlocked, match="current requirements"):
         documents.export(ArtifactKind.DOCX, tmp_path / "stale-requirements.docx", run.id)
-    with pytest.raises(DocumentExportBlocked, match="current requirements"):
+    with pytest.raises(DocumentExportBlocked, match="Only the released DOCX"):
         documents.export(ArtifactKind.PDF, tmp_path / "stale-requirements.pdf", run.id)
     # The deterministic profile scaffold is intentionally visible in the
     # release report, even when this compact smoke blueprint omits some of
@@ -416,4 +418,27 @@ class _FakeLocalFinalizer:
         page.insert_text((72, 100), "PaperCraft deterministic PDF fixture", fontsize=12)
         document.save(pdf)
         document.close()
-        return FinalizationResult(docx, PDFResult(pdf, pdf.stat().st_size, True), "none", False)
+        return FinalizationResult(
+            docx,
+            PDFResult(pdf, pdf.stat().st_size, True),
+            "libreoffice",
+            True,
+        )
+
+    def finalize_copy(
+        self,
+        draft_docx_path: str | Path,
+        final_docx_path: str | Path,
+        *,
+        pdf_path: str | Path,
+    ) -> FinalizationResult:
+        draft = Path(draft_docx_path)
+        final = Path(final_docx_path)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(draft.read_bytes())
+        document = Document(final)
+        for paragraph in document.paragraphs:
+            if "Обновите оглавление" in paragraph.text:
+                paragraph.text = "Оглавление обновлено LibreOffice fixture"
+        document.save(final)
+        return self.finalize(final, pdf_path=pdf_path)

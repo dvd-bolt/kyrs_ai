@@ -62,30 +62,41 @@ class ProfileRegistry:
             raise KeyError(f"Unknown PaperCraft profile: {profile_id}") from exc
 
     def all(self) -> list[WorkProfile]:
-        return sorted(self._profiles.values(), key=lambda item: item.display_name)
+        # The MVP exposes exactly one profile for each supported work type.
+        # Older coursework specialisations stay addressable through ``get``
+        # so persisted beta metadata can still be inspected, but are not
+        # selectable for a new autopilot run.
+        active = [
+            self._profiles[profile_id]
+            for profile_id in ("coursework", "scientific_article", "practice_report", "school_project")
+            if profile_id in self._profiles
+        ]
+        return sorted(active, key=lambda item: item.display_name)
 
     def resolve(self, work_type: Any, domain_profile: Any = "general") -> WorkProfile:
         work = self._value(work_type)
         domain = self._value(domain_profile)
         aliases = {
-            "coursework_it": ("coursework", "it"),
-            "coursework_finance": ("coursework", "finance"),
+            "coursework_it": ("coursework", "general"),
+            "coursework_finance": ("coursework", "general"),
             "scientific_article": ("scientific_article", "general"),
             "school_project": ("school_project", "general"),
             "practice_report": ("practice_report", domain),
-            "lab_report": ("practice_report", "it"),
+            "lab_report": ("practice_report", "general"),
             "industrial_report": ("practice_report", domain),
         }
         work, alias_domain = aliases.get(work, (work, domain))
         domain = domain if domain not in {"", "general", "none"} else alias_domain
 
-        candidates = [profile for profile in self._profiles.values() if profile.work_type == work]
+        if work == "universal":
+            work = "coursework"
+        candidates = [profile for profile in self.all() if profile.work_type == work]
         for profile in candidates:
             if domain in profile.domain_tags:
                 return profile
         if candidates:
             return candidates[0]
-        return self.get("universal")
+        return self.get("coursework")
 
 
 def _section(
@@ -157,10 +168,11 @@ def default_profile_registry() -> ProfileRegistry:
             ],
         ),
         WorkProfile(
-            id="coursework_general",
-            display_name="Курсовая — общая тематика",
+            id="coursework",
+            version="2026-09",
+            display_name="Курсовая работа",
             work_type="coursework",
-            domain_tags=["general", "science", "universal"],
+            domain_tags=["general", "science", "universal", "it", "programming", "finance", "accounting"],
             description="Универсальная исследовательская курсовая с теорией, анализом и практическими предложениями.",
             sections=[
                 _section("introduction", "ВВЕДЕНИЕ", 700, "Обосновать актуальность, цель, задачи, объект и предмет"),
@@ -175,12 +187,20 @@ def default_profile_registry() -> ProfileRegistry:
                 voice="formal evidence-led academic Russian",
                 required_artifacts=["evidence table", "analytical table"],
                 source_priorities=common_sources,
+                allow_synthetic_data=True,
                 minimum_sources=12,
             ),
-            prompt_rules=["Separate established facts from interpretation", "Tie every conclusion to a stated task"],
+            prompt_rules=[
+                "Separate established facts from interpretation",
+                "Tie every conclusion to a stated task",
+                "Describe code only from imported static-analysis findings and cite source locators",
+                "Use persisted CalculationResult values; never ask the language model to calculate",
+                "Label modelled data as synthetic demonstration data, never as real observations",
+            ],
         ),
         WorkProfile(
             id="scientific_article",
+            version="2026-09",
             display_name="Научная статья",
             work_type="scientific_article",
             domain_tags=["general"],
@@ -211,6 +231,7 @@ def default_profile_registry() -> ProfileRegistry:
         ),
         WorkProfile(
             id="practice_report",
+            version="2026-09",
             display_name="Отчёт по практике или лабораторной работе",
             work_type="practice_report",
             domain_tags=["general", "it", "finance"],
@@ -235,6 +256,7 @@ def default_profile_registry() -> ProfileRegistry:
         ),
         WorkProfile(
             id="school_project",
+            version="2026-09",
             display_name="Школьный проект",
             work_type="school_project",
             domain_tags=["general"],

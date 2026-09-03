@@ -46,8 +46,6 @@ class ContextBuilder:
             if (item.id in section.required_claim_ids or item.section_id == section.id)
             and item.status == ClaimStatus.SUPPORTED
         ]
-        if not selected_claims and claims:
-            selected_claims = [item for item in claims if item.status == ClaimStatus.SUPPORTED]
         evidence_ids = {item_id for claim in selected_claims for item_id in claim.evidence_ids}
         selected_evidence = [item for item in evidence if item.id in evidence_ids and item.verified]
         # A fresh web verification can deduplicate a new URL record into an
@@ -70,9 +68,6 @@ class ContextBuilder:
             for item in bibliography
             if item.id in evidence_bibliography_ids or item.source_id in selected_sources
         ]
-        if not selected_bibliography and bibliography:
-            selected_bibliography = list(bibliography)
-
         target_dataset_ids = {
             vr.dataset_id for vr in section.visual_requests if vr.dataset_id
         } | set(section.required_fact_ids)
@@ -80,8 +75,6 @@ class ContextBuilder:
             item for item in datasets
             if not target_dataset_ids or item.id in target_dataset_ids or item.name in target_dataset_ids
         ]
-        if not selected_datasets and datasets:
-            selected_datasets = list(datasets)
         return SectionContext(
             section=section,
             claims=selected_claims,

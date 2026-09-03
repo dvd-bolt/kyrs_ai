@@ -59,6 +59,9 @@ class DomainModel(BaseModel):
 
 
 class AutopilotOptions(DomainModel):
+    # Kept solely to deserialize beta projects created before autopilot mode.
+    # They are deliberately ignored by AutopilotService: a run never waits
+    # for requirements, outline, or review approval.
     checkpoint_requirements: bool = False
     checkpoint_outline: bool = False
     checkpoint_final_review: bool = False
@@ -821,13 +824,51 @@ class ChartSpec(DomainModel):
     y_columns: list[str]
     x_label: str = ""
     y_label: str = ""
+    caption: str = ""
+    alt_text: str = ""
     options: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class DiagramNode(DomainModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    label: str = Field(min_length=1, max_length=240)
+
+
+class DiagramEdge(DomainModel):
+    source: str = Field(min_length=1, max_length=80)
+    target: str = Field(min_length=1, max_length=80)
+    label: str = Field(default="", max_length=160)
 
 
 class DiagramSpec(DomainModel):
     title: str = ""
+    nodes: list[DiagramNode] = Field(default_factory=list, max_length=60)
+    edges: list[DiagramEdge] = Field(default_factory=list, max_length=120)
+    caption: str = ""
+    alt_text: str = ""
+    # ``source`` is retained only to read module-7 drafts. Renderers derive a
+    # safe graph from it once and never pass it to an executable renderer.
     language: Literal["mermaid", "graphviz"] = "mermaid"
-    source: str = Field(min_length=1)
+    source: str = ""
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> DiagramSpec:
+        node_ids = [node.id for node in self.nodes]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("diagram node IDs must be unique")
+        if self.nodes:
+            known = set(node_ids)
+            unknown = {
+                endpoint
+                for edge in self.edges
+                for endpoint in (edge.source, edge.target)
+                if endpoint not in known
+            }
+            if unknown:
+                raise ValueError("diagram edges must reference declared nodes")
+        elif not self.source.strip():
+            raise ValueError("diagram needs typed nodes or legacy source")
+        return self
 
 
 class FormulaSpec(DomainModel):
@@ -840,6 +881,8 @@ class ImageSpec(DomainModel):
     prompt: str = Field(min_length=1)
     aspect_ratio: str = "4:3"
     alt_text: str = ""
+    caption: str = ""
+    optional: bool = True
 
 
 class ParagraphBlock(DomainModel):

@@ -11,7 +11,7 @@ from papercraft.application import (
     StageContext,
     StageOutcome,
 )
-from papercraft.application.release import build_submission_release
+from papercraft.application.release import build_submission_release, stable_hash
 from papercraft.config import AppSettings
 from papercraft.domain import (
     Artifact,
@@ -69,12 +69,26 @@ def _release_outcome(context: StageContext) -> StageOutcome:
         path=str(path),
         sha256=sha256_file(path),
         size_bytes=path.stat().st_size,
+        metadata={
+            "phase": "final",
+            "finalizer": "libreoffice",
+            "fields_updated": True,
+        },
     )
     context.repository.save_artifact(artifact)
     report = QAReport(
         project_id=context.project.id,
         run_id=context.run.id,
-        metadata={"deterministic": True, "gate_version": 1},
+        metadata={
+            "deterministic": True,
+            "gate_version": 2,
+            "release_hashes": {
+                "input_hash": context.run.input_hash,
+                "manuscript_hash": stable_hash(manuscript.model_dump(mode="json")),
+                "docx_hash": artifact.sha256,
+                "pdf_hash": None,
+            },
+        },
     )
     context.repository.save_qa_report(report)
     project = context.repository.get_project(context.project.id)

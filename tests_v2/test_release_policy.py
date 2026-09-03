@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from papercraft.application.documents import DocumentExportBlocked, DocumentService
-from papercraft.application.release import ReleasePolicyError, build_submission_release
+from papercraft.application.release import ReleasePolicyError, build_submission_release, stable_hash
 from papercraft.application.schemas import GlobalReview, SectionCritique
 from papercraft.domain import (
     Artifact,
@@ -101,12 +101,26 @@ def _ready_candidate(tmp_path: Path) -> tuple[
         sha256=digest,
         size_bytes=docx.stat().st_size,
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        metadata={
+            "phase": "final",
+            "finalizer": "libreoffice",
+            "fields_updated": True,
+        },
     )
     repository.save_artifact(artifact)
     report = QAReport(
         project_id=project.id,
         run_id=run.id,
-        metadata={"deterministic": True, "gate_version": 1},
+        metadata={
+            "deterministic": True,
+            "gate_version": 2,
+            "release_hashes": {
+                "input_hash": run.input_hash,
+                "manuscript_hash": stable_hash(manuscript.model_dump(mode="json")),
+                "docx_hash": digest,
+                "pdf_hash": None,
+            },
+        },
     )
     repository.save_qa_report(report)
     for name in ("consistency_qa", "final_gemini_review"):
@@ -190,6 +204,54 @@ def test_stale_docx_hash_cannot_be_finalized(tmp_path: Path) -> None:
     Path(artifact.path).write_bytes(b"changed-after-qa")
     with pytest.raises(ValueError, match="integrity"):
         repository.finalize_submission_release(release, finished_at=release.created_at)
+
+
+def test_release_builder_rejects_draft_docx_and_stale_qa_scope(tmp_path: Path) -> None:
+    repository, project, run, artifact, _ = _ready_candidate(tmp_path)
+    manuscript = repository.get_latest_manuscript(project.id)
+    requirements = repository.get_latest_requirement_set(project.id)
+    blueprint = repository.get_latest_blueprint(project.id)
+    report = repository.get_latest_qa_report(run.id)
+    assert all(item is not None for item in (manuscript, requirements, blueprint, report))
+    assert manuscript is not None
+    assert requirements is not None
+    assert blueprint is not None
+    assert report is not None
+
+    with pytest.raises(ReleasePolicyError, match="finalized DOCX"):
+        build_submission_release(
+            project=project,
+            run=run,
+            manuscript=manuscript,
+            docx_artifact=artifact.model_copy(
+                update={"metadata": {**artifact.metadata, "phase": "draft"}}
+            ),
+            report=report,
+            requirements=requirements,
+            blueprint=blueprint,
+            profile=_profile(),
+        )
+
+    stale_hashes = dict(report.metadata["release_hashes"])
+    stale_hashes["docx_hash"] = "0" * 64
+    with pytest.raises(ReleasePolicyError, match="hashes do not match"):
+        build_submission_release(
+            project=project,
+            run=run,
+            manuscript=manuscript,
+            docx_artifact=artifact,
+            report=report.model_copy(
+                update={
+                    "metadata": {
+                        **report.metadata,
+                        "release_hashes": stale_hashes,
+                    }
+                }
+            ),
+            requirements=requirements,
+            blueprint=blueprint,
+            profile=_profile(),
+        )
 
 
 def test_open_in_word_cannot_bypass_release_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
