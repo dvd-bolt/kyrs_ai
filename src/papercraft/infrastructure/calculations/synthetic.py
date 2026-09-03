@@ -78,10 +78,10 @@ class SyntheticDatasetFactory:
             cast(
                 JsonValue,
                 {
-                "name": column.name,
-                "data_type": column.data_type.value,
-                "distribution": column.distribution.value,
-                "parameters": _json_safe_parameters(column.parameters),
+                    "name": column.name,
+                    "data_type": column.data_type.value,
+                    "distribution": column.distribution.value,
+                    "parameters": _json_safe_parameters(column.parameters),
                 },
             )
             for column in spec.columns
@@ -109,14 +109,13 @@ class SyntheticDatasetFactory:
                     "Модельные (синтетические) данные сформированы для учебной демонстрации; "
                     "они не являются наблюдениями реальной организации."
                 ),
+                "observation_status": "modelled_not_observed",
                 "generator_version": 1,
                 "column_specs": metadata_spec,
             },
         )
 
-    def _value(
-        self, column: SyntheticColumnSpec, row_index: int, rng: random.Random
-    ) -> Any:
+    def _value(self, column: SyntheticColumnSpec, row_index: int, rng: random.Random) -> Any:
         params = column.parameters
         distribution = column.distribution
         if distribution == Distribution.SEQUENCE:

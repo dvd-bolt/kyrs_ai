@@ -59,9 +59,7 @@ def _qa_profile() -> WorkProfile:
         work_type="coursework",
         description="Neutral deterministic QA fixture",
         sections=[
-            ProfileSectionTemplate(
-                key="body", title="Body", target_words=100, purpose="Test"
-            )
+            ProfileSectionTemplate(key="body", title="Body", target_words=100, purpose="Test")
         ],
         policy=ProfilePolicy(voice="academic", minimum_sources=0),
     )
@@ -171,9 +169,13 @@ def test_synthetic_dataset_is_seeded_and_has_provenance() -> None:
     assert first.synthetic_seed == 20250813
     assert first.generation_method
     assert first.metadata["synthetic"] is True
+    assert first.metadata["observation_status"] == "modelled_not_observed"
+    assert "не являются наблюдениями реальной организации" in str(first.metadata["disclosure"])
 
 
-@pytest.mark.skipif(importlib.util.find_spec("matplotlib") is None, reason="matplotlib not installed")
+@pytest.mark.skipif(
+    importlib.util.find_spec("matplotlib") is None, reason="matplotlib not installed"
+)
 def test_chart_renderer_uses_declarative_spec(tmp_path: Path) -> None:
     dataset = Dataset(
         id="sales",
@@ -222,7 +224,7 @@ def test_local_diagram_fallback_never_needs_remote_service(tmp_path: Path) -> No
 
     with pytest.raises(Exception, match="unsafe"):
         renderer.render(
-            DiagramSpec(title="Unsafe", source="flowchart TD\nclick A href \"file:///secret\""),
+            DiagramSpec(title="Unsafe", source='flowchart TD\nclick A href "file:///secret"'),
             tmp_path / "unsafe.png",
         )
 
@@ -243,7 +245,9 @@ def _complete_manuscript(image_artifact_id: str) -> Manuscript:
         },
         blocks=[
             HeadingBlock(text="INTRODUCTION", level=1),
-            ParagraphBlock(text="The source data were verified and used consistently throughout the work."),
+            ParagraphBlock(
+                text="The source data were verified and used consistently throughout the work."
+            ),
             TableBlock(
                 spec=TableSpec(
                     caption="Core indicators",
@@ -379,9 +383,7 @@ def test_qa_accepts_rendered_docx_and_complete_provenance(tmp_path: Path) -> Non
             profile=_qa_profile(),
             facts=[fact],
             datasets=[dataset],
-            citations=[
-                Citation(bibliography_entry_id=manuscript.bibliography[0].id)
-            ],
+            citations=[Citation(bibliography_entry_id=manuscript.bibliography[0].id)],
             artifact_paths={"figure-1": image_path},
             docx_path=docx_path,
         )

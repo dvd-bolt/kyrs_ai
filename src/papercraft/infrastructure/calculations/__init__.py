@@ -35,7 +35,7 @@ from .financial import (
     loan_schedule,
     vertical_analysis,
 )
-from .financial_catalog import AccountDefinition, RASAccountCatalog, RAS_2026
+from .financial_catalog import RAS_2026, AccountDefinition, RASAccountCatalog
 from .ledger import (
     CalculationError,
     CalculationOperation,
@@ -55,10 +55,11 @@ from .synthetic import (
 from .tabular import TabularDatasetImporter, TabularImportError
 
 __all__ = [
-    "AccountKind",
+    "RAS_2026",
     "AccountDefinition",
-    "AccountingPosting",
+    "AccountKind",
     "AccountTurnover",
+    "AccountingPosting",
     "CalculationError",
     "CalculationOperation",
     "CalculationRequest",
@@ -68,9 +69,9 @@ __all__ = [
     "FactLedger",
     "FactLedgerError",
     "FactProvenanceError",
-    "FinancialCalculationError",
     "FinanceIssue",
     "FinanceValidationResult",
+    "FinancialCalculationError",
     "JournalEntry",
     "LoanMethod",
     "LoanPayment",
@@ -78,7 +79,6 @@ __all__ = [
     "PostingLeg",
     "PostingSide",
     "RASAccountCatalog",
-    "RAS_2026",
     "ReportingPeriod",
     "StatisticsSummary",
     "SyntheticColumnSpec",

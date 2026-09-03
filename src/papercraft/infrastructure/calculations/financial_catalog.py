@@ -6,10 +6,10 @@ account used in a reproducible exercise explicit and pins its effective date.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
-from typing import Mapping
 
 from .finance import AccountKind
 
@@ -83,7 +83,10 @@ _ACCOUNTS = (
 RAS_2026 = RASAccountCatalog(
     version="ras-chart-accounts-2026.1",
     effective_from=_EFFECTIVE_FROM,
-    source_note="План счетов бухгалтерского учёта: учебный воспроизводимый поднабор.",
+    source_note=(
+        "Учебный воспроизводимый поднабор Плана счетов по приказу Минфина России "
+        "от 31.10.2000 № 94н, редакция от 08.11.2010; сверено для каталога 2026.1."
+    ),
     accounts=MappingProxyType(
         {
             code: AccountDefinition(code, name, kind, _EFFECTIVE_FROM)
@@ -93,4 +96,4 @@ RAS_2026 = RASAccountCatalog(
 )
 
 
-__all__ = ["AccountDefinition", "RASAccountCatalog", "RAS_2026"]
+__all__ = ["RAS_2026", "AccountDefinition", "RASAccountCatalog"]

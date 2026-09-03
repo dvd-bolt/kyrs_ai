@@ -4,7 +4,10 @@ from papercraft.profiles import default_profile_registry
 def test_registry_resolves_every_supported_profile() -> None:
     registry = default_profile_registry()
     assert registry.resolve("coursework_it").id == "coursework_it"
-    assert registry.resolve("coursework", "finance").id == "coursework_finance"
+    finance = registry.resolve("coursework", "finance")
+    assert finance.id == "coursework_finance"
+    assert finance.policy.allow_synthetic_data
+    assert any("CalculationResult" in rule for rule in finance.prompt_rules)
     assert registry.resolve("coursework", "general").id == "coursework_general"
     assert registry.resolve("scientific_article").id == "scientific_article"
     assert registry.resolve("practice_report", "it").id == "practice_report"

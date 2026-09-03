@@ -146,9 +146,15 @@ def default_profile_registry() -> ProfileRegistry:
                 voice="formal impersonal financial Russian",
                 required_artifacts=["journal entries", "account balances", "three-year tables", "charts"],
                 source_priorities=common_sources,
+                allow_synthetic_data=True,
                 minimum_sources=15,
             ),
-            prompt_rules=["All monetary values must originate in the fact ledger", "Never invent a legal citation"],
+            prompt_rules=[
+                "All monetary values must originate in the fact ledger",
+                "Use persisted CalculationResult values; never ask the language model to calculate",
+                "Label modelled data as synthetic demonstration data, never as real observations",
+                "Never invent a legal citation",
+            ],
         ),
         WorkProfile(
             id="coursework_general",
